@@ -5,7 +5,7 @@ related_adrs: []
 created: 2026-08-21
 updated: 2026-08-21
 ---
-# Issue 0006: Make Clippy validation reproducible
+# Issue 0012: Make Clippy validation reproducible
 
 - Status: In Progress
 - Priority: P1

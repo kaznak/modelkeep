@@ -14,6 +14,11 @@ Issue files use a zero-padded number and a short kebab-case title:
 NNNN-short-description.md
 ```
 
+[`LAST_ISSUE_NUMBER`](LAST_ISSUE_NUMBER) records the highest issue number ever
+assigned, including completed issues whose files have been removed. When creating an
+issue, assign the next number and update that file in the same commit. Never reuse an
+issue number.
+
 Each issue must begin with YAML frontmatter containing `status`, `priority`, `related_adrs`, `created`, and `updated`. The body should also state:
 
 - `Status`: `Open`, `In Progress`, `Blocked`, or `Done`;
