@@ -1,0 +1,82 @@
+name: Release OCI image
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }} image
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            nix_system: x86_64-linux
+            runner: ubuntu-latest
+          - arch: arm64
+            nix_system: aarch64-linux
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v19
+
+      - name: Enable Nix store cache
+        uses: DeterminateSystems/magic-nix-cache-action@v13
+
+      - name: Build OCI image from flake
+        run: nix build .#packages.${{ matrix.nix_system }}.modelkeep-image
+
+      - name: Load image into Docker
+        run: docker load < result
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag and push architecture image
+        env:
+          VERSION: ${{ startsWith(github.ref_name, 'v') && github.ref_name || format('sha-{0}', github.sha) }}
+        run: |
+          IMAGE="${REGISTRY}/${IMAGE_NAME,,}"
+          docker tag modelkeep:0.1.0 "${IMAGE}:${VERSION}-${{ matrix.arch }}"
+          docker push "${IMAGE}:${VERSION}-${{ matrix.arch }}"
+
+  manifest:
+    name: Publish multi-arch manifest
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish versioned manifest
+        env:
+          VERSION: ${{ startsWith(github.ref_name, 'v') && github.ref_name || format('sha-{0}', github.sha) }}
+        run: |
+          IMAGE="${REGISTRY}/${IMAGE_NAME,,}"
+          docker buildx imagetools create \
+            --tag "${IMAGE}:${VERSION}" \
+            "${IMAGE}:${VERSION}-amd64" \
+            "${IMAGE}:${VERSION}-arm64"
