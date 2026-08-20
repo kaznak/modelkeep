@@ -45,6 +45,24 @@ impl From<io::Error> for ArchiveError {
 pub type ArchiveResult<T> = Result<T, ArchiveError>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedFile {
+    pub path: PathBuf,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ByteRange {
+    pub start: u64,
+    pub end: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeError {
+    Invalid,
+    Unsatisfiable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchiveFile {
     pub path: String,
     pub bytes: Vec<u8>,
@@ -150,6 +168,25 @@ impl Archive {
             .join(name)
             .join("revisions")
             .join(commit))
+    }
+
+    pub fn resolve_file(
+        &self,
+        repo_id: &str,
+        commit: &str,
+        relative_path: &str,
+    ) -> ArchiveResult<ResolvedFile> {
+        let relative = validate_relative_file_path(relative_path)?;
+        let revision = self.revision_path(repo_id, commit)?;
+        let revision_root = fs::canonicalize(&revision)?;
+        let candidate = fs::canonicalize(revision.join(relative))?;
+        if !candidate.starts_with(&revision_root) || !candidate.is_file() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "archive file not found").into());
+        }
+        Ok(ResolvedFile {
+            size: fs::metadata(&candidate)?.len(),
+            path: candidate,
+        })
     }
 
     fn staging_path(&self, commit: &str) -> PathBuf {
@@ -288,6 +325,42 @@ fn sync_directory(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
+pub fn parse_range(value: &str, size: u64) -> Result<Option<ByteRange>, RangeError> {
+    if !value.starts_with("bytes=") || value[6..].contains(',') {
+        return Err(RangeError::Invalid);
+    }
+    let value = &value[6..];
+    let (start, end) = value.split_once('-').ok_or(RangeError::Invalid)?;
+    if size == 0 {
+        return Err(RangeError::Unsatisfiable);
+    }
+    if start.is_empty() {
+        let suffix = end.parse::<u64>().map_err(|_| RangeError::Invalid)?;
+        if suffix == 0 {
+            return Err(RangeError::Unsatisfiable);
+        }
+        return Ok(Some(ByteRange {
+            start: size.saturating_sub(suffix),
+            end: size - 1,
+        }));
+    }
+    let start = start.parse::<u64>().map_err(|_| RangeError::Invalid)?;
+    if start >= size {
+        return Err(RangeError::Unsatisfiable);
+    }
+    let end = if end.is_empty() {
+        size - 1
+    } else {
+        end.parse::<u64>()
+            .map_err(|_| RangeError::Invalid)?
+            .min(size - 1)
+    };
+    if start > end {
+        return Err(RangeError::Unsatisfiable);
+    }
+    Ok(Some(ByteRange { start, end }))
+}
+
 fn sha256(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
@@ -376,6 +449,47 @@ mod tests {
             archive.publish_revision(bad),
             Err(ArchiveError::InvalidPath(_))
         ));
+    }
+
+    #[test]
+    fn resolves_only_files_inside_published_revision() {
+        let (archive, _) = archive();
+        archive
+            .publish_revision(request("aaaaaaaa", b"{}"))
+            .unwrap();
+        let resolved = archive
+            .resolve_file("org/model", "aaaaaaaa", "config.json")
+            .unwrap();
+        assert_eq!(resolved.size, 2);
+        assert!(resolved.path.ends_with("config.json"));
+        assert!(archive
+            .resolve_file("org/model", "aaaaaaaa", "missing.json")
+            .is_err());
+    }
+
+    #[test]
+    fn parses_single_byte_ranges() {
+        assert_eq!(
+            parse_range("bytes=0-9", 100),
+            Ok(Some(ByteRange { start: 0, end: 9 }))
+        );
+        assert_eq!(
+            parse_range("bytes=90-", 100),
+            Ok(Some(ByteRange { start: 90, end: 99 }))
+        );
+        assert_eq!(
+            parse_range("bytes=-10", 100),
+            Ok(Some(ByteRange { start: 90, end: 99 }))
+        );
+        assert_eq!(
+            parse_range("bytes=90-120", 100),
+            Ok(Some(ByteRange { start: 90, end: 99 }))
+        );
+        assert_eq!(
+            parse_range("bytes=100-", 100),
+            Err(RangeError::Unsatisfiable)
+        );
+        assert_eq!(parse_range("bytes=0-1,4-5", 100), Err(RangeError::Invalid));
     }
 
     #[test]
