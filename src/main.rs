@@ -1,9 +1,14 @@
 use std::{env, net::SocketAddr, path::PathBuf, process, sync::Arc};
 
 use modelkeep::{http, pullthrough::PullThrough, upstream::OfficialHfFetcher, Archive};
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
     if let Err(error) = run().await {
         eprintln!("modelkeep: {error}");
         process::exit(1);

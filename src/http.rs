@@ -10,6 +10,7 @@ use axum::{
     Router,
 };
 use tokio::task;
+use tracing::info;
 
 use crate::pullthrough::PullThrough;
 use crate::{parse_range, Archive, ArchiveError, ByteRange, RangeError};
@@ -82,6 +83,7 @@ async fn file_response(
     head_only: bool,
 ) -> Result<Response, StatusCode> {
     let repo_id = format!("{namespace}/{repo}");
+    info!(repo_id = %repo_id, requested_revision = %revision, path = %path, "archive request");
     let resolved_result = if is_commit(&revision) {
         state.archive.resolve_file(&repo_id, &revision, &path)
     } else {
@@ -93,6 +95,7 @@ async fn file_response(
     let resolved = match resolved_result {
         Ok(resolved) => resolved,
         Err(ArchiveError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            info!(repo_id = %repo_id, requested_revision = %revision, path = %path, "archive miss");
             let Some(pullthrough) = state.pullthrough.clone() else {
                 return Err(StatusCode::NOT_FOUND);
             };

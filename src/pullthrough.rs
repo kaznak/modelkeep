@@ -73,6 +73,7 @@ impl PullThrough {
             }
         }
         let staging = self.archive.create_fetch_staging()?;
+        tracing::info!(repo_id = %repo_id, requested_revision = %requested_revision, "upstream fetch start");
         let request = FetchRequest {
             repo_id: repo_id.to_string(),
             revision: requested_revision.to_string(),
@@ -105,6 +106,7 @@ impl PullThrough {
             });
         let _ = std::fs::remove_dir_all(&staging);
         publish?;
+        tracing::info!(repo_id = %repo_id, commit = %fetched.commit, "archive publish complete");
         if !is_commit(requested_revision) {
             self.archive
                 .update_ref(repo_id, requested_revision, &fetched.commit)?;
