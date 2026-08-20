@@ -421,8 +421,18 @@ impl Archive {
         if published.exists() {
             return Err(ArchiveError::AlreadyPublished(published));
         }
-        let staging = self.create_staging("revision")?;
-        let result = self.write_source_revision(&staging, &source_root, &request);
+        let archive_tmp = fs::canonicalize(self.root.join("tmp"))?;
+        let reuse_staging = source_root.starts_with(&archive_tmp);
+        let staging = if reuse_staging {
+            source_root.clone()
+        } else {
+            self.create_staging("revision")?
+        };
+        let result = if reuse_staging {
+            Self::write_source_manifest(&staging, &source_root, &request)
+        } else {
+            self.write_source_revision(&staging, &source_root, &request)
+        };
         if let Err(error) = result {
             let _ = fs::remove_dir_all(&staging);
             return Err(error);
@@ -504,6 +514,49 @@ impl Archive {
         sync_directory(staging)?;
         Ok(())
     }
+    fn write_source_manifest(
+        staging: &Path,
+        source_root: &Path,
+        request: &SourcePublishRequest,
+    ) -> ArchiveResult<()> {
+        let mut entries = Vec::with_capacity(request.files.len());
+        for source_file in &request.files {
+            validate_relative_file_path(&source_file.path)?;
+            let source = fs::canonicalize(&source_file.source)?;
+            if !source.starts_with(source_root) || !source.is_file() {
+                return Err(ArchiveError::InvalidPath(source_file.path.clone()));
+            }
+            let mut input = File::open(source)?;
+            let mut hasher = Sha256::new();
+            let mut buffer = [0u8; 1024 * 1024];
+            let mut size = 0u64;
+            loop {
+                let read = input.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+                size += read as u64;
+            }
+            entries.push((
+                source_file.path.as_str(),
+                size,
+                hex_digest(hasher.finalize().as_slice()),
+            ));
+        }
+        let mut file = File::create(staging.join(".modelkeep-manifest.json"))?;
+        write_manifest(
+            &mut file,
+            &request.repo_id,
+            &request.requested_revision,
+            &request.commit,
+            &entries,
+        )?;
+        file.sync_all()?;
+        sync_directory(staging)?;
+        Ok(())
+    }
+
     fn write_source_revision(
         &self,
         staging: &Path,

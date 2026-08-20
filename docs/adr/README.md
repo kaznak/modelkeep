@@ -16,3 +16,4 @@ Initial records:
 - ADR-0005 — official HF client for upstream acquisition
 - ADR-0006 — metadata indexes are derived state
 - ADR-0009 — lease-protected staging ownership and recovery
+- ADR-0010 — reuse validated fetch staging for publication
