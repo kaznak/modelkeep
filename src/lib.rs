@@ -79,6 +79,8 @@ pub enum RangeError {
 
 #[derive(Debug, Deserialize)]
 struct Manifest {
+    #[serde(default)]
+    complete: bool,
     files: Vec<ManifestFile>,
 }
 
@@ -324,6 +326,12 @@ impl Archive {
             .join(commit))
     }
 
+    pub fn is_complete_revision(&self, repo_id: &str, commit: &str) -> ArchiveResult<bool> {
+        let manifest: Manifest = serde_json::from_str(&self.manifest(repo_id, commit)?)
+            .map_err(|error| ArchiveError::IntegrityMismatch(error.to_string()))?;
+        Ok(manifest.complete)
+    }
+
     pub fn resolve_file(
         &self,
         repo_id: &str,
@@ -332,6 +340,11 @@ impl Archive {
     ) -> ArchiveResult<ResolvedFile> {
         let relative = validate_relative_file_path(relative_path)?;
         let revision = self.revision_path(repo_id, commit)?;
+        if !self.is_complete_revision(repo_id, commit)? {
+            return Err(ArchiveError::IntegrityMismatch(
+                "revision is not complete".into(),
+            ));
+        }
         let revision_root = fs::canonicalize(&revision)?;
         let candidate = fs::canonicalize(revision.join(relative))?;
         if !candidate.starts_with(&revision_root) || !candidate.is_file() {
@@ -348,6 +361,11 @@ impl Archive {
         let manifest_path = revision.join(".modelkeep-manifest.json");
         let manifest: Manifest = serde_json::from_slice(&fs::read(&manifest_path)?)
             .map_err(|error| ArchiveError::IntegrityMismatch(error.to_string()))?;
+        if !manifest.complete {
+            return Err(ArchiveError::IntegrityMismatch(
+                "revision is not complete".into(),
+            ));
+        }
         let mut verified = 0;
         for entry in &manifest.files {
             let resolved = self.resolve_file(repo_id, commit, &entry.path)?;
@@ -569,7 +587,7 @@ fn write_manifest(
 ) -> io::Result<()> {
     write!(
         output,
-        "{{\"version\":1,\"repo_type\":\"model\",\"repo_id\":\"{}\",\"requested_revision\":\"{}\",\"commit\":\"{}\",\"archived_at\":{},\"files\":[",
+        "{{\"version\":1,\"complete\":true,\"repo_type\":\"model\",\"repo_id\":\"{}\",\"requested_revision\":\"{}\",\"commit\":\"{}\",\"archived_at\":{},\"files\":[",
         json_escape(repo_id),
         json_escape(requested_revision),
         commit,

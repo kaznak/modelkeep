@@ -27,21 +27,11 @@ impl PullThrough {
         files: &[String],
     ) -> Result<String, String> {
         if let Ok(commit) = self.archive.resolve_ref(repo_id, requested_revision) {
-            if self
-                .archive
-                .revision_path(repo_id, &commit)
-                .map(|path| path.is_dir())
-                .unwrap_or(false)
-            {
+            if self.revision_is_ready(repo_id, &commit, files) {
                 return Ok(commit);
             }
         }
-        if self
-            .archive
-            .revision_path(repo_id, requested_revision)
-            .map(|path| path.is_dir())
-            .unwrap_or(false)
-        {
+        if self.revision_is_ready(repo_id, requested_revision, files) {
             return Ok(requested_revision.to_string());
         }
 
@@ -56,6 +46,15 @@ impl PullThrough {
         })
     }
 
+    fn revision_is_ready(&self, repo_id: &str, commit: &str, files: &[String]) -> bool {
+        self.archive
+            .is_complete_revision(repo_id, commit)
+            .unwrap_or(false)
+            && files
+                .iter()
+                .all(|file| self.archive.resolve_file(repo_id, commit, file).is_ok())
+    }
+
     fn fetch_and_publish(
         &self,
         repo_id: &str,
@@ -63,12 +62,7 @@ impl PullThrough {
         files: &[String],
     ) -> ArchiveResult<String> {
         if let Ok(commit) = self.archive.resolve_ref(repo_id, requested_revision) {
-            if self
-                .archive
-                .revision_path(repo_id, &commit)
-                .map(|path| path.is_dir())
-                .unwrap_or(false)
-            {
+            if self.revision_is_ready(repo_id, &commit, files) {
                 return Ok(commit);
             }
         }
@@ -77,7 +71,7 @@ impl PullThrough {
         let request = FetchRequest {
             repo_id: repo_id.to_string(),
             revision: requested_revision.to_string(),
-            files: files.to_vec(),
+            files: Vec::new(),
             staging: staging.clone(),
         };
         let fetched = match self.fetcher.fetch(&request) {
@@ -146,9 +140,11 @@ mod tests {
         fn fetch(&self, request: &FetchRequest) -> Result<FetchedRevision, UpstreamError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             fs::write(request.staging.join("config.json"), b"cold").unwrap();
+            assert!(request.files.is_empty());
+            fs::write(request.staging.join("tokenizer.json"), b"tokenizer").unwrap();
             Ok(FetchedRevision {
                 commit: "aaaaaaaa".into(),
-                files: vec!["config.json".into()],
+                files: vec!["config.json".into(), "tokenizer.json".into()],
                 staging: request.staging.clone(),
             })
         }

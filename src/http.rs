@@ -397,9 +397,11 @@ mod tests {
             request: &crate::upstream::FetchRequest,
         ) -> Result<crate::upstream::FetchedRevision, crate::upstream::UpstreamError> {
             std::fs::write(request.staging.join("config.json"), b"cold-http").unwrap();
+            assert!(request.files.is_empty());
+            std::fs::write(request.staging.join("tokenizer.json"), b"tokenizer-http").unwrap();
             Ok(crate::upstream::FetchedRevision {
                 commit: "bbbbbbbb".into(),
-                files: vec!["config.json".into()],
+                files: vec!["config.json".into(), "tokenizer.json".into()],
                 staging: request.staging.clone(),
             })
         }
