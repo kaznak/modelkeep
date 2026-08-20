@@ -27,7 +27,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Some("help") | None => {
-            println!("usage: modelkeep serve [archive-root] [bind-address]");
+            println!(
+                "usage: modelkeep serve [archive-root] [bind-address]
+       modelkeep verify [archive-root] <repo-id> <commit>"
+            );
             Ok(())
         }
         Some(command) => Err(format!("unknown command: {command}").into()),
