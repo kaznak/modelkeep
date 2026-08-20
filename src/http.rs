@@ -5,9 +5,9 @@ use axum::{
     body::Body,
     extract::{Path, State},
     http::{header, HeaderMap, StatusCode},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::get,
-    Router,
+    Json, Router,
 };
 use tokio::task;
 use tracing::info;
@@ -51,10 +51,69 @@ pub fn router_with_pullthrough(archive: Archive, pullthrough: Arc<PullThrough>) 
 fn router_with_state(state: HttpState) -> Router {
     Router::new()
         .route(
+            "/api/models/{namespace}/{repo}/revision/{revision}",
+            get(model_info),
+        )
+        .route(
             "/{namespace}/{repo}/resolve/{revision}/{*path}",
             get(get_file).head(head_file),
         )
         .with_state(state)
+}
+
+async fn model_info(
+    State(state): State<HttpState>,
+    Path((namespace, repo, revision)): Path<(String, String, String)>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let repo_id = format!("{namespace}/{repo}");
+    let commit = match if is_commit(&revision) {
+        state
+            .archive
+            .revision_path(&repo_id, &revision)
+            .and_then(|path| {
+                if path.is_dir() {
+                    Ok(revision.clone())
+                } else {
+                    Err(ArchiveError::Io(std::io::Error::from(
+                        std::io::ErrorKind::NotFound,
+                    )))
+                }
+            })
+    } else {
+        state.archive.resolve_ref(&repo_id, &revision)
+    } {
+        Ok(commit) => commit,
+        Err(ArchiveError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            let Some(pullthrough) = state.pullthrough.clone() else {
+                return Err(StatusCode::NOT_FOUND);
+            };
+            let requested = revision.clone();
+            let repo = repo_id.clone();
+            task::spawn_blocking(move || pullthrough.ensure(&repo, &requested, &[]))
+                .await
+                .map_err(|_| StatusCode::BAD_GATEWAY)?
+                .map_err(|_| StatusCode::BAD_GATEWAY)?
+        }
+        Err(error) => return Err(status_for_archive_error(error)),
+    };
+    let manifest: serde_json::Value = serde_json::from_str(
+        &state
+            .archive
+            .manifest(&repo_id, &commit)
+            .map_err(status_for_archive_error)?,
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let siblings = manifest["files"]
+        .as_array()
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?
+        .iter()
+        .filter_map(|file| file["path"].as_str())
+        .map(|path| serde_json::json!({ "rfilename": path }))
+        .collect::<Vec<_>>();
+    Ok(Json(serde_json::json!({
+        "id": repo_id, "sha": commit, "private": false, "downloads": 0,
+        "likes": 0, "tags": [], "siblings": siblings,
+    })))
 }
 
 async fn get_file(
@@ -206,6 +265,25 @@ mod tests {
             })
             .unwrap();
         (router(archive), directory)
+    }
+
+    #[tokio::test]
+    async fn serves_model_info_for_revision() {
+        let (app, _directory) = test_router();
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/models/org/model/revision/aaaaaaaa")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["sha"], "aaaaaaaa");
+        assert_eq!(value["siblings"][0]["rfilename"], "config.json");
     }
 
     #[tokio::test]
