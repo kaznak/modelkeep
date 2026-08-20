@@ -35,8 +35,6 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v19
 
-      - name: Enable Nix store cache
-        uses: DeterminateSystems/magic-nix-cache-action@v13
 
       - name: Build OCI image from flake
         run: nix build .#packages.${{ matrix.nix_system }}.modelkeep-image
