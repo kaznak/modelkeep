@@ -1,5 +1,5 @@
 ---
-status: open
+status: in_progress
 priority: P1
 related_adrs: []
 created: 2026-08-21

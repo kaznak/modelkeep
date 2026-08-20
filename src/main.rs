@@ -1,4 +1,12 @@
-use std::{env, net::SocketAddr, path::PathBuf, process, sync::Arc};
+use std::{
+    env,
+    io::{Read, Write},
+    net::{SocketAddr, TcpStream},
+    path::PathBuf,
+    process,
+    sync::Arc,
+    time::Duration,
+};
 
 use modelkeep::{http, pullthrough::PullThrough, upstream::OfficialHfFetcher, Archive};
 use tracing_subscriber::EnvFilter;
@@ -121,12 +129,29 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             Ok(())
         }
+        Some("health") => {
+            let address = env::var("MODELKEEP_HEALTH_ADDRESS")
+                .unwrap_or_else(|_| "127.0.0.1:8090".to_string())
+                .parse::<SocketAddr>()?;
+            let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
+            stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+            stream.write_all(
+                b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )?;
+            let mut buffer = [0u8; 128];
+            let read = stream.read(&mut buffer)?;
+            if !String::from_utf8_lossy(&buffer[..read]).starts_with("HTTP/1.1 200") {
+                return Err("health endpoint is not ready".into());
+            }
+            Ok(())
+        }
         Some("help") | None => {
             println!(
                 "usage: modelkeep list [archive-root] <repo-id>
        modelkeep show [archive-root] <repo-id> <commit>
        modelkeep import-hf-cache <cache-path> [archive-root]
        modelkeep serve [archive-root] [bind-address]
+       modelkeep health
        modelkeep verify [archive-root] <repo-id> <commit>
        modelkeep remove [archive-root] <repo-id> <commit> [--dry-run]"
             );

@@ -54,6 +54,7 @@ pub fn router_with_pullthrough(archive: Archive, pullthrough: Arc<PullThrough>) 
 
 fn router_with_state(state: HttpState) -> Router {
     Router::new()
+        .route("/healthz", get(healthz))
         .route(
             "/api/models/{namespace}/{repo}/revision/{revision}",
             get(model_info),
@@ -63,6 +64,10 @@ fn router_with_state(state: HttpState) -> Router {
             get(get_file).head(head_file),
         )
         .with_state(state)
+}
+
+async fn healthz() -> StatusCode {
+    StatusCode::OK
 }
 
 async fn model_info(
@@ -281,6 +286,21 @@ mod tests {
             })
             .unwrap();
         (router(archive), directory)
+    }
+
+    #[tokio::test]
+    async fn health_endpoint_returns_ok() {
+        let (app, _directory) = test_router();
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

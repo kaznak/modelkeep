@@ -88,6 +88,7 @@ GHCR へ push し multi-architecture manifest を作成するのは `v*` tag の
 
 ```sh
 modelkeep serve [archive-root] [bind-address]
+modelkeep health
 modelkeep list [archive-root] <repo-id>
 modelkeep show [archive-root] <repo-id> <commit>
 modelkeep verify [archive-root] <repo-id> <commit>
@@ -101,6 +102,9 @@ compute node 上の既存 cache を削除する前に import と verify を行�
 modelkeep import-hf-cache ~/.cache/huggingface/hub /data
 modelkeep verify /data Qwen/ExampleModel <commit>
 ```
+
+`GET /healthz` は軽量な liveness check です。QNAP 用 Compose 設定では、コンテナの
+healthcheck に `modelkeep health` を使用します。
 
 ## Durable archive
 
