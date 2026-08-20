@@ -9,7 +9,15 @@
       forAllSystems = function: nixpkgs.lib.genAttrs systems (system:
         function (import nixpkgs { inherit system; }));
     in {
-      packages = forAllSystems (pkgs: {
+      packages = forAllSystems (pkgs:
+        let
+          python = pkgs.python3.withPackages (pythonPackages: [ pythonPackages."huggingface-hub" ]);
+          hfFetcher = pkgs.runCommand "modelkeep-hf-fetcher" {} ''
+            mkdir -p $out/bin
+            cp ${./upstream/hf_fetch.py} $out/bin/hf_fetch.py
+            chmod 0555 $out/bin/hf_fetch.py
+          '';
+        in {
         modelkeep = pkgs.rustPlatform.buildRustPackage {
           pname = "modelkeep";
           version = "0.1.0";
@@ -21,12 +29,12 @@
         modelkeep-image = pkgs.dockerTools.buildLayeredImage {
           name = "modelkeep";
           tag = "0.1.0";
-          contents = [ self.packages.${pkgs.system}.modelkeep pkgs.cacert ];
+          contents = [ self.packages.${pkgs.system}.modelkeep hfFetcher python pkgs.cacert ];
           config = {
             Entrypoint = [ "${self.packages.${pkgs.system}.modelkeep}/bin/modelkeep" "serve" ];
             User = "10001:10001";
             ExposedPorts."8090/tcp" = {};
-            Env = [ "RUST_LOG=info" ];
+            Env = [ "RUST_LOG=info" "MODELKEEP_HF_PYTHON=${python}/bin/python3" "MODELKEEP_HF_HELPER=${hfFetcher}/bin/hf_fetch.py" ];
           };
         };
 
