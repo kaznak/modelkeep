@@ -13,6 +13,14 @@ pub struct SingleFlight<K, V, E> {
     flights: Mutex<HashMap<K, Arc<Flight<V, E>>>>,
 }
 
+impl<K, V, E> Default for SingleFlight<K, V, E> {
+    fn default() -> Self {
+        Self {
+            flights: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
 impl<K, V, E> SingleFlight<K, V, E>
 where
     K: Eq + Hash + Clone,
