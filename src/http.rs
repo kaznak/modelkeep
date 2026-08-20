@@ -203,7 +203,8 @@ async fn file_response(
         .status(status)
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::CONTENT_LENGTH, content_length)
-        .header(header::ETAG, format!("\"{etag_revision}-{size}\""));
+        .header(header::ETAG, format!("\"{etag_revision}-{size}\""))
+        .header("x-repo-commit", &etag_revision);
     if let Some(ByteRange { start, end }) = range {
         response = response.header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{size}"));
     }
