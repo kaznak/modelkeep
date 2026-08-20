@@ -28,6 +28,7 @@ pub enum ArchiveError {
     InvalidPath(String),
     AlreadyPublished(PathBuf),
     IntegrityMismatch(String),
+    ReferencedRevision(Vec<String>),
 }
 
 impl fmt::Display for ArchiveError {
@@ -36,6 +37,11 @@ impl fmt::Display for ArchiveError {
             Self::Io(error) => write!(f, "archive I/O error: {error}"),
             Self::InvalidPath(path) => write!(f, "unsafe archive path: {path}"),
             Self::IntegrityMismatch(message) => write!(f, "archive integrity mismatch: {message}"),
+            Self::ReferencedRevision(references) => write!(
+                f,
+                "revision is referenced by mutable refs: {}",
+                references.join(", ")
+            ),
             Self::AlreadyPublished(path) => {
                 write!(f, "revision is already published: {}", path.display())
             }
@@ -110,6 +116,13 @@ pub struct SourcePublishRequest {
     pub commit: String,
     pub source_root: PathBuf,
     pub files: Vec<SourceFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevisionRemoval {
+    pub commit: String,
+    pub references: Vec<String>,
+    pub removed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -226,6 +239,46 @@ impl Archive {
         }
         commits.sort();
         Ok(commits)
+    }
+
+    pub fn remove_revision(
+        &self,
+        repo_id: &str,
+        commit: &str,
+        dry_run: bool,
+    ) -> ArchiveResult<RevisionRemoval> {
+        let revision = self.revision_path(repo_id, commit)?;
+        if !revision.is_dir() {
+            return Err(
+                io::Error::new(io::ErrorKind::NotFound, "revision is not published").into(),
+            );
+        }
+        let refs_path = revision.parent().unwrap().parent().unwrap().join("refs");
+        let mut references = Vec::new();
+        if refs_path.is_dir() {
+            for entry in fs::read_dir(&refs_path)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
+                if fs::read_to_string(entry.path())?.trim() == commit {
+                    references.push(entry.file_name().to_string_lossy().into_owned());
+                }
+            }
+        }
+        references.sort();
+        if !references.is_empty() {
+            return Err(ArchiveError::ReferencedRevision(references));
+        }
+        if !dry_run {
+            fs::remove_dir_all(&revision)?;
+            sync_directory(revision.parent().unwrap())?;
+        }
+        Ok(RevisionRemoval {
+            commit: commit.to_string(),
+            references,
+            removed: !dry_run,
+        })
     }
 
     pub fn manifest(&self, repo_id: &str, commit: &str) -> ArchiveResult<String> {
@@ -711,6 +764,55 @@ mod tests {
         assert!(root.is_dir());
         let reference = root.parent().unwrap().parent().unwrap().join("refs/main");
         assert_eq!(fs::read_to_string(reference).unwrap(), "bbbbbbbb");
+    }
+
+    #[test]
+    fn dry_run_preserves_unreferenced_revision() {
+        let (archive, _) = archive();
+        archive
+            .publish_revision(request("aaaaaaaa", b"one"))
+            .unwrap();
+        let result = archive
+            .remove_revision("org/model", "aaaaaaaa", true)
+            .unwrap();
+        assert!(!result.removed);
+        assert!(archive
+            .revision_path("org/model", "aaaaaaaa")
+            .unwrap()
+            .is_dir());
+    }
+
+    #[test]
+    fn removes_unreferenced_revision() {
+        let (archive, _) = archive();
+        archive
+            .publish_revision(request("aaaaaaaa", b"one"))
+            .unwrap();
+        let result = archive
+            .remove_revision("org/model", "aaaaaaaa", false)
+            .unwrap();
+        assert!(result.removed);
+        assert!(!archive
+            .revision_path("org/model", "aaaaaaaa")
+            .unwrap()
+            .exists());
+    }
+
+    #[test]
+    fn refuses_to_remove_referenced_revision() {
+        let (archive, _) = archive();
+        archive
+            .publish_revision(request("aaaaaaaa", b"one"))
+            .unwrap();
+        archive.update_ref("org/model", "main", "aaaaaaaa").unwrap();
+        assert!(matches!(
+            archive.remove_revision("org/model", "aaaaaaaa", false),
+            Err(ArchiveError::ReferencedRevision(refs)) if refs == &["main"]
+        ));
+        assert!(archive
+            .revision_path("org/model", "aaaaaaaa")
+            .unwrap()
+            .is_dir());
     }
 
     #[test]
