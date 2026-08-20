@@ -64,6 +64,7 @@ docker compose up -d
 Change `/share/LLM/modelkeep` in `compose.yaml` if the QNAP archive share uses another
 path. The container runs as UID/GID `10001:10001`, uses a read-only root filesystem,
 drops Linux capabilities, and writes durable state only under `/data`.
+See [`docs/deployment/qnap-permissions.md`](docs/deployment/qnap-permissions.md) for the host-side UID/GID and permission preflight.
 
 For private or gated upstream repositories, provide `HF_TOKEN` through the deployment
 environment. Never put credentials in URLs, manifests, or logs.

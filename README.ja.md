@@ -62,6 +62,7 @@ docker compose up -d
 
 QNAP の archive share が別の場所にある場合は、`compose.yaml` の `/share/LLM/modelkeep` を変更してください。
 コンテナは UID/GID `10001:10001`、read-only root filesystem、capability drop で動作し、永続データは `/data` のみに書き込みます。
+ホスト側の UID/GID と権限 preflight は [`docs/deployment/qnap-permissions.md`](docs/deployment/qnap-permissions.md) を参照してください。
 
 private / gated repository を使う場合は、deploy 環境から `HF_TOKEN` を渡します。認証情報を URL、manifest、log に保存しないでください。
 
