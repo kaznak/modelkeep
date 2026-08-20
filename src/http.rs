@@ -1,4 +1,4 @@
-use std::io::{Read, Seek, SeekFrom};
+use std::io::SeekFrom;
 use std::sync::Arc;
 
 use axum::{
@@ -9,7 +9,11 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use tokio::task;
+use tokio::{
+    io::{AsyncReadExt, AsyncSeekExt},
+    task,
+};
+use tokio_util::io::ReaderStream;
 use tracing::info;
 
 use crate::pullthrough::PullThrough;
@@ -221,24 +225,17 @@ async fn file_response(
     let body = if head_only {
         Body::empty()
     } else {
-        let file = resolved.path;
-        let bytes = task::spawn_blocking(move || read_range(&file, start, content_length))
+        let mut file = tokio::fs::File::open(resolved.path)
             .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        Body::from(bytes)
+        file.seek(SeekFrom::Start(start))
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        Body::from_stream(ReaderStream::new(file.take(content_length)))
     };
     response
         .body(body)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-}
-
-fn read_range(path: &std::path::Path, start: u64, length: u64) -> std::io::Result<Vec<u8>> {
-    let mut file = std::fs::File::open(path)?;
-    file.seek(SeekFrom::Start(start))?;
-    let mut bytes = vec![0; usize::try_from(length).map_err(|_| std::io::ErrorKind::InvalidInput)?];
-    file.read_exact(&mut bytes)?;
-    Ok(bytes)
 }
 
 fn status_for_archive_error(error: ArchiveError) -> StatusCode {
