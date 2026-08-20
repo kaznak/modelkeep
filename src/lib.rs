@@ -15,6 +15,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 pub mod http;
+pub mod importer;
 pub mod singleflight;
 
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);

@@ -13,6 +13,21 @@ async fn main() {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
+        Some("import-hf-cache") => {
+            let cache = args.next().ok_or("import-hf-cache requires cache path")?;
+            let root = args
+                .next()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/data"));
+            let archive = Archive::new(root)?;
+            let report =
+                modelkeep::importer::import_hf_cache(&archive, PathBuf::from(cache).as_path())?;
+            println!(
+                "imported {} revisions and {} refs",
+                report.revisions, report.refs
+            );
+            Ok(())
+        }
         Some("verify") => {
             let root = args
                 .next()
@@ -40,7 +55,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some("help") | None => {
             println!(
-                "usage: modelkeep serve [archive-root] [bind-address]
+                "usage: modelkeep import-hf-cache <cache-path> [archive-root]
+       modelkeep serve [archive-root] [bind-address]
        modelkeep verify [archive-root] <repo-id> <commit>"
             );
             Ok(())
