@@ -33,7 +33,6 @@ Priority meanings:
 
 ## Current backlog
 
-- [0002 — Stream large file responses](0002-stream-large-file-responses.md)
 - [0003 — Add a health endpoint](0003-add-health-endpoint.md)
 - [0004 — Add storage observability](0004-add-storage-observability.md)
 - [0005 — Define the client network boundary](0005-define-client-network-boundary.md)
