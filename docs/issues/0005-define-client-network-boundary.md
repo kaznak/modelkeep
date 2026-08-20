@@ -1,3 +1,12 @@
+---
+status: open
+priority: P2
+related_adrs:
+  - ADR-0003
+  - ADR-0005
+created: 2026-08-21
+updated: 2026-08-21
+---
 # Issue 0005: Define the client network boundary
 
 - Status: Open

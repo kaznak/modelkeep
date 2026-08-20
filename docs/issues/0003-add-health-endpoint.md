@@ -1,3 +1,10 @@
+---
+status: open
+priority: P1
+related_adrs: []
+created: 2026-08-21
+updated: 2026-08-21
+---
 # Issue 0003: Add a health endpoint
 
 - Status: Open

@@ -1,3 +1,11 @@
+---
+status: open
+priority: P1
+related_adrs:
+  - ADR-0001
+created: 2026-08-21
+updated: 2026-08-21
+---
 # Issue 0002: Stream large file responses
 
 - Status: Open

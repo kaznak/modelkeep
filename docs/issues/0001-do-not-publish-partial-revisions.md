@@ -1,3 +1,14 @@
+---
+status: open
+priority: P0
+related_adrs:
+  - ADR-0001
+  - ADR-0002
+  - ADR-0005
+  - ADR-0008
+created: 2026-08-21
+updated: 2026-08-21
+---
 # Issue 0001: Do not publish partial revisions
 
 - Status: Open

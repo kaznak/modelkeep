@@ -1,3 +1,12 @@
+---
+status: open
+priority: P1
+related_adrs:
+  - ADR-0004
+  - ADR-0006
+created: 2026-08-21
+updated: 2026-08-21
+---
 # Issue 0004: Add storage observability
 
 - Status: Open
