@@ -11,6 +11,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 pub mod http;
@@ -22,6 +23,7 @@ pub enum ArchiveError {
     Io(io::Error),
     InvalidPath(String),
     AlreadyPublished(PathBuf),
+    IntegrityMismatch(String),
 }
 
 impl fmt::Display for ArchiveError {
@@ -29,6 +31,7 @@ impl fmt::Display for ArchiveError {
         match self {
             Self::Io(error) => write!(f, "archive I/O error: {error}"),
             Self::InvalidPath(path) => write!(f, "unsafe archive path: {path}"),
+            Self::IntegrityMismatch(message) => write!(f, "archive integrity mismatch: {message}"),
             Self::AlreadyPublished(path) => {
                 write!(f, "revision is already published: {}", path.display())
             }
@@ -62,6 +65,18 @@ pub struct ByteRange {
 pub enum RangeError {
     Invalid,
     Unsatisfiable,
+}
+
+#[derive(Debug, Deserialize)]
+struct Manifest {
+    files: Vec<ManifestFile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestFile {
+    path: String,
+    size: u64,
+    sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,6 +204,26 @@ impl Archive {
             size: fs::metadata(&candidate)?.len(),
             path: candidate,
         })
+    }
+
+    pub fn verify_revision(&self, repo_id: &str, commit: &str) -> ArchiveResult<usize> {
+        let revision = self.revision_path(repo_id, commit)?;
+        let manifest_path = revision.join(".modelkeep-manifest.json");
+        let manifest: Manifest = serde_json::from_slice(&fs::read(&manifest_path)?)
+            .map_err(|error| ArchiveError::IntegrityMismatch(error.to_string()))?;
+        let mut verified = 0;
+        for entry in &manifest.files {
+            let resolved = self.resolve_file(repo_id, commit, &entry.path)?;
+            if resolved.size != entry.size {
+                return Err(ArchiveError::IntegrityMismatch(entry.path.clone()));
+            }
+            let bytes = fs::read(&resolved.path)?;
+            if sha256(&bytes) != entry.sha256 {
+                return Err(ArchiveError::IntegrityMismatch(entry.path.clone()));
+            }
+            verified += 1;
+        }
+        Ok(verified)
     }
 
     fn staging_path(&self, commit: &str) -> PathBuf {
