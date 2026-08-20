@@ -1,0 +1,392 @@
+//! Durable archive primitives for ModelKeep.
+//!
+//! The archive stores materialized files under an immutable commit directory.
+//! A revision becomes visible only after all files and its manifest have been
+//! written and synchronized to disk.
+
+use std::fmt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use sha2::{Digest, Sha256};
+
+static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug)]
+pub enum ArchiveError {
+    Io(io::Error),
+    InvalidPath(String),
+    AlreadyPublished(PathBuf),
+}
+
+impl fmt::Display for ArchiveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "archive I/O error: {error}"),
+            Self::InvalidPath(path) => write!(f, "unsafe archive path: {path}"),
+            Self::AlreadyPublished(path) => {
+                write!(f, "revision is already published: {}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for ArchiveError {}
+
+impl From<io::Error> for ArchiveError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+pub type ArchiveResult<T> = Result<T, ArchiveError>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveFile {
+    pub path: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishRequest {
+    pub repo_id: String,
+    pub requested_revision: String,
+    pub commit: String,
+    pub files: Vec<ArchiveFile>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Archive {
+    root: PathBuf,
+}
+
+impl Archive {
+    pub fn new(root: impl Into<PathBuf>) -> ArchiveResult<Self> {
+        let root = root.into();
+        fs::create_dir_all(root.join("models"))?;
+        fs::create_dir_all(root.join("tmp"))?;
+        Ok(Self { root })
+    }
+
+    /// Publishes one complete immutable revision.
+    pub fn publish_revision(&self, request: PublishRequest) -> ArchiveResult<PathBuf> {
+        let (namespace, name) = validate_repo_id(&request.repo_id)?;
+        validate_component(&request.requested_revision)?;
+        validate_revision(&request.commit)?;
+        if request.files.is_empty() {
+            return Err(ArchiveError::InvalidPath("revision has no files".into()));
+        }
+
+        let revisions = self
+            .root
+            .join("models")
+            .join(namespace)
+            .join(name)
+            .join("revisions");
+        fs::create_dir_all(&revisions)?;
+        let published = revisions.join(&request.commit);
+        if published.exists() {
+            return Err(ArchiveError::AlreadyPublished(published));
+        }
+
+        let staging = self.staging_path(&request.commit);
+        fs::create_dir_all(&staging)?;
+        let result = self.write_revision(&staging, &request);
+        if let Err(error) = result {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+
+        if let Err(error) = fs::rename(&staging, &published) {
+            let _ = fs::remove_dir_all(&staging);
+            if published.exists() {
+                return Err(ArchiveError::AlreadyPublished(published));
+            }
+            return Err(error.into());
+        }
+        sync_directory(&revisions)?;
+        Ok(published)
+    }
+
+    /// Updates a mutable ref only after the target revision is published.
+    pub fn update_ref(&self, repo_id: &str, reference: &str, commit: &str) -> ArchiveResult<()> {
+        let (namespace, name) = validate_repo_id(repo_id)?;
+        validate_component(reference)?;
+        validate_revision(commit)?;
+        let revision = self
+            .root
+            .join("models")
+            .join(namespace)
+            .join(name)
+            .join("revisions")
+            .join(commit);
+        if !revision.is_dir() {
+            return Err(
+                io::Error::new(io::ErrorKind::NotFound, "revision is not published").into(),
+            );
+        }
+
+        let refs = revision.parent().unwrap().parent().unwrap().join("refs");
+        fs::create_dir_all(&refs)?;
+        let temporary = refs.join(format!(".{reference}.part"));
+        let mut file = File::create(&temporary)?;
+        file.write_all(commit.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temporary, refs.join(reference))?;
+        sync_directory(&refs)?;
+        Ok(())
+    }
+
+    pub fn revision_path(&self, repo_id: &str, commit: &str) -> ArchiveResult<PathBuf> {
+        let (namespace, name) = validate_repo_id(repo_id)?;
+        validate_revision(commit)?;
+        Ok(self
+            .root
+            .join("models")
+            .join(namespace)
+            .join(name)
+            .join("revisions")
+            .join(commit))
+    }
+
+    fn staging_path(&self, commit: &str) -> PathBuf {
+        let sequence = STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        self.root
+            .join("tmp")
+            .join(format!("revision-{commit}-{sequence}"))
+    }
+
+    fn write_revision(&self, staging: &Path, request: &PublishRequest) -> ArchiveResult<()> {
+        let mut entries = Vec::with_capacity(request.files.len());
+        for archive_file in &request.files {
+            let relative = validate_relative_file_path(&archive_file.path)?;
+            let destination = staging.join(relative);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&destination)?;
+            file.write_all(&archive_file.bytes)?;
+            file.sync_all()?;
+            entries.push((
+                archive_file.path.as_str(),
+                archive_file.bytes.len(),
+                sha256(&archive_file.bytes),
+            ));
+        }
+
+        let manifest = staging.join(".modelkeep-manifest.json");
+        let mut file = File::create(manifest)?;
+        write_manifest(&mut file, request, &entries)?;
+        file.sync_all()?;
+        sync_directory(staging)?;
+        Ok(())
+    }
+}
+
+fn validate_repo_id(repo_id: &str) -> ArchiveResult<(&str, &str)> {
+    let mut parts = repo_id.split('/');
+    let namespace = parts.next().unwrap_or_default();
+    let name = parts.next().unwrap_or_default();
+    if parts.next().is_some() || namespace.is_empty() || name.is_empty() {
+        return Err(ArchiveError::InvalidPath(repo_id.into()));
+    }
+    validate_component(namespace)?;
+    validate_component(name)?;
+    Ok((namespace, name))
+}
+
+fn validate_revision(revision: &str) -> ArchiveResult<()> {
+    if revision.is_empty()
+        || revision.len() > 128
+        || !revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(ArchiveError::InvalidPath(revision.into()));
+    }
+    Ok(())
+}
+
+fn validate_component(value: &str) -> ArchiveResult<()> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.contains('/')
+        || value.contains('\\')
+        || value
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+    {
+        return Err(ArchiveError::InvalidPath(value.into()));
+    }
+    Ok(())
+}
+
+fn validate_relative_file_path(value: &str) -> ArchiveResult<&Path> {
+    let path = Path::new(value);
+    if value.is_empty()
+        || path.is_absolute()
+        || value
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ArchiveError::InvalidPath(value.into()));
+    }
+    Ok(path)
+}
+
+fn write_manifest(
+    output: &mut File,
+    request: &PublishRequest,
+    entries: &[(&str, usize, String)],
+) -> io::Result<()> {
+    write!(
+        output,
+        "{{\"version\":1,\"repo_type\":\"model\",\"repo_id\":\"{}\",\"requested_revision\":\"{}\",\"commit\":\"{}\",\"archived_at\":{},\"files\":[",
+        json_escape(&request.repo_id),
+        json_escape(&request.requested_revision),
+        request.commit,
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+    )?;
+    for (index, (path, size, digest)) in entries.iter().enumerate() {
+        if index > 0 {
+            output.write_all(b",")?;
+        }
+        write!(
+            output,
+            "{{\"path\":\"{}\",\"size\":{},\"sha256\":\"{}\"}}",
+            json_escape(path),
+            size,
+            digest
+        )?;
+    }
+    output.write_all(b"]}\n")
+}
+
+fn json_escape(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|character| match character {
+            '"' => "\\\"".chars().collect::<Vec<_>>(),
+            '\\' => "\\\\".chars().collect(),
+            _ => vec![character],
+        })
+        .collect()
+}
+
+fn sync_directory(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn archive() -> (Archive, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        (archive, directory)
+    }
+
+    fn request(commit: &str, content: &[u8]) -> PublishRequest {
+        PublishRequest {
+            repo_id: "org/model".into(),
+            requested_revision: "main".into(),
+            commit: commit.into(),
+            files: vec![ArchiveFile {
+                path: "config.json".into(),
+                bytes: content.into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn publishes_revision_and_manifest() {
+        let (archive, _) = archive();
+        let path = archive
+            .publish_revision(request("aaaaaaaa", b"{}"))
+            .unwrap();
+        assert_eq!(fs::read(path.join("config.json")).unwrap(), b"{}");
+        let manifest = fs::read_to_string(path.join(".modelkeep-manifest.json")).unwrap();
+        assert!(manifest.contains("\"commit\":\"aaaaaaaa\""));
+        assert!(manifest.contains("\"size\":2"));
+    }
+
+    #[test]
+    fn published_revision_cannot_be_overwritten() {
+        let (archive, _) = archive();
+        archive
+            .publish_revision(request("aaaaaaaa", b"one"))
+            .unwrap();
+        assert!(matches!(
+            archive.publish_revision(request("aaaaaaaa", b"two")),
+            Err(ArchiveError::AlreadyPublished(_))
+        ));
+        let path = archive.revision_path("org/model", "aaaaaaaa").unwrap();
+        assert_eq!(fs::read(path.join("config.json")).unwrap(), b"one");
+    }
+
+    #[test]
+    fn ref_update_keeps_old_revision() {
+        let (archive, _) = archive();
+        archive
+            .publish_revision(request("aaaaaaaa", b"one"))
+            .unwrap();
+        archive
+            .publish_revision(request("bbbbbbbb", b"two"))
+            .unwrap();
+        archive.update_ref("org/model", "main", "aaaaaaaa").unwrap();
+        archive.update_ref("org/model", "main", "bbbbbbbb").unwrap();
+        let root = archive.revision_path("org/model", "aaaaaaaa").unwrap();
+        assert!(root.is_dir());
+        let reference = root.parent().unwrap().parent().unwrap().join("refs/main");
+        assert_eq!(fs::read_to_string(reference).unwrap(), "bbbbbbbb");
+    }
+
+    #[test]
+    fn rejects_unsafe_paths() {
+        let (archive, _) = archive();
+        let mut bad = request("aaaaaaaa", b"bad");
+        bad.repo_id = "../escape/model".into();
+        assert!(matches!(
+            archive.publish_revision(bad),
+            Err(ArchiveError::InvalidPath(_))
+        ));
+
+        let mut bad = request("bbbbbbbb", b"bad");
+        bad.files[0].path = "../escape".into();
+        assert!(matches!(
+            archive.publish_revision(bad),
+            Err(ArchiveError::InvalidPath(_))
+        ));
+    }
+
+    #[test]
+    fn failed_publish_leaves_no_staging_directory() {
+        let (archive, directory) = archive();
+        let mut bad = request("aaaaaaaa", b"bad");
+        bad.files[0].path = "../escape".into();
+        assert!(archive.publish_revision(bad).is_err());
+        let entries: Vec<_> = fs::read_dir(directory.path().join("tmp"))
+            .unwrap()
+            .collect();
+        assert!(entries.is_empty());
+    }
+}
