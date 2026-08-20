@@ -8,6 +8,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -21,6 +22,8 @@ pub mod singleflight;
 pub mod upstream;
 
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const STAGING_LEASE_FILE: &str = ".modelkeep-staging-lease";
+const STAGING_LEASE_SECONDS: u64 = 3600;
 
 #[derive(Debug)]
 pub enum ArchiveError {
@@ -161,14 +164,14 @@ impl Archive {
             return Err(ArchiveError::AlreadyPublished(published));
         }
 
-        let staging = self.staging_path(&request.commit);
-        fs::create_dir_all(&staging)?;
+        let staging = self.create_staging("revision")?;
         let result = self.write_revision(&staging, &request);
         if let Err(error) = result {
             let _ = fs::remove_dir_all(&staging);
             return Err(error);
         }
 
+        remove_staging_lease(&staging)?;
         if let Err(error) = fs::rename(&staging, &published) {
             let _ = fs::remove_dir_all(&staging);
             if published.exists() {
@@ -213,10 +216,25 @@ impl Archive {
         let mut recovered = 0;
         for entry in fs::read_dir(self.root.join("tmp"))? {
             let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                fs::remove_dir_all(entry.path())?;
-                recovered += 1;
+            let path = entry.path();
+            if !entry.file_type()?.is_dir() {
+                continue;
             }
+            let lease = path.join(STAGING_LEASE_FILE);
+            let Ok(metadata) = fs::read_to_string(&lease) else {
+                continue;
+            };
+            let Some(expires_at) = metadata
+                .lines()
+                .find_map(|line| line.strip_prefix("expires_at=")?.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            if expires_at > unix_timestamp() {
+                continue;
+            }
+            fs::remove_dir_all(path)?;
+            recovered += 1;
         }
         Ok(recovered)
     }
@@ -306,12 +324,7 @@ impl Archive {
     }
 
     pub fn create_fetch_staging(&self) -> ArchiveResult<PathBuf> {
-        let staging = self.root.join("tmp").join(format!(
-            "fetch-{}",
-            STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&staging)?;
-        Ok(staging)
+        self.create_staging("fetch")
     }
 
     pub fn revision_path(&self, repo_id: &str, commit: &str) -> ArchiveResult<PathBuf> {
@@ -408,13 +421,13 @@ impl Archive {
         if published.exists() {
             return Err(ArchiveError::AlreadyPublished(published));
         }
-        let staging = self.staging_path(&request.commit);
-        fs::create_dir_all(&staging)?;
+        let staging = self.create_staging("revision")?;
         let result = self.write_source_revision(&staging, &source_root, &request);
         if let Err(error) = result {
             let _ = fs::remove_dir_all(&staging);
             return Err(error);
         }
+        remove_staging_lease(&staging)?;
         if let Err(error) = fs::rename(&staging, &published) {
             let _ = fs::remove_dir_all(&staging);
             if published.exists() {
@@ -426,11 +439,35 @@ impl Archive {
         Ok(published)
     }
 
-    fn staging_path(&self, commit: &str) -> PathBuf {
-        let sequence = STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        self.root
-            .join("tmp")
-            .join(format!("revision-{commit}-{sequence}"))
+    fn create_staging(&self, prefix: &str) -> ArchiveResult<PathBuf> {
+        for _ in 0..16 {
+            let operation = operation_id();
+            let staging = self.root.join("tmp").join(format!("{prefix}-{operation}"));
+            match fs::create_dir(&staging) {
+                Ok(()) => {
+                    let mut lease = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(staging.join(STAGING_LEASE_FILE))?;
+                    writeln!(lease, "nonce={operation}")?;
+                    writeln!(lease, "pid={}", process::id())?;
+                    writeln!(
+                        lease,
+                        "expires_at={}",
+                        unix_timestamp() + STAGING_LEASE_SECONDS
+                    )?;
+                    lease.sync_all()?;
+                    sync_directory(&staging)?;
+                    return Ok(staging);
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(ArchiveError::Io(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "unable to allocate unique staging directory",
+        )))
     }
 
     fn write_revision(&self, staging: &Path, request: &PublishRequest) -> ArchiveResult<()> {
@@ -519,6 +556,36 @@ impl Archive {
         file.sync_all()?;
         sync_directory(staging)?;
         Ok(())
+    }
+}
+
+fn operation_id() -> String {
+    let mut bytes = [0u8; 16];
+    if let Ok(mut random) = File::open("/dev/urandom") {
+        if random.read_exact(&mut bytes).is_ok() {
+            return hex_digest(&bytes);
+        }
+    }
+    format!(
+        "{}-{}-{}",
+        unix_timestamp(),
+        process::id(),
+        STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn remove_staging_lease(staging: &Path) -> ArchiveResult<()> {
+    match fs::remove_file(staging.join(STAGING_LEASE_FILE)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -708,7 +775,7 @@ mod tests {
 
     #[test]
     fn publishes_revision_and_manifest() {
-        let (archive, _) = archive();
+        let (archive, _directory) = archive();
         let path = archive
             .publish_revision(request("aaaaaaaa", b"{}"))
             .unwrap();
@@ -755,7 +822,7 @@ mod tests {
 
     #[test]
     fn published_revision_cannot_be_overwritten() {
-        let (archive, _) = archive();
+        let (archive, _directory) = archive();
         archive
             .publish_revision(request("aaaaaaaa", b"one"))
             .unwrap();
@@ -769,7 +836,7 @@ mod tests {
 
     #[test]
     fn ref_update_keeps_old_revision() {
-        let (archive, _) = archive();
+        let (archive, _directory) = archive();
         archive
             .publish_revision(request("aaaaaaaa", b"one"))
             .unwrap();
@@ -786,7 +853,7 @@ mod tests {
 
     #[test]
     fn dry_run_preserves_unreferenced_revision() {
-        let (archive, _) = archive();
+        let (archive, _directory) = archive();
         archive
             .publish_revision(request("aaaaaaaa", b"one"))
             .unwrap();
@@ -802,7 +869,7 @@ mod tests {
 
     #[test]
     fn removes_unreferenced_revision() {
-        let (archive, _) = archive();
+        let (archive, _directory) = archive();
         archive
             .publish_revision(request("aaaaaaaa", b"one"))
             .unwrap();
@@ -818,7 +885,7 @@ mod tests {
 
     #[test]
     fn refuses_to_remove_referenced_revision() {
-        let (archive, _) = archive();
+        let (archive, _directory) = archive();
         archive
             .publish_revision(request("aaaaaaaa", b"one"))
             .unwrap();
@@ -835,7 +902,7 @@ mod tests {
 
     #[test]
     fn rejects_unsafe_paths() {
-        let (archive, _) = archive();
+        let (archive, _directory) = archive();
         let mut bad = request("aaaaaaaa", b"bad");
         bad.repo_id = "../escape/model".into();
         assert!(matches!(
@@ -853,7 +920,7 @@ mod tests {
 
     #[test]
     fn resolves_only_files_inside_published_revision() {
-        let (archive, _) = archive();
+        let (archive, _directory) = archive();
         archive
             .publish_revision(request("aaaaaaaa", b"{}"))
             .unwrap();
@@ -904,10 +971,28 @@ mod tests {
         assert!(entries.is_empty());
     }
     #[test]
+    fn recovery_preserves_active_staging() {
+        let (archive, _directory) = archive();
+        let staging = archive.create_fetch_staging().unwrap();
+        fs::write(
+            staging.join(STAGING_LEASE_FILE),
+            format!("nonce=test\npid=1\nexpires_at={}\n", unix_timestamp() + 60),
+        )
+        .unwrap();
+        assert_eq!(archive.recover_incomplete().unwrap(), 0);
+        assert!(staging.exists());
+    }
+
+    #[test]
     fn recovery_removes_unpublished_staging_only() {
         let (archive, directory) = archive();
         let staging = archive.create_fetch_staging().unwrap();
         fs::write(staging.join("partial.bin"), b"partial").unwrap();
+        fs::write(
+            staging.join(STAGING_LEASE_FILE),
+            "nonce=test\npid=1\nexpires_at=0\n",
+        )
+        .unwrap();
         assert_eq!(archive.recover_incomplete().unwrap(), 1);
         assert!(!staging.exists());
         assert!(!directory.path().join("models/org/model/revisions").exists());

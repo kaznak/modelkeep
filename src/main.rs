@@ -33,7 +33,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|| PathBuf::from("/data"));
             let repo = args.next().ok_or("list requires repository id")?;
             let archive = Archive::new(root)?;
-            archive.recover_incomplete()?;
             for commit in archive.list_revisions(&repo)? {
                 println!("{commit}");
             }
@@ -47,7 +46,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let repo = args.next().ok_or("show requires repository id")?;
             let commit = args.next().ok_or("show requires commit")?;
             let archive = Archive::new(root)?;
-            archive.recover_incomplete()?;
             print!("{}", archive.manifest(&repo, &commit)?);
             Ok(())
         }
@@ -75,7 +73,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let repo = args.next().ok_or("verify requires repository id")?;
             let commit = args.next().ok_or("verify requires commit")?;
             let archive = Archive::new(root)?;
-            archive.recover_incomplete()?;
             let count = archive.verify_revision(&repo, &commit)?;
             println!("verified {count} files for {repo}@{commit}");
             Ok(())
@@ -87,11 +84,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|| PathBuf::from("/data"));
             let repo = args.next().ok_or("remove requires repository id")?;
             let commit = args.next().ok_or("remove requires commit")?;
-            let option = args.next();
-            let dry_run = option.is_some();
-            if option.as_deref() != Some("--dry-run") || args.next().is_some() {
-                return Err("remove accepts only --dry-run".into());
-            }
+            let dry_run = match args.next().as_deref() {
+                None => false,
+                Some("--dry-run") => {
+                    if args.next().is_some() {
+                        return Err("remove accepts only --dry-run".into());
+                    }
+                    true
+                }
+                Some(_) => return Err("remove accepts only --dry-run".into()),
+            };
             let archive = Archive::new(root)?;
             archive.recover_incomplete()?;
             let result = archive.remove_revision(&repo, &commit, dry_run)?;
