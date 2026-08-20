@@ -1,0 +1,24 @@
+services:
+  modelkeep:
+    # Build and tag the image from the Nix flake before deployment.
+    # Keep this tag pinned to a released version or Git commit; do not use latest.
+    image: modelkeep:${MODELKEEP_IMAGE_TAG:-0.1.0}
+    restart: unless-stopped
+    read_only: true
+    user: "10001:10001"
+    ports:
+      - "8090:8090"
+    volumes:
+      # Change the host path to the QNAP share reserved for ModelKeep.
+      - /share/LLM/modelkeep:/data
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+      HF_HOME: /tmp/huggingface
+      # Optional service token for private or gated upstream repositories.
+      HF_TOKEN: ${HF_TOKEN:-}
