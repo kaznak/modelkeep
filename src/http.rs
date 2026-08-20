@@ -55,6 +55,7 @@ pub fn router_with_pullthrough(archive: Archive, pullthrough: Arc<PullThrough>) 
 fn router_with_state(state: HttpState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route(
             "/api/models/{namespace}/{repo}/revision/{revision}",
             get(model_info),
@@ -68,6 +69,16 @@ fn router_with_state(state: HttpState) -> Router {
 
 async fn healthz() -> StatusCode {
     StatusCode::OK
+}
+
+async fn readyz(State(state): State<HttpState>) -> StatusCode {
+    match state.archive.check_readiness() {
+        Ok(()) => StatusCode::OK,
+        Err(error) => {
+            tracing::warn!(error = %error, "archive readiness check failed");
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+    }
 }
 
 async fn model_info(
@@ -301,6 +312,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn readiness_endpoint_reports_archive_state() {
+        let (app, directory) = test_router();
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        std::fs::remove_dir_all(directory.path().join("tmp")).unwrap();
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

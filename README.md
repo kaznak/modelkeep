@@ -94,6 +94,7 @@ them. Only `v*` tags push images to GHCR and create the multi-architecture manif
 ```sh
 modelkeep serve [archive-root] [bind-address]
 modelkeep health
+modelkeep ready
 modelkeep list [archive-root] <repo-id>
 modelkeep show [archive-root] <repo-id> <commit>
 modelkeep verify [archive-root] <repo-id> <commit>
@@ -108,8 +109,7 @@ modelkeep import-hf-cache ~/.cache/huggingface/hub /data
 modelkeep verify /data Qwen/ExampleModel <commit>
 ```
 
-The `GET /healthz` endpoint is a lightweight liveness check. The QNAP Compose
-deployment uses `modelkeep health` for its container healthcheck.
+The `GET /healthz` endpoint is a lightweight process liveness check. `GET /readyz` verifies that the archive paths are available and writable. The QNAP Compose deployment uses `modelkeep ready` for its container healthcheck.
 
 ## Durable archive
 

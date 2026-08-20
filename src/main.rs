@@ -23,6 +23,23 @@ async fn main() {
     }
 }
 
+fn probe_endpoint(endpoint: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let address = env::var("MODELKEEP_HEALTH_ADDRESS")
+        .unwrap_or_else(|_| "127.0.0.1:8090".to_string())
+        .parse::<SocketAddr>()?;
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let request =
+        format!("GET {endpoint} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes())?;
+    let mut buffer = [0u8; 128];
+    let read = stream.read(&mut buffer)?;
+    if !String::from_utf8_lossy(&buffer[..read]).starts_with("HTTP/1.1 200") {
+        return Err(format!("endpoint {endpoint} is not ready").into());
+    }
+    Ok(())
+}
+
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
@@ -131,22 +148,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             Ok(())
         }
-        Some("health") => {
-            let address = env::var("MODELKEEP_HEALTH_ADDRESS")
-                .unwrap_or_else(|_| "127.0.0.1:8090".to_string())
-                .parse::<SocketAddr>()?;
-            let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
-            stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-            stream.write_all(
-                b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-            )?;
-            let mut buffer = [0u8; 128];
-            let read = stream.read(&mut buffer)?;
-            if !String::from_utf8_lossy(&buffer[..read]).starts_with("HTTP/1.1 200") {
-                return Err("health endpoint is not ready".into());
-            }
-            Ok(())
-        }
+        Some("health") => probe_endpoint("/healthz"),
+        Some("ready") => probe_endpoint("/readyz"),
         Some("help") | None => {
             println!(
                 "usage: modelkeep list [archive-root] <repo-id>
@@ -154,6 +157,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
        modelkeep import-hf-cache <cache-path> [archive-root]
        modelkeep serve [archive-root] [bind-address]
        modelkeep health
+       modelkeep ready
        modelkeep verify [archive-root] <repo-id> <commit>
        modelkeep remove [archive-root] <repo-id> <commit> [--dry-run]"
             );

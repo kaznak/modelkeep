@@ -323,6 +323,33 @@ impl Archive {
         Ok(commit)
     }
 
+    pub fn check_readiness(&self) -> ArchiveResult<()> {
+        for directory in [self.root.join("models"), self.root.join("tmp")] {
+            if !directory.is_dir() {
+                return Err(ArchiveError::Io(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "required archive directory is unavailable: {}",
+                        directory.display()
+                    ),
+                )));
+            }
+        }
+        let probe = self
+            .root
+            .join("tmp")
+            .join(format!("readiness-{}", operation_id()));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)?;
+        file.write_all(b"modelkeep-readiness")?;
+        file.sync_all()?;
+        fs::remove_file(&probe)?;
+        sync_directory(&self.root.join("tmp"))?;
+        Ok(())
+    }
+
     pub fn create_fetch_staging(&self) -> ArchiveResult<PathBuf> {
         self.create_staging("fetch")
     }

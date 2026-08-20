@@ -16,7 +16,7 @@ services:
     cap_drop:
       - ALL
     healthcheck:
-      test: ["CMD", "/bin/modelkeep", "health"]
+      test: ["CMD", "/bin/modelkeep", "ready"]
       interval: 30s
       timeout: 5s
       retries: 3
