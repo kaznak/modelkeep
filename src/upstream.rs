@@ -43,7 +43,7 @@ impl std::fmt::Display for UpstreamError {
 
 impl std::error::Error for UpstreamError {}
 
-pub trait UpstreamFetcher {
+pub trait UpstreamFetcher: Send + Sync {
     fn fetch(&self, request: &FetchRequest) -> Result<FetchedRevision, UpstreamError>;
 }
 

@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 
 pub mod http;
 pub mod importer;
+pub mod pullthrough;
 pub mod singleflight;
 pub mod upstream;
 
@@ -191,6 +192,30 @@ impl Archive {
         fs::rename(&temporary, refs.join(reference))?;
         sync_directory(&refs)?;
         Ok(())
+    }
+
+    pub fn resolve_ref(&self, repo_id: &str, reference: &str) -> ArchiveResult<String> {
+        let (namespace, name) = validate_repo_id(repo_id)?;
+        validate_component(reference)?;
+        let path = self
+            .root
+            .join("models")
+            .join(namespace)
+            .join(name)
+            .join("refs")
+            .join(reference);
+        let commit = fs::read_to_string(path)?.trim().to_string();
+        validate_revision(&commit)?;
+        Ok(commit)
+    }
+
+    pub fn create_fetch_staging(&self) -> ArchiveResult<PathBuf> {
+        let staging = self.root.join("tmp").join(format!(
+            "fetch-{}",
+            STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&staging)?;
+        Ok(staging)
     }
 
     pub fn revision_path(&self, repo_id: &str, commit: &str) -> ArchiveResult<PathBuf> {

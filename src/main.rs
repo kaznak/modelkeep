@@ -1,6 +1,6 @@
-use std::{env, net::SocketAddr, path::PathBuf, process};
+use std::{env, net::SocketAddr, path::PathBuf, process, sync::Arc};
 
-use modelkeep::{http, Archive};
+use modelkeep::{http, pullthrough::PullThrough, upstream::OfficialHfFetcher, Archive};
 
 #[tokio::main]
 async fn main() {
@@ -50,7 +50,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|| "0.0.0.0:8090".to_string())
                 .parse::<SocketAddr>()?;
             let archive = Archive::new(root)?;
-            http::serve(archive, bind).await?;
+            match (
+                env::var("MODELKEEP_HF_PYTHON"),
+                env::var("MODELKEEP_HF_HELPER"),
+            ) {
+                (Ok(python), Ok(helper)) => {
+                    let fetcher = Arc::new(OfficialHfFetcher {
+                        python: python.into(),
+                        helper: helper.into(),
+                    });
+                    let pullthrough = Arc::new(PullThrough::new(archive.clone(), fetcher));
+                    http::serve_with_pullthrough(archive, pullthrough, bind).await?;
+                }
+                _ => http::serve(archive, bind).await?,
+            }
             Ok(())
         }
         Some("help") | None => {

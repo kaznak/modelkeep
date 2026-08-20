@@ -11,22 +11,43 @@ use axum::{
 };
 use tokio::task;
 
+use crate::pullthrough::PullThrough;
 use crate::{parse_range, Archive, ArchiveError, ByteRange, RangeError};
 
 #[derive(Clone)]
 pub struct HttpState {
     archive: Arc<Archive>,
+    pullthrough: Option<Arc<PullThrough>>,
 }
-
 pub async fn serve(archive: Archive, address: std::net::SocketAddr) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(address).await?;
     axum::serve(listener, router(archive)).await
 }
 
+pub async fn serve_with_pullthrough(
+    archive: Archive,
+    pullthrough: Arc<PullThrough>,
+    address: std::net::SocketAddr,
+) -> std::io::Result<()> {
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    axum::serve(listener, router_with_pullthrough(archive, pullthrough)).await
+}
+
 pub fn router(archive: Archive) -> Router {
-    let state = HttpState {
+    router_with_state(HttpState {
         archive: Arc::new(archive),
-    };
+        pullthrough: None,
+    })
+}
+
+pub fn router_with_pullthrough(archive: Archive, pullthrough: Arc<PullThrough>) -> Router {
+    router_with_state(HttpState {
+        archive: Arc::new(archive),
+        pullthrough: Some(pullthrough),
+    })
+}
+
+fn router_with_state(state: HttpState) -> Router {
     Router::new()
         .route(
             "/{namespace}/{repo}/resolve/{revision}/{*path}",
@@ -61,8 +82,36 @@ async fn file_response(
     head_only: bool,
 ) -> Result<Response, StatusCode> {
     let repo_id = format!("{namespace}/{repo}");
-    let resolved_result = state.archive.resolve_file(&repo_id, &revision, &path);
-    let resolved = resolved_result.map_err(status_for_archive_error)?;
+    let resolved_result = if is_commit(&revision) {
+        state.archive.resolve_file(&repo_id, &revision, &path)
+    } else {
+        state
+            .archive
+            .resolve_ref(&repo_id, &revision)
+            .and_then(|commit| state.archive.resolve_file(&repo_id, &commit, &path))
+    };
+    let resolved = match resolved_result {
+        Ok(resolved) => resolved,
+        Err(ArchiveError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            let Some(pullthrough) = state.pullthrough.clone() else {
+                return Err(StatusCode::NOT_FOUND);
+            };
+            let requested = revision.clone();
+            let requested_file = path.clone();
+            let repo = repo_id.clone();
+            let commit = task::spawn_blocking(move || {
+                pullthrough.ensure(&repo, &requested, &[requested_file])
+            })
+            .await
+            .map_err(|_| StatusCode::BAD_GATEWAY)?
+            .map_err(|_| StatusCode::BAD_GATEWAY)?;
+            state
+                .archive
+                .resolve_file(&repo_id, &commit, &path)
+                .map_err(status_for_archive_error)?
+        }
+        Err(error) => return Err(status_for_archive_error(error)),
+    };
     let size = resolved.size;
     let range = match headers.get(header::RANGE) {
         Some(value) => {
@@ -128,8 +177,13 @@ fn status_for_range_error(error: RangeError) -> StatusCode {
     }
 }
 
+fn is_commit(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use axum::body::to_bytes;
     use tower::ServiceExt;
@@ -209,6 +263,43 @@ mod tests {
                 .unwrap()
                 .len(),
             0
+        );
+    }
+    struct HttpFakeFetcher;
+
+    impl crate::upstream::UpstreamFetcher for HttpFakeFetcher {
+        fn fetch(
+            &self,
+            request: &crate::upstream::FetchRequest,
+        ) -> Result<crate::upstream::FetchedRevision, crate::upstream::UpstreamError> {
+            std::fs::write(request.staging.join("config.json"), b"cold-http").unwrap();
+            Ok(crate::upstream::FetchedRevision {
+                commit: "bbbbbbbb".into(),
+                files: vec!["config.json".into()],
+                staging: request.staging.clone(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_miss_fetches_then_serves_mutable_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        let pullthrough = Arc::new(PullThrough::new(archive.clone(), Arc::new(HttpFakeFetcher)));
+        let app = router_with_pullthrough(archive, pullthrough);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/org/model/resolve/main/config.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+            "cold-http"
         );
     }
 }
