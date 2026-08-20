@@ -9,7 +9,6 @@ struct Flight<V, E> {
     completed: Condvar,
 }
 
-#[derive(Default)]
 pub struct SingleFlight<K, V, E> {
     flights: Mutex<HashMap<K, Arc<Flight<V, E>>>>,
 }
@@ -21,7 +20,9 @@ where
     E: Clone,
 {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            flights: Mutex::new(HashMap::new()),
+        }
     }
 
     pub fn run<F>(&self, key: K, fetch: F) -> Result<V, E>
