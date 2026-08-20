@@ -29,20 +29,20 @@
         modelkeep-image = pkgs.dockerTools.buildLayeredImage {
           name = "modelkeep";
           tag = "0.1.0";
-          contents = [ self.packages.${pkgs.system}.modelkeep hfFetcher python pkgs.cacert ];
+          contents = [ self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep hfFetcher python pkgs.cacert ];
           config = {
-            Entrypoint = [ "${self.packages.${pkgs.system}.modelkeep}/bin/modelkeep" "serve" ];
+            Entrypoint = [ "${self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep}/bin/modelkeep" "serve" ];
             User = "10001:10001";
             ExposedPorts."8090/tcp" = {};
             Env = [ "RUST_LOG=info" "MODELKEEP_HF_PYTHON=${python}/bin/python3" "MODELKEEP_HF_HELPER=${hfFetcher}/bin/hf_fetch.py" ];
           };
         };
 
-        default = self.packages.${pkgs.system}.modelkeep;
+        default = self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep;
       });
 
       checks = forAllSystems (pkgs: {
-        modelkeep = self.packages.${pkgs.system}.modelkeep;
+        modelkeep = self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep;
       });
     };
 }
