@@ -175,6 +175,14 @@ async fn file_response(
         Err(error) => return Err(status_for_archive_error(error)),
     };
     let size = resolved.size;
+    let etag_revision = if is_commit(&revision) {
+        revision.clone()
+    } else {
+        state
+            .archive
+            .resolve_ref(&repo_id, &revision)
+            .unwrap_or(revision.clone())
+    };
     let range = match headers.get(header::RANGE) {
         Some(value) => {
             let value = value.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -195,9 +203,19 @@ async fn file_response(
         .status(status)
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::CONTENT_LENGTH, content_length)
-        .header(header::ETAG, format!("\"{revision}-{size}\""));
+        .header(header::ETAG, format!("\"{etag_revision}-{size}\""));
     if let Some(ByteRange { start, end }) = range {
         response = response.header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{size}"));
+    }
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        == Some(format!("\"{etag_revision}-{size}\"").as_str())
+    {
+        return response
+            .status(StatusCode::NOT_MODIFIED)
+            .body(Body::empty())
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
     }
     let body = if head_only {
         Body::empty()
@@ -320,6 +338,30 @@ mod tests {
         assert_eq!(
             to_bytes(response.into_body(), usize::MAX).await.unwrap(),
             "2345"
+        );
+    }
+
+    #[tokio::test]
+    async fn returns_not_modified_for_matching_etag() {
+        let (app, _directory) = test_router();
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/org/model/resolve/aaaaaaaa/config.json")
+                    .header(header::IF_NONE_MATCH, "\"aaaaaaaa-10\"")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(response.headers()[header::ETAG], "\"aaaaaaaa-10\"");
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .len(),
+            0
         );
     }
 
