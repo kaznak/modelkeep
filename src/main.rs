@@ -23,6 +23,17 @@ async fn main() {
     }
 }
 
+fn parse_remove_option(option: Option<&str>, has_extra: bool) -> Result<bool, String> {
+    if has_extra {
+        return Err("remove accepts only --dry-run".into());
+    }
+    match option {
+        None => Ok(false),
+        Some("--dry-run") => Ok(true),
+        Some(_) => Err("remove accepts only --dry-run".into()),
+    }
+}
+
 fn probe_endpoint(endpoint: &str) -> Result<(), Box<dyn std::error::Error>> {
     let address = env::var("MODELKEEP_HEALTH_ADDRESS")
         .unwrap_or_else(|_| "127.0.0.1:8090".to_string())
@@ -101,16 +112,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|| PathBuf::from("/data"));
             let repo = args.next().ok_or("remove requires repository id")?;
             let commit = args.next().ok_or("remove requires commit")?;
-            let dry_run = match args.next().as_deref() {
-                None => false,
-                Some("--dry-run") => {
-                    if args.next().is_some() {
-                        return Err("remove accepts only --dry-run".into());
-                    }
-                    true
-                }
-                Some(_) => return Err("remove accepts only --dry-run".into()),
-            };
+            let dry_run = parse_remove_option(args.next().as_deref(), args.next().is_some())?;
             let archive = Archive::new(root)?;
             archive.recover_incomplete()?;
             let result = archive.remove_revision(&repo, &commit, dry_run)?;
@@ -164,5 +166,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Some(command) => Err(format!("unknown command: {command}").into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_remove_option;
+
+    #[test]
+    fn remove_option_parser_accepts_real_delete_and_dry_run() {
+        assert!(!parse_remove_option(None, false).unwrap());
+        assert!(parse_remove_option(Some("--dry-run"), false).unwrap());
+    }
+
+    #[test]
+    fn remove_option_parser_rejects_unknown_and_extra_arguments() {
+        assert!(parse_remove_option(Some("--other"), false).is_err());
+        assert!(parse_remove_option(None, true).is_err());
+        assert!(parse_remove_option(Some("--dry-run"), true).is_err());
     }
 }

@@ -10,7 +10,8 @@ use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -495,6 +496,7 @@ impl Archive {
                     )?;
                     lease.sync_all()?;
                     sync_directory(&staging)?;
+                    spawn_lease_heartbeat(staging.clone());
                     return Ok(staging);
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -659,6 +661,36 @@ fn unix_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn spawn_lease_heartbeat(staging: PathBuf) {
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_secs(30));
+        if !staging.is_dir() || refresh_staging_lease(&staging).is_err() {
+            break;
+        }
+    });
+}
+
+fn refresh_staging_lease(staging: &Path) -> ArchiveResult<()> {
+    let metadata = fs::read_to_string(staging.join(STAGING_LEASE_FILE))?;
+    let nonce = metadata
+        .lines()
+        .find_map(|line| line.strip_prefix("nonce="))
+        .ok_or_else(|| ArchiveError::IntegrityMismatch("staging lease has no nonce".into()))?;
+    let temporary = staging.join(".modelkeep-staging-lease.part");
+    let mut lease = File::create(&temporary)?;
+    writeln!(lease, "nonce={nonce}")?;
+    writeln!(lease, "pid={}", process::id())?;
+    writeln!(
+        lease,
+        "expires_at={}",
+        unix_timestamp() + STAGING_LEASE_SECONDS
+    )?;
+    lease.sync_all()?;
+    fs::rename(temporary, staging.join(STAGING_LEASE_FILE))?;
+    sync_directory(staging)?;
+    Ok(())
 }
 
 fn remove_staging_lease(staging: &Path) -> ArchiveResult<()> {
@@ -1051,6 +1083,17 @@ mod tests {
         assert!(entries.is_empty());
     }
     #[test]
+    fn staging_ids_are_unique_across_operations() {
+        let (archive, _directory) = archive();
+        let mut paths = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let path = archive.create_fetch_staging().unwrap();
+            assert!(paths.insert(path));
+        }
+        assert_eq!(paths.len(), 64);
+    }
+
+    #[test]
     fn recovery_preserves_active_staging() {
         let (archive, _directory) = archive();
         let staging = archive.create_fetch_staging().unwrap();
@@ -1076,5 +1119,28 @@ mod tests {
         assert_eq!(archive.recover_incomplete().unwrap(), 1);
         assert!(!staging.exists());
         assert!(!directory.path().join("models/org/model/revisions").exists());
+    }
+    #[test]
+    fn reuses_fetch_staging_for_publication() {
+        let (archive, _directory) = archive();
+        let staging = archive.create_fetch_staging().unwrap();
+        fs::write(staging.join("model.bin"), vec![3u8; 1024]).unwrap();
+        let published = archive
+            .publish_revision_from_directory(SourcePublishRequest {
+                repo_id: "org/model".into(),
+                requested_revision: "main".into(),
+                commit: "dddddddd".into(),
+                source_root: staging.clone(),
+                files: vec![SourceFile {
+                    path: "model.bin".into(),
+                    source: staging.join("model.bin"),
+                }],
+            })
+            .unwrap();
+        assert!(!staging.exists());
+        assert_eq!(
+            fs::metadata(published.join("model.bin")).unwrap().len(),
+            1024
+        );
     }
 }
