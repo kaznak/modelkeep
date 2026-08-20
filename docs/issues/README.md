@@ -14,7 +14,7 @@ Issue files use a zero-padded number and a short kebab-case title:
 NNNN-short-description.md
 ```
 
-Each issue should state:
+Each issue must begin with YAML frontmatter containing `status`, `priority`, `related_adrs`, `created`, and `updated`. The body should also state:
 
 - `Status`: `Open`, `In Progress`, `Blocked`, or `Done`;
 - `Priority`: `P0` through `P3`;
@@ -33,6 +33,5 @@ Priority meanings:
 
 ## Current backlog
 
-- [0003 — Add a health endpoint](0003-add-health-endpoint.md)
 - [0004 — Add storage observability](0004-add-storage-observability.md)
 - [0005 — Define the client network boundary](0005-define-client-network-boundary.md)
