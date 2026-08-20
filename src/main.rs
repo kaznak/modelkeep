@@ -72,6 +72,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("verified {count} files for {repo}@{commit}");
             Ok(())
         }
+        Some("remove") => {
+            let root = args
+                .next()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/data"));
+            let repo = args.next().ok_or("remove requires repository id")?;
+            let commit = args.next().ok_or("remove requires commit")?;
+            let option = args.next();
+            let dry_run = option.is_some();
+            if option.as_deref() != Some("--dry-run") || args.next().is_some() {
+                return Err("remove accepts only --dry-run".into());
+            }
+            let archive = Archive::new(root)?;
+            archive.recover_incomplete()?;
+            let result = archive.remove_revision(&repo, &commit, dry_run)?;
+            if result.removed {
+                println!("removed {repo}@{commit}");
+            } else {
+                println!("would remove {repo}@{commit}");
+            }
+            Ok(())
+        }
         Some("serve") => {
             let root = args
                 .next()
@@ -105,7 +127,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
        modelkeep show [archive-root] <repo-id> <commit>
        modelkeep import-hf-cache <cache-path> [archive-root]
        modelkeep serve [archive-root] [bind-address]
-       modelkeep verify [archive-root] <repo-id> <commit>"
+       modelkeep verify [archive-root] <repo-id> <commit>
+       modelkeep remove [archive-root] <repo-id> <commit> [--dry-run]"
             );
             Ok(())
         }

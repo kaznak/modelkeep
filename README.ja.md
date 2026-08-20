@@ -91,6 +91,7 @@ modelkeep serve [archive-root] [bind-address]
 modelkeep list [archive-root] <repo-id>
 modelkeep show [archive-root] <repo-id> <commit>
 modelkeep verify [archive-root] <repo-id> <commit>
+modelkeep remove [archive-root] <repo-id> <commit> [--dry-run]
 modelkeep import-hf-cache <cache-path> [archive-root]
 ```
 

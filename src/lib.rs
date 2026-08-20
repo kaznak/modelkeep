@@ -807,7 +807,7 @@ mod tests {
         archive.update_ref("org/model", "main", "aaaaaaaa").unwrap();
         assert!(matches!(
             archive.remove_revision("org/model", "aaaaaaaa", false),
-            Err(ArchiveError::ReferencedRevision(refs)) if refs == &["main"]
+            Err(ArchiveError::ReferencedRevision(refs)) if refs == vec![String::from("main")]
         ));
         assert!(archive
             .revision_path("org/model", "aaaaaaaa")
