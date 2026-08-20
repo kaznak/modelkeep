@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 pub mod http;
 pub mod importer;
 pub mod singleflight;
+pub mod upstream;
 
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
