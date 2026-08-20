@@ -194,6 +194,18 @@ impl Archive {
         Ok(())
     }
 
+    pub fn recover_incomplete(&self) -> ArchiveResult<usize> {
+        let mut recovered = 0;
+        for entry in fs::read_dir(self.root.join("tmp"))? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                fs::remove_dir_all(entry.path())?;
+                recovered += 1;
+            }
+        }
+        Ok(recovered)
+    }
+
     pub fn list_revisions(&self, repo_id: &str) -> ArchiveResult<Vec<String>> {
         let (namespace, name) = validate_repo_id(repo_id)?;
         let revisions = self
@@ -289,8 +301,7 @@ impl Archive {
             if resolved.size != entry.size {
                 return Err(ArchiveError::IntegrityMismatch(entry.path.clone()));
             }
-            let bytes = fs::read(&resolved.path)?;
-            if sha256(&bytes) != entry.sha256 {
+            if sha256_file(&resolved.path)? != entry.sha256 {
                 return Err(ArchiveError::IntegrityMismatch(entry.path.clone()));
             }
             verified += 1;
@@ -581,6 +592,20 @@ fn hex_digest(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn sha256_file(path: &Path) -> io::Result<String> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex_digest(hasher.finalize().as_slice()))
+}
+
 fn sha256(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
@@ -757,5 +782,14 @@ mod tests {
             .unwrap()
             .collect();
         assert!(entries.is_empty());
+    }
+    #[test]
+    fn recovery_removes_unpublished_staging_only() {
+        let (archive, directory) = archive();
+        let staging = archive.create_fetch_staging().unwrap();
+        fs::write(staging.join("partial.bin"), b"partial").unwrap();
+        assert_eq!(archive.recover_incomplete().unwrap(), 1);
+        assert!(!staging.exists());
+        assert!(!directory.path().join("models/org/model/revisions").exists());
     }
 }

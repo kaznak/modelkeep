@@ -25,6 +25,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|| PathBuf::from("/data"));
             let repo = args.next().ok_or("list requires repository id")?;
             let archive = Archive::new(root)?;
+            archive.recover_incomplete()?;
             for commit in archive.list_revisions(&repo)? {
                 println!("{commit}");
             }
@@ -38,6 +39,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let repo = args.next().ok_or("show requires repository id")?;
             let commit = args.next().ok_or("show requires commit")?;
             let archive = Archive::new(root)?;
+            archive.recover_incomplete()?;
             print!("{}", archive.manifest(&repo, &commit)?);
             Ok(())
         }
@@ -48,6 +50,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/data"));
             let archive = Archive::new(root)?;
+            archive.recover_incomplete()?;
             let report =
                 modelkeep::importer::import_hf_cache(&archive, PathBuf::from(cache).as_path())?;
             println!(
@@ -64,6 +67,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let repo = args.next().ok_or("verify requires repository id")?;
             let commit = args.next().ok_or("verify requires commit")?;
             let archive = Archive::new(root)?;
+            archive.recover_incomplete()?;
             let count = archive.verify_revision(&repo, &commit)?;
             println!("verified {count} files for {repo}@{commit}");
             Ok(())
@@ -78,6 +82,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|| "0.0.0.0:8090".to_string())
                 .parse::<SocketAddr>()?;
             let archive = Archive::new(root)?;
+            archive.recover_incomplete()?;
             match (
                 env::var("MODELKEEP_HF_PYTHON"),
                 env::var("MODELKEEP_HF_HELPER"),
