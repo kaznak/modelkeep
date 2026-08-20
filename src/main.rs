@@ -13,6 +13,29 @@ async fn main() {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
+        Some("list") => {
+            let root = args
+                .next()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/data"));
+            let repo = args.next().ok_or("list requires repository id")?;
+            let archive = Archive::new(root)?;
+            for commit in archive.list_revisions(&repo)? {
+                println!("{commit}");
+            }
+            Ok(())
+        }
+        Some("show") => {
+            let root = args
+                .next()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/data"));
+            let repo = args.next().ok_or("show requires repository id")?;
+            let commit = args.next().ok_or("show requires commit")?;
+            let archive = Archive::new(root)?;
+            print!("{}", archive.manifest(&repo, &commit)?);
+            Ok(())
+        }
         Some("import-hf-cache") => {
             let cache = args.next().ok_or("import-hf-cache requires cache path")?;
             let root = args
@@ -68,7 +91,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some("help") | None => {
             println!(
-                "usage: modelkeep import-hf-cache <cache-path> [archive-root]
+                "usage: modelkeep list [archive-root] <repo-id>
+       modelkeep show [archive-root] <repo-id> <commit>
+       modelkeep import-hf-cache <cache-path> [archive-root]
        modelkeep serve [archive-root] [bind-address]
        modelkeep verify [archive-root] <repo-id> <commit>"
             );

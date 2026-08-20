@@ -194,6 +194,35 @@ impl Archive {
         Ok(())
     }
 
+    pub fn list_revisions(&self, repo_id: &str) -> ArchiveResult<Vec<String>> {
+        let (namespace, name) = validate_repo_id(repo_id)?;
+        let revisions = self
+            .root
+            .join("models")
+            .join(namespace)
+            .join(name)
+            .join("revisions");
+        let mut commits = Vec::new();
+        if !revisions.is_dir() {
+            return Ok(commits);
+        }
+        for entry in fs::read_dir(revisions)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                commits.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+        commits.sort();
+        Ok(commits)
+    }
+
+    pub fn manifest(&self, repo_id: &str, commit: &str) -> ArchiveResult<String> {
+        Ok(fs::read_to_string(
+            self.revision_path(repo_id, commit)?
+                .join(".modelkeep-manifest.json"),
+        )?)
+    }
+
     pub fn resolve_ref(&self, repo_id: &str, reference: &str) -> ArchiveResult<String> {
         let (namespace, name) = validate_repo_id(repo_id)?;
         validate_component(reference)?;
@@ -591,6 +620,14 @@ mod tests {
         let manifest = fs::read_to_string(path.join(".modelkeep-manifest.json")).unwrap();
         assert!(manifest.contains("\"commit\":\"aaaaaaaa\""));
         assert!(manifest.contains("\"size\":2"));
+        assert_eq!(
+            archive.list_revisions("org/model").unwrap(),
+            vec!["aaaaaaaa"]
+        );
+        assert!(archive
+            .manifest("org/model", "aaaaaaaa")
+            .unwrap()
+            .contains("repo_id"));
     }
 
     #[test]
