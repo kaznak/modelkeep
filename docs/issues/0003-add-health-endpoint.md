@@ -46,3 +46,21 @@ docker compose config
 
 Liveness and readiness should not be conflated. A temporary upstream outage should not
 make a server that can still serve archived revisions appear dead.
+
+## Deployment research: QNAP Container Station
+
+Container Station 3 manages Docker Compose applications, so the standard Compose healthcheck field is the appropriate integration point.
+
+Important operational distinctions:
+
+- healthcheck classifies the container as healthy or unhealthy.
+- restart: unless-stopped restarts a terminated container, but unhealthy alone does not normally restart it.
+- Compose can wait for service_healthy dependencies.
+- Container Station UI behavior may vary by QTS and Container Station version.
+
+The current image does not guarantee curl or wget for an in-container probe. Add a small probe command or equivalent ModelKeep command before adding the Compose healthcheck stanza.
+
+References:
+
+- https://www.qnap.com/en-us/how-to/tutorial/article/how-to-use-container-station-3
+- https://docs.docker.com/reference/compose-file/services/
