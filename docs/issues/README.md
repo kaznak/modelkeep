@@ -38,7 +38,6 @@ Priority meanings:
 
 ## Current backlog
 
-- [0015 — Add the supported Hugging Face client integration suite](0015-add-supported-hf-client-integration-suite.md) (P0)
 - [0016 — Define and implement mutable-ref refresh policy](0016-define-mutable-ref-refresh-policy.md) (P1)
 - [0017 — Preserve upstream error semantics through HTTP](0017-preserve-upstream-error-semantics.md) (P1)
 - [0018 — Handle cross-alias publication concurrency](0018-handle-cross-alias-publication-concurrency.md) (P1)

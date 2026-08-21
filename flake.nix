@@ -122,6 +122,22 @@
             touch $out
           '';
 
+          hf-client-integration = pkgs.runCommand "modelkeep-hf-client-integration" {
+            nativeBuildInputs = [
+              python
+              pkgs.cacert
+              self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep
+            ];
+            SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+          } ''
+            export HOME="$TMPDIR"
+            export HF_HOME="$TMPDIR/huggingface"
+            python3 ${./tests/hf_client_integration.py} \
+              ${self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep}/bin/modelkeep \
+              ${./tests/fixtures/hf_fetch_fixture.py}
+            touch $out
+          '';
+
           modelkeep = self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep;
         });
     };

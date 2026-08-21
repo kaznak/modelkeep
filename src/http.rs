@@ -61,6 +61,10 @@ fn router_with_state(state: HttpState) -> Router {
             get(model_info),
         )
         .route(
+            "/api/models/{namespace}/{repo}/tree/{revision}",
+            get(model_tree),
+        )
+        .route(
             "/{namespace}/{repo}/resolve/{revision}/{*path}",
             get(get_file).head(head_file),
         )
@@ -134,6 +138,42 @@ async fn model_info(
         "id": repo_id, "sha": commit, "private": false, "downloads": 0,
         "likes": 0, "tags": [], "siblings": siblings,
     })))
+}
+
+async fn model_tree(
+    State(state): State<HttpState>,
+    Path((namespace, repo, revision)): Path<(String, String, String)>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let repo_id = format!("{namespace}/{repo}");
+    let commit = if is_commit(&revision) {
+        revision
+    } else {
+        state
+            .archive
+            .resolve_ref(&repo_id, &revision)
+            .map_err(status_for_archive_error)?
+    };
+    let manifest: serde_json::Value = serde_json::from_str(
+        &state
+            .archive
+            .manifest(&repo_id, &commit)
+            .map_err(status_for_archive_error)?,
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let files = manifest["files"]
+        .as_array()
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?
+        .iter()
+        .map(|file| {
+            serde_json::json!({
+                "type": "file",
+                "path": file["path"],
+                "size": file["size"],
+                "oid": file["sha256"],
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(files))
 }
 
 async fn get_file(
@@ -358,6 +398,26 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["sha"], "aaaaaaaa");
         assert_eq!(value["siblings"][0]["rfilename"], "config.json");
+    }
+
+    #[tokio::test]
+    async fn serves_repository_tree_from_manifest() {
+        let (app, _directory) = test_router();
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/models/org/model/tree/aaaaaaaa?recursive=true&expand=false")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value[0]["type"], "file");
+        assert_eq!(value[0]["path"], "config.json");
+        assert_eq!(value[0]["size"], 10);
     }
 
     #[tokio::test]
