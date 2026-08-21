@@ -4,6 +4,7 @@
 //! A revision becomes visible only after all files and its manifest have been
 //! written and synchronized to disk.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -131,6 +132,19 @@ pub struct RevisionRemoval {
     pub removed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditFailure {
+    pub repo_id: String,
+    pub commit: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditReport {
+    pub checked: usize,
+    pub failures: Vec<AuditFailure>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Archive {
     root: PathBuf,
@@ -141,6 +155,15 @@ impl Archive {
         let root = root.into();
         fs::create_dir_all(root.join("models"))?;
         fs::create_dir_all(root.join("tmp"))?;
+        Ok(Self { root })
+    }
+
+    /// Opens an existing archive without creating or modifying durable state.
+    pub fn open_read_only(root: impl Into<PathBuf>) -> ArchiveResult<Self> {
+        let root = root.into();
+        if !root.is_dir() || !root.join("models").is_dir() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "archive root not found").into());
+        }
         Ok(Self { root })
     }
 
@@ -418,7 +441,64 @@ impl Archive {
             }
             verified += 1;
         }
+        let expected = manifest
+            .files
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<BTreeSet<_>>();
+        let mut actual = BTreeSet::new();
+        collect_revision_files(&revision, &revision, &mut actual)?;
+        if actual != expected {
+            return Err(ArchiveError::IntegrityMismatch(format!(
+                "manifest file set differs: expected {expected:?}, actual {actual:?}"
+            )));
+        }
         Ok(verified)
+    }
+
+    pub fn audit(&self) -> ArchiveResult<AuditReport> {
+        let mut report = AuditReport {
+            checked: 0,
+            failures: Vec::new(),
+        };
+        for namespace in fs::read_dir(self.root.join("models"))? {
+            let namespace = namespace?;
+            if !namespace.file_type()?.is_dir() {
+                continue;
+            }
+            for repository in fs::read_dir(namespace.path())? {
+                let repository = repository?;
+                if !repository.file_type()?.is_dir() {
+                    continue;
+                }
+                let repo_id = format!(
+                    "{}/{}",
+                    namespace.file_name().to_string_lossy(),
+                    repository.file_name().to_string_lossy()
+                );
+                let revisions = repository.path().join("revisions");
+                if !revisions.is_dir() {
+                    continue;
+                }
+                for revision in fs::read_dir(revisions)? {
+                    let revision = revision?;
+                    if !revision.file_type()?.is_dir() {
+                        continue;
+                    }
+                    let commit = revision.file_name().to_string_lossy().into_owned();
+                    report.checked += 1;
+                    tracing::info!(repo_id = %repo_id, commit = %commit, "archive audit revision");
+                    if let Err(error) = self.verify_revision(&repo_id, &commit) {
+                        report.failures.push(AuditFailure {
+                            repo_id: repo_id.clone(),
+                            commit,
+                            error: error.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(report)
     }
 
     pub fn publish_revision_from_directory(
@@ -802,6 +882,38 @@ fn sync_directory(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
+fn collect_revision_files(
+    root: &Path,
+    directory: &Path,
+    files: &mut BTreeSet<String>,
+) -> ArchiveResult<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| ArchiveError::InvalidPath(path.display().to_string()))?;
+        if relative == Path::new(".modelkeep-manifest.json") {
+            continue;
+        }
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            collect_revision_files(root, &path, files)?;
+        } else if kind.is_file() {
+            let value = relative
+                .to_str()
+                .ok_or_else(|| ArchiveError::InvalidPath(relative.display().to_string()))?;
+            validate_relative_file_path(value)?;
+            files.insert(value.to_string());
+        } else {
+            return Err(ArchiveError::IntegrityMismatch(
+                relative.display().to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn parse_range(value: &str, size: u64) -> Result<Option<ByteRange>, RangeError> {
     if !value.starts_with("bytes=") || value[6..].contains(',') {
         return Err(RangeError::Invalid);
@@ -1142,5 +1254,97 @@ mod tests {
             fs::metadata(published.join("model.bin")).unwrap().len(),
             1024
         );
+    }
+
+    #[test]
+    fn audit_reports_corrupt_missing_malformed_and_unexpected_files() {
+        let (archive, _directory) = archive();
+        for (name, commit) in [
+            ("healthy", "aaaaaaaa"),
+            ("corrupt", "bbbbbbbb"),
+            ("missing", "cccccccc"),
+            ("malformed", "dddddddd"),
+            ("unexpected", "eeeeeeee"),
+            ("unsafe", "ffffffff"),
+        ] {
+            archive
+                .publish_revision(PublishRequest {
+                    repo_id: format!("org/{name}"),
+                    requested_revision: "main".into(),
+                    commit: commit.into(),
+                    files: vec![ArchiveFile {
+                        path: "config.json".into(),
+                        bytes: b"valid".to_vec(),
+                    }],
+                })
+                .unwrap();
+        }
+        fs::write(
+            archive
+                .revision_path("org/corrupt", "bbbbbbbb")
+                .unwrap()
+                .join("config.json"),
+            b"wrong",
+        )
+        .unwrap();
+        fs::remove_file(
+            archive
+                .revision_path("org/missing", "cccccccc")
+                .unwrap()
+                .join("config.json"),
+        )
+        .unwrap();
+        fs::write(
+            archive
+                .revision_path("org/malformed", "dddddddd")
+                .unwrap()
+                .join(".modelkeep-manifest.json"),
+            b"not-json",
+        )
+        .unwrap();
+        fs::write(
+            archive
+                .revision_path("org/unexpected", "eeeeeeee")
+                .unwrap()
+                .join("extra.bin"),
+            b"extra",
+        )
+        .unwrap();
+        let unsafe_manifest = archive
+            .revision_path("org/unsafe", "ffffffff")
+            .unwrap()
+            .join(".modelkeep-manifest.json");
+        let unsafe_contents = fs::read_to_string(&unsafe_manifest)
+            .unwrap()
+            .replace("config.json", "../escape");
+        fs::write(unsafe_manifest, unsafe_contents).unwrap();
+
+        let report = archive.audit().unwrap();
+        assert_eq!(report.checked, 6);
+        assert_eq!(report.failures.len(), 5);
+        assert!(!report
+            .failures
+            .iter()
+            .any(|failure| failure.repo_id == "org/healthy"));
+        for repo in [
+            "org/corrupt",
+            "org/missing",
+            "org/malformed",
+            "org/unexpected",
+            "org/unsafe",
+        ] {
+            assert!(report
+                .failures
+                .iter()
+                .any(|failure| failure.repo_id == repo));
+        }
+    }
+
+    #[test]
+    fn read_only_open_does_not_create_a_missing_archive() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing");
+        assert!(Archive::open_read_only(&missing).is_err());
+        assert!(!missing.exists());
     }
 }

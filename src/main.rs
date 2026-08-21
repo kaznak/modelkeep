@@ -105,6 +105,31 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("verified {count} files for {repo}@{commit}");
             Ok(())
         }
+        Some("audit") => {
+            let root = args
+                .next()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/data"));
+            if args.next().is_some() {
+                return Err("audit accepts only archive-root".into());
+            }
+            let report = Archive::open_read_only(root)?.audit()?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "status": if report.failures.is_empty() { "clean" } else { "failed" },
+                    "checked": report.checked,
+                    "failures": report.failures.iter().map(|failure| serde_json::json!({
+                        "repo_id": failure.repo_id, "commit": failure.commit, "error": failure.error
+                    })).collect::<Vec<_>>()
+                })
+            );
+            if report.failures.is_empty() {
+                Ok(())
+            } else {
+                Err("archive audit failed".into())
+            }
+        }
         Some("remove") => {
             let root = args
                 .next()
@@ -188,6 +213,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
        modelkeep serve [archive-root] [bind-address]
        modelkeep health
        modelkeep ready
+       modelkeep audit [archive-root]
        modelkeep refresh [archive-root] <repo-id> <ref> [--dry-run]
        modelkeep verify [archive-root] <repo-id> <commit>
        modelkeep remove [archive-root] <repo-id> <commit> [--dry-run]"

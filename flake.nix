@@ -146,6 +146,14 @@
             touch $out
           '';
 
+          archive-audit-cli = pkgs.runCommand "modelkeep-archive-audit-cli" {
+            nativeBuildInputs = [ python self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep ];
+          } ''
+            python3 ${./tests/archive_audit_cli.py} \
+              ${self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep}/bin/modelkeep
+            touch $out
+          '';
+
           modelkeep = self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep;
         });
     };

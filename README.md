@@ -108,6 +108,7 @@ them. Only `v*` tags push images to GHCR and create the multi-architecture manif
 modelkeep serve [archive-root] [bind-address]
 modelkeep health
 modelkeep ready
+modelkeep audit [archive-root]
 modelkeep refresh [archive-root] <repo-id> <ref> [--dry-run]
 modelkeep list [archive-root] <repo-id>
 modelkeep show [archive-root] <repo-id> <commit>

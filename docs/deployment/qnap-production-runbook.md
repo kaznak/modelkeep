@@ -43,6 +43,19 @@ without `HF_TOKEN` or fetch-helper variables, run `modelkeep verify`, clear a te
 client cache, block Internet access, and download an explicit restored commit. Record
 the snapshot identity, image digest, verification output, and result.
 
+## Archive integrity audit
+
+Run `modelkeep audit /data` from a scheduled one-shot container during the NAS's
+lowest-I/O window. The command reads manifests and hashes every published file, so do
+not overlap it with snapshots, RAID scrubs, or large model acquisitions. Start with a
+monthly schedule and adjust only after measuring QNAP disk latency during serving.
+
+Capture stdout as JSON and record the process exit status. `status: "clean"` with a
+zero exit status means the complete run finished cleanly. `status: "failed"` and a
+non-zero status identify revisions that failed verification. A killed container,
+missing JSON output, or any other incomplete run is not a successful audit; schedule
+a replacement run. The audit is read-only and never repairs or deletes data.
+
 ## Upgrade, rollback, and incidents
 
 Before upgrade, snapshot storage and test the new pinned image against a restored
