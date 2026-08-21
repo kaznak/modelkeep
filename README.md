@@ -66,9 +66,9 @@ tailscale serve status
 ```
 
 `compose.yaml` defaults to the public `ghcr.io/kaznak/modelkeep:v0.2.0` image, so the
-normal deployment needs neither image environment variables nor a GHCR login. Override
-`MODELKEEP_IMAGE_REPOSITORY` or `MODELKEEP_IMAGE_TAG` only for a mirror or another
-release.
+normal deployment needs neither image environment variables nor a GHCR login. QNAP
+Container Station does not expand Compose default-value expressions when creating an
+Application, so edit the literal `image:` value for a mirror or another release.
 Change `/share/LLM/modelkeep` in `compose.yaml` if the QNAP archive share uses another
 path. The container runs as UID/GID `10001:10001`, uses a read-only root filesystem,
 drops Linux capabilities, writes durable state only under `/data`, and publishes its
@@ -80,6 +80,8 @@ for Tailscale Serve setup and boundary checks.
 
 For private or gated upstream repositories, provide `HF_TOKEN` through the deployment
 environment. Never put credentials in URLs, manifests, or logs.
+For a QNAP Container Station Application, do not rely on Compose interpolation;
+replace the empty `HF_TOKEN` through QNAP's protected deployment configuration.
 
 ## Development
 

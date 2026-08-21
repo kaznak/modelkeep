@@ -159,8 +159,12 @@
           } ''
             port_mapping="$(yq -r '.services.modelkeep.ports[0]' ${./compose.yaml})"
             test "$port_mapping" = "127.0.0.1:8090:8090"
-            rg --fixed-strings 'ghcr.io/kaznak/modelkeep' ${./compose.yaml}
-            rg --fixed-strings 'v0.2.0' ${./compose.yaml}
+            image="$(yq -r '.services.modelkeep.image' ${./compose.yaml})"
+            test "$image" = "ghcr.io/kaznak/modelkeep:v0.2.0"
+            if rg --fixed-strings '$' ${./compose.yaml}; then
+              echo "compose.yaml must not require variable interpolation" >&2
+              exit 1
+            fi
             touch $out
           '';
 

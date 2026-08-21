@@ -18,8 +18,8 @@ The archive directory must be writable for `models/`, `tmp/`, revision publicati
 
 ## Preflight
 
-Using the public image already pinned by `compose.yaml` (or after overriding its image
-variables when necessary), run the same image and volume configuration used for
+Using the public image already pinned by `compose.yaml` (or after editing its literal
+image value when necessary), run the same image and volume configuration used for
 deployment before starting a large import or fetch:
 
 ```sh

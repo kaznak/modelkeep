@@ -64,14 +64,17 @@ tailscale serve status
 ```
 
 `compose.yaml` は公開済みの `ghcr.io/kaznak/modelkeep:v0.2.0` を既定で使用するため、
-通常は image 用の環境変数や GHCR ログインは不要です。別 registry や別 release を使う場合だけ
-`MODELKEEP_IMAGE_REPOSITORY` / `MODELKEEP_IMAGE_TAG` を上書きしてください。
+image 用の環境変数や GHCR ログインは不要です。QNAP Container Station の Application 作成では
+Compose の環境変数デフォルト値が展開されないため、別 registry や別 release を使う場合は
+`compose.yaml` の `image:` を直接変更してください。
 QNAP の archive share が別の場所にある場合は、`compose.yaml` の `/share/LLM/modelkeep` を変更してください。
 コンテナは UID/GID `10001:10001`、read-only root filesystem、capability drop で動作し、永続データは `/data` のみに書き込みます。HTTP port は QNAP host の loopback のみに公開されます。host の公式 Tailscale app で tailnet 限定 HTTPS endpoint を構成し、port 8090 を LAN に直接公開しないでください。
 ホスト側の UID/GID と権限 preflight は [`docs/deployment/qnap-permissions.md`](docs/deployment/qnap-permissions.md) を参照してください。
 Tailscale Serve の設定と境界確認は [`docs/deployment/qnap-tailscale-serve.md`](docs/deployment/qnap-tailscale-serve.md) を参照してください。
 
 private / gated repository を使う場合は、deploy 環境から `HF_TOKEN` を渡します。認証情報を URL、manifest、log に保存しないでください。
+QNAP Container Station の Application では Compose 変数展開に依存せず、保護された設定方法で
+`compose.yaml` の空の `HF_TOKEN` を置き換えてください。
 
 ## 開発
 

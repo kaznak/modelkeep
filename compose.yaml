@@ -4,8 +4,9 @@
 #   tailscale serve status
 services:
   modelkeep:
-    # Override either variable only for a mirror or a different pinned release.
-    image: ${MODELKEEP_IMAGE_REPOSITORY:-ghcr.io/kaznak/modelkeep}:${MODELKEEP_IMAGE_TAG:-v0.2.0}
+    # Keep this literal for QNAP Container Station, which does not expand Compose
+    # default-value expressions consistently when creating an Application.
+    image: ghcr.io/kaznak/modelkeep:v0.2.0
     restart: unless-stopped
     read_only: true
     user: "10001:10001"
@@ -29,7 +30,8 @@ services:
     security_opt:
       - no-new-privileges:true
     environment:
-      RUST_LOG: ${RUST_LOG:-info}
+      RUST_LOG: info
       HF_HOME: /tmp/huggingface
-      # Optional service token for private or gated upstream repositories.
-      HF_TOKEN: ${HF_TOKEN:-}
+      # For private or gated upstream repositories, replace the empty value with a
+      # token supplied through QNAP's protected deployment configuration.
+      HF_TOKEN: ""
