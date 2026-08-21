@@ -7,7 +7,9 @@ services:
     read_only: true
     user: "10001:10001"
     ports:
-      - "8090:8090"
+      # Tailscale Serve runs on the QNAP host and is the only supported ingress.
+      # Do not change this to 8090:8090: that would also expose ModelKeep on the LAN.
+      - "127.0.0.1:8090:8090"
     volumes:
       # Change the host path to the QNAP share reserved for ModelKeep.
       - /share/LLM/modelkeep:/data

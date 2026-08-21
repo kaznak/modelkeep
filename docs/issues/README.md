@@ -38,5 +38,5 @@ Priority meanings:
 
 ## Current backlog
 
+- [0021 — Add tailnet identity-aware authorization](0021-add-tailnet-identity-aware-authorization.md) (P3)
 - [0004 — Add storage observability](0004-add-storage-observability.md) (P3)
-- [0005 — Define the client network boundary](0005-define-client-network-boundary.md) (P3)

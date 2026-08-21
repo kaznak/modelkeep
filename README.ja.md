@@ -61,8 +61,9 @@ docker compose up -d
 ```
 
 QNAP の archive share が別の場所にある場合は、`compose.yaml` の `/share/LLM/modelkeep` を変更してください。
-コンテナは UID/GID `10001:10001`、read-only root filesystem、capability drop で動作し、永続データは `/data` のみに書き込みます。
+コンテナは UID/GID `10001:10001`、read-only root filesystem、capability drop で動作し、永続データは `/data` のみに書き込みます。HTTP port は QNAP host の loopback のみに公開されます。host の公式 Tailscale app で tailnet 限定 HTTPS endpoint を構成し、port 8090 を LAN に直接公開しないでください。
 ホスト側の UID/GID と権限 preflight は [`docs/deployment/qnap-permissions.md`](docs/deployment/qnap-permissions.md) を参照してください。
+Tailscale Serve の設定と境界確認は [`docs/deployment/qnap-tailscale-serve.md`](docs/deployment/qnap-tailscale-serve.md) を参照してください。
 
 private / gated repository を使う場合は、deploy 環境から `HF_TOKEN` を渡します。認証情報を URL、manifest、log に保存しないでください。
 

@@ -26,8 +26,11 @@ does not certify unrecorded QNAP firmware, ACL, snapshot, or filesystem behavior
 2. Set a released or `sha-...` image tag and record `docker image inspect` output.
 3. Run `docker compose config`; confirm only the intended share maps to `/data`.
 4. Run `docker compose run --rm modelkeep ready`, then `docker compose up -d`.
-5. Check `docker compose ps`, readiness, and structured logs.
-6. Import a small model, verify it, and complete the restore drill below.
+5. Configure Tailscale Serve as described in
+   [qnap-tailscale-serve.md](qnap-tailscale-serve.md). Confirm loopback HTTP and
+   tailnet HTTPS work, and direct LAN port 8090 does not.
+6. Check `docker compose ps`, readiness, and structured logs.
+7. Import a small model, verify it, and complete the restore drill below.
 
 Keep `HF_TOKEN` in the deployment environment or QNAP secret facility, never in
 `/data`, backup metadata, recorded commands, or URLs.

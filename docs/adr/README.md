@@ -19,3 +19,4 @@ Initial records:
 - ADR-0010 — reuse validated fetch staging for publication
 - ADR-0011 — separate archive readiness from process liveness
 - ADR-0012 — explicit administrative refresh of mutable refs
+- ADR-0013 — Tailscale Serve as the QNAP client network boundary
