@@ -1,8 +1,11 @@
+# Ready to use on QNAP after changing the archive share below when necessary.
+# Tailscale runs on the QNAP host, not in this container. After startup, run:
+#   tailscale serve --bg http://127.0.0.1:8090
+#   tailscale serve status
 services:
   modelkeep:
-    # Build and tag the image from the Nix flake before deployment.
-    # Keep this tag pinned to a released version or Git commit; do not use latest.
-    image: ${MODELKEEP_IMAGE_REPOSITORY:-modelkeep}:${MODELKEEP_IMAGE_TAG:-0.2.0}
+    # Override either variable only for a mirror or a different pinned release.
+    image: ${MODELKEEP_IMAGE_REPOSITORY:-ghcr.io/kaznak/modelkeep}:${MODELKEEP_IMAGE_TAG:-v0.2.0}
     restart: unless-stopped
     read_only: true
     user: "10001:10001"

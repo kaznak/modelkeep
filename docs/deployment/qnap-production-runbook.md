@@ -23,7 +23,8 @@ does not certify unrecorded QNAP firmware, ACL, snapshot, or filesystem behavior
 ## First deployment
 
 1. Apply [qnap-permissions.md](qnap-permissions.md).
-2. Set a released or `sha-...` image tag and record `docker image inspect` output.
+2. Use the Compose default `ghcr.io/kaznak/modelkeep:v0.2.0`, or override it with a
+   different released or `sha-...` image tag, and record `docker image inspect` output.
 3. Run `docker compose config`; confirm only the intended share maps to `/data`.
 4. Run `docker compose run --rm modelkeep ready`, then `docker compose up -d`.
 5. Configure Tailscale Serve as described in

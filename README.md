@@ -56,14 +56,19 @@ git push origin v0.2.0
 On QNAP:
 
 ```sh
-export MODELKEEP_IMAGE_REPOSITORY=ghcr.io/OWNER/REPOSITORY
-export MODELKEEP_IMAGE_TAG=0.2.0
-
-docker login ghcr.io
 docker compose pull
 docker compose up -d
+curl --fail http://127.0.0.1:8090/healthz
+
+# Run this with the official Tailscale QPKG CLI installed on the QNAP host.
+tailscale serve --bg http://127.0.0.1:8090
+tailscale serve status
 ```
 
+`compose.yaml` defaults to the public `ghcr.io/kaznak/modelkeep:v0.2.0` image, so the
+normal deployment needs neither image environment variables nor a GHCR login. Override
+`MODELKEEP_IMAGE_REPOSITORY` or `MODELKEEP_IMAGE_TAG` only for a mirror or another
+release.
 Change `/share/LLM/modelkeep` in `compose.yaml` if the QNAP archive share uses another
 path. The container runs as UID/GID `10001:10001`, uses a read-only root filesystem,
 drops Linux capabilities, writes durable state only under `/data`, and publishes its
