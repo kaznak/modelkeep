@@ -3,20 +3,38 @@
 #   tailscale serve --bg http://127.0.0.1:8090
 #   tailscale serve status
 services:
+  modelkeep-init:
+    image: ghcr.io/kaznak/modelkeep:v0.2.1
+    restart: "no"
+    read_only: true
+    user: "0:0"
+    entrypoint: ["/bin/chown", "10001:10001", "/data"]
+    volumes:
+      - /share/Services/modelkeep:/data
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+    security_opt:
+      - no-new-privileges:true
+
   modelkeep:
     # Keep this literal for QNAP Container Station, which does not expand Compose
     # default-value expressions consistently when creating an Application.
-    image: ghcr.io/kaznak/modelkeep:v0.2.0
+    image: ghcr.io/kaznak/modelkeep:v0.2.1
     restart: unless-stopped
     read_only: true
     user: "10001:10001"
+    depends_on:
+      modelkeep-init:
+        condition: service_completed_successfully
     ports:
       # Tailscale Serve runs on the QNAP host and is the only supported ingress.
       # Do not change this to 8090:8090: that would also expose ModelKeep on the LAN.
       - "127.0.0.1:8090:8090"
     volumes:
       # Change the host path to the QNAP share reserved for ModelKeep.
-      - /share/LLM/modelkeep:/data
+      - /share/Services/modelkeep:/data
     tmpfs:
       - /tmp
     cap_drop:

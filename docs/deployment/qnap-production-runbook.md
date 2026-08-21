@@ -23,12 +23,14 @@ does not certify unrecorded QNAP firmware, ACL, snapshot, or filesystem behavior
 ## First deployment
 
 1. Apply [qnap-permissions.md](qnap-permissions.md).
-2. Use the Compose image `ghcr.io/kaznak/modelkeep:v0.2.0`, or edit the literal
+2. Use the Compose image `ghcr.io/kaznak/modelkeep:v0.2.1`, or edit the literal
    `image:` field to a different released or `sha-...` image tag, and record
    `docker image inspect` output. Do not use Compose variable-default expressions in
    a QNAP Container Station Application.
-3. Run `docker compose config`; confirm only the intended share maps to `/data`.
-4. Run `docker compose run --rm modelkeep ready`, then `docker compose up -d`.
+3. Run `docker compose config`; confirm both services mount only
+   `/share/Services/modelkeep` at `/data`.
+4. Run `docker compose up -d`; confirm `modelkeep-init` exits successfully and
+   `modelkeep` becomes healthy.
 5. Configure Tailscale Serve as described in
    [qnap-tailscale-serve.md](qnap-tailscale-serve.md). Confirm loopback HTTP and
    tailnet HTTPS work, and direct LAN port 8090 does not.

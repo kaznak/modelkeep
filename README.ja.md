@@ -47,8 +47,8 @@ Nix flake から amd64 / arm64 image をビルドし、`v*` tag が push され�
 image を公開します。
 
 ```sh
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.2.1
+git push origin v0.2.1
 ```
 
 QNAP 側では以下のように起動します。
@@ -63,12 +63,12 @@ tailscale serve --bg http://127.0.0.1:8090
 tailscale serve status
 ```
 
-`compose.yaml` は公開済みの `ghcr.io/kaznak/modelkeep:v0.2.0` を既定で使用するため、
+`compose.yaml` は公開済みの `ghcr.io/kaznak/modelkeep:v0.2.1` を既定で使用するため、
 image 用の環境変数や GHCR ログインは不要です。QNAP Container Station の Application 作成では
 Compose の環境変数デフォルト値が展開されないため、別 registry や別 release を使う場合は
 `compose.yaml` の `image:` を直接変更してください。
-QNAP の archive share が別の場所にある場合は、`compose.yaml` の `/share/LLM/modelkeep` を変更してください。
-コンテナは UID/GID `10001:10001`、read-only root filesystem、capability drop で動作し、永続データは `/data` のみに書き込みます。HTTP port は QNAP host の loopback のみに公開されます。host の公式 Tailscale app で tailnet 限定 HTTPS endpoint を構成し、port 8090 を LAN に直接公開しないでください。
+QNAP の archive share が別の場所にある場合は、`compose.yaml` の `/share/Services/modelkeep` を変更してください。
+短時間だけ動く `modelkeep-init` がマウントルートを `10001:10001` に設定して終了するため、新規ディレクトリならSSHでの権限設定は不要です。本体コンテナは UID/GID `10001:10001`、read-only root filesystem、capability drop で動作し、永続データは `/data` のみに書き込みます。HTTP port は QNAP host の loopback のみに公開されます。host の公式 Tailscale app で tailnet 限定 HTTPS endpoint を構成し、port 8090 を LAN に直接公開しないでください。
 ホスト側の UID/GID と権限 preflight は [`docs/deployment/qnap-permissions.md`](docs/deployment/qnap-permissions.md) を参照してください。
 Tailscale Serve の設定と境界確認は [`docs/deployment/qnap-tailscale-serve.md`](docs/deployment/qnap-tailscale-serve.md) を参照してください。
 

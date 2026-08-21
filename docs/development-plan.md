@@ -527,16 +527,29 @@ Compose の基本方針:
 
 ```yaml
 services:
+  modelkeep-init:
+    image: ghcr.io/kaznak/modelkeep:<version>
+    user: "0:0"
+    entrypoint: ["/bin/chown", "10001:10001", "/data"]
+    volumes:
+      - /share/Services/modelkeep:/data
+    cap_drop: [ALL]
+    cap_add: [CHOWN]
+
   modelkeep:
-    image: modelkeep:<version>
+    image: ghcr.io/kaznak/modelkeep:<version>
     restart: unless-stopped
     read_only: true
+    user: "10001:10001"
+    depends_on:
+      modelkeep-init:
+        condition: service_completed_successfully
 
     ports:
-      - "8090:8090"
+      - "127.0.0.1:8090:8090"
 
     volumes:
-      - /share/LLM/modelkeep:/data
+      - /share/Services/modelkeep:/data
 
     tmpfs:
       - /tmp

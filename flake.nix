@@ -21,7 +21,7 @@
       cargoValidation = pkgs: name: command:
         pkgs.rustPlatform.buildRustPackage {
           pname = "modelkeep-${name}";
-          version = "0.2.0";
+          version = "0.2.1";
           src = nixpkgs.lib.cleanSource ./.;
           cargoLock.lockFile = ./Cargo.lock;
           nativeBuildInputs = rustToolsFor pkgs;
@@ -48,7 +48,7 @@
         in {
         modelkeep = pkgs.rustPlatform.buildRustPackage {
           pname = "modelkeep";
-          version = "0.2.0";
+          version = "0.2.1";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
           meta.mainProgram = "modelkeep";
@@ -56,8 +56,8 @@
 
         modelkeep-image = pkgs.dockerTools.buildLayeredImage {
           name = "modelkeep";
-          tag = "0.2.0";
-          contents = [ self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep hfFetcher python pkgs.cacert ];
+          tag = "0.2.1";
+          contents = [ self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep hfFetcher python pkgs.cacert pkgs.coreutils ];
           config = {
             Entrypoint = [ "${self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep}/bin/modelkeep" "serve" ];
             User = "10001:10001";
@@ -160,7 +160,15 @@
             port_mapping="$(yq -r '.services.modelkeep.ports[0]' ${./compose.yaml})"
             test "$port_mapping" = "127.0.0.1:8090:8090"
             image="$(yq -r '.services.modelkeep.image' ${./compose.yaml})"
-            test "$image" = "ghcr.io/kaznak/modelkeep:v0.2.0"
+            init_image="$(yq -r '.services."modelkeep-init".image' ${./compose.yaml})"
+            test "$image" = "ghcr.io/kaznak/modelkeep:v0.2.1"
+            test "$init_image" = "$image"
+            test "$(yq -r '.services."modelkeep-init".user' ${./compose.yaml})" = "0:0"
+            test "$(yq -r '.services."modelkeep-init".entrypoint | join(" ")' ${./compose.yaml})" = "/bin/chown 10001:10001 /data"
+            test "$(yq -r '.services."modelkeep-init".cap_add[0]' ${./compose.yaml})" = "CHOWN"
+            test "$(yq -r '.services.modelkeep.depends_on."modelkeep-init".condition' ${./compose.yaml})" = "service_completed_successfully"
+            test "$(yq -r '.services."modelkeep-init".volumes[0]' ${./compose.yaml})" = "/share/Services/modelkeep:/data"
+            test "$(yq -r '.services.modelkeep.volumes[0]' ${./compose.yaml})" = "/share/Services/modelkeep:/data"
             if rg --fixed-strings '$' ${./compose.yaml}; then
               echo "compose.yaml must not require variable interpolation" >&2
               exit 1

@@ -49,8 +49,8 @@ The GitHub Actions workflow builds both architectures from the Nix flake and pub
 a multi-architecture image to GHCR when a `v*` tag is pushed:
 
 ```sh
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.2.1
+git push origin v0.2.1
 ```
 
 On QNAP:
@@ -65,12 +65,14 @@ tailscale serve --bg http://127.0.0.1:8090
 tailscale serve status
 ```
 
-`compose.yaml` defaults to the public `ghcr.io/kaznak/modelkeep:v0.2.0` image, so the
+`compose.yaml` defaults to the public `ghcr.io/kaznak/modelkeep:v0.2.1` image, so the
 normal deployment needs neither image environment variables nor a GHCR login. QNAP
 Container Station does not expand Compose default-value expressions when creating an
 Application, so edit the literal `image:` value for a mirror or another release.
-Change `/share/LLM/modelkeep` in `compose.yaml` if the QNAP archive share uses another
-path. The container runs as UID/GID `10001:10001`, uses a read-only root filesystem,
+Change `/share/Services/modelkeep` in `compose.yaml` if the QNAP archive share uses another
+path. A short-lived `modelkeep-init` sets the mount-root owner to `10001:10001`, so a
+new directory needs no SSH permission setup. The application container runs as
+UID/GID `10001:10001`, uses a read-only root filesystem,
 drops Linux capabilities, writes durable state only under `/data`, and publishes its
 HTTP port only on QNAP host loopback. Configure the host's official Tailscale app to
 provide the tailnet-only HTTPS endpoint; do not expose port 8090 directly on the LAN.
