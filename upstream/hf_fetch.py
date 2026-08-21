@@ -3,11 +3,15 @@
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.utils import GatedRepoError, HfHubHTTPError, RepositoryNotFoundError
+
+
+COMMIT_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
 
 
 def safe_relative_files(root: Path):
@@ -24,6 +28,31 @@ def safe_relative_files(root: Path):
     return sorted(result)
 
 
+def acquire(repo_id, requested_revision, output, files=None, api=None, download=None):
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=True)
+    api = api or HfApi()
+    download = download or snapshot_download
+
+    info = api.repo_info(repo_id, revision=requested_revision, repo_type="model")
+    commit = info.sha
+    if not isinstance(commit, str) or not COMMIT_PATTERN.fullmatch(commit):
+        raise ValueError("upstream returned malformed commit identity")
+
+    download(
+        repo_id=repo_id,
+        revision=commit,
+        repo_type="model",
+        local_dir=str(output),
+        allow_patterns=files or None,
+    )
+    archived_files = safe_relative_files(output)
+    if files:
+        requested = set(files)
+        archived_files = [path for path in archived_files if path in requested]
+    return {"commit": commit, "files": archived_files}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo-id", required=True)
@@ -32,22 +61,13 @@ def main():
     parser.add_argument("--file", action="append", dest="files")
     args = parser.parse_args()
 
-    output = Path(args.output)
-    output.mkdir(parents=True, exist_ok=True)
-    api = HfApi()
-    info = api.repo_info(args.repo_id, revision=args.revision, repo_type="model")
-    snapshot_download(
+    result = acquire(
         repo_id=args.repo_id,
-        revision=args.revision,
-        repo_type="model",
-        local_dir=str(output),
-        allow_patterns=args.files or None,
+        requested_revision=args.revision,
+        output=args.output,
+        files=args.files,
     )
-    files = safe_relative_files(output)
-    if args.files:
-        requested = set(args.files)
-        files = [path for path in files if path in requested]
-    print(json.dumps({"commit": info.sha, "files": files}, separators=(",", ":")))
+    print(json.dumps(result, separators=(",", ":")))
 
 
 if __name__ == "__main__":

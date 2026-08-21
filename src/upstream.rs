@@ -80,7 +80,7 @@ impl UpstreamFetcher for OfficialHfFetcher {
         }
         let response: HelperOutput =
             serde_json::from_slice(&output.stdout).map_err(|_| UpstreamError::InvalidOutput)?;
-        if response.commit.is_empty() || response.files.is_empty() {
+        if !is_hf_commit(&response.commit) || response.files.is_empty() {
             return Err(UpstreamError::InvalidOutput);
         }
         Ok(FetchedRevision {
@@ -89,6 +89,10 @@ impl UpstreamFetcher for OfficialHfFetcher {
             staging: request.staging.clone(),
         })
     }
+}
+
+fn is_hf_commit(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,9 +107,18 @@ mod tests {
 
     #[test]
     fn helper_output_contract_is_deserialized() {
-        let output: HelperOutput =
-            serde_json::from_slice(br#"{ "commit":"aaaaaaaa","files":["config.json"] }"#).unwrap();
-        assert_eq!(output.commit, "aaaaaaaa");
+        let commit = "a".repeat(40);
+        let encoded = format!(r#"{{ "commit":"{commit}","files":["config.json"] }}"#);
+        let output: HelperOutput = serde_json::from_slice(encoded.as_bytes()).unwrap();
+        assert_eq!(output.commit, commit);
         assert_eq!(output.files, vec!["config.json"]);
+    }
+
+    #[test]
+    fn helper_commit_contract_rejects_malformed_identities() {
+        assert!(is_hf_commit(&"a".repeat(40)));
+        assert!(!is_hf_commit(""));
+        assert!(!is_hf_commit("aaaaaaaa"));
+        assert!(!is_hf_commit(&"g".repeat(40)));
     }
 }

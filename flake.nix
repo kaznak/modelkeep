@@ -113,6 +113,15 @@
             touch $out
           '';
 
+          hf-fetcher-tests = pkgs.runCommand "modelkeep-hf-fetcher-tests" {
+            nativeBuildInputs = [ python ];
+          } ''
+            cp ${./upstream/hf_fetch.py} hf_fetch.py
+            cp ${./upstream/test_hf_fetch.py} test_hf_fetch.py
+            python3 -m unittest -v test_hf_fetch.py
+            touch $out
+          '';
+
           modelkeep = self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep;
         });
     };

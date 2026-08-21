@@ -38,7 +38,6 @@ Priority meanings:
 
 ## Current backlog
 
-- [0014 — Pin upstream download to the resolved commit](0014-pin-upstream-download-to-resolved-commit.md) (P0)
 - [0015 — Add the supported Hugging Face client integration suite](0015-add-supported-hf-client-integration-suite.md) (P0)
 - [0016 — Define and implement mutable-ref refresh policy](0016-define-mutable-ref-refresh-policy.md) (P1)
 - [0017 — Preserve upstream error semantics through HTTP](0017-preserve-upstream-error-semantics.md) (P1)
