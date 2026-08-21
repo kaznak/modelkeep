@@ -17,7 +17,7 @@ use tokio_util::io::ReaderStream;
 use tracing::info;
 
 use crate::pullthrough::{PullThrough, PullThroughError};
-use crate::{parse_range, Archive, ArchiveError, ByteRange, RangeError};
+use crate::{is_hf_commit, parse_range, Archive, ArchiveError, ByteRange, RangeError};
 
 #[derive(Clone)]
 pub struct HttpState {
@@ -90,7 +90,7 @@ async fn model_info(
     Path((namespace, repo, revision)): Path<(String, String, String)>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let repo_id = format!("{namespace}/{repo}");
-    let commit = match if is_commit(&revision) {
+    let commit = match if is_hf_commit(&revision) {
         state
             .archive
             .revision_path(&repo_id, &revision)
@@ -145,7 +145,7 @@ async fn model_tree(
     Path((namespace, repo, revision)): Path<(String, String, String)>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let repo_id = format!("{namespace}/{repo}");
-    let commit = if is_commit(&revision) {
+    let commit = if is_hf_commit(&revision) {
         revision
     } else {
         state
@@ -203,15 +203,23 @@ async fn file_response(
 ) -> Result<Response, StatusCode> {
     let repo_id = format!("{namespace}/{repo}");
     info!(repo_id = %repo_id, requested_revision = %revision, path = %path, "archive request");
-    let resolved_result = if is_commit(&revision) {
-        state.archive.resolve_file(&repo_id, &revision, &path)
+    let resolved_result = if is_hf_commit(&revision) {
+        state
+            .archive
+            .resolve_file(&repo_id, &revision, &path)
+            .map(|file| (file, revision.clone()))
     } else {
         state
             .archive
             .resolve_ref(&repo_id, &revision)
-            .and_then(|commit| state.archive.resolve_file(&repo_id, &commit, &path))
+            .and_then(|commit| {
+                state
+                    .archive
+                    .resolve_file(&repo_id, &commit, &path)
+                    .map(|file| (file, commit))
+            })
     };
-    let resolved = match resolved_result {
+    let (resolved, resolved_commit) = match resolved_result {
         Ok(resolved) => resolved,
         Err(ArchiveError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
             info!(repo_id = %repo_id, requested_revision = %revision, path = %path, "archive miss");
@@ -227,22 +235,15 @@ async fn file_response(
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
             .map_err(status_for_pullthrough_error)?;
-            state
+            let resolved = state
                 .archive
                 .resolve_file(&repo_id, &commit, &path)
-                .map_err(status_for_archive_error)?
+                .map_err(status_for_archive_error)?;
+            (resolved, commit)
         }
         Err(error) => return Err(status_for_archive_error(error)),
     };
     let size = resolved.size;
-    let etag_revision = if is_commit(&revision) {
-        revision.clone()
-    } else {
-        state
-            .archive
-            .resolve_ref(&repo_id, &revision)
-            .unwrap_or(revision.clone())
-    };
     let range = match headers.get(header::RANGE) {
         Some(value) => {
             let value = value.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -263,15 +264,15 @@ async fn file_response(
         .status(status)
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::CONTENT_LENGTH, content_length)
-        .header(header::ETAG, format!("\"{etag_revision}-{size}\""))
-        .header("x-repo-commit", &etag_revision);
+        .header(header::ETAG, format!("\"{resolved_commit}-{size}\""))
+        .header("x-repo-commit", &resolved_commit);
     if let Some(ByteRange { start, end }) = range {
         response = response.header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{size}"));
     }
     if headers
         .get(header::IF_NONE_MATCH)
         .and_then(|value| value.to_str().ok())
-        == Some(format!("\"{etag_revision}-{size}\"").as_str())
+        == Some(format!("\"{resolved_commit}-{size}\"").as_str())
     {
         return response
             .status(StatusCode::NOT_MODIFIED)
@@ -327,10 +328,6 @@ fn status_for_range_error(error: RangeError) -> StatusCode {
     }
 }
 
-fn is_commit(value: &str) -> bool {
-    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
 #[cfg(test)]
 mod tests {
 
@@ -345,12 +342,19 @@ mod tests {
             .publish_revision(crate::PublishRequest {
                 repo_id: "org/model".into(),
                 requested_revision: "main".into(),
-                commit: "aaaaaaaa".into(),
+                commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
                 files: vec![crate::ArchiveFile {
                     path: "config.json".into(),
                     bytes: b"0123456789".to_vec(),
                 }],
             })
+            .unwrap();
+        archive
+            .update_ref(
+                "org/model",
+                "main",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
             .unwrap();
         (router(archive), directory)
     }
@@ -403,7 +407,7 @@ mod tests {
         let response = app
             .oneshot(
                 axum::http::Request::builder()
-                    .uri("/api/models/org/model/revision/aaaaaaaa")
+                    .uri("/api/models/org/model/revision/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -412,7 +416,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value["sha"], "aaaaaaaa");
+        assert_eq!(value["sha"], "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         assert_eq!(value["siblings"][0]["rfilename"], "config.json");
     }
 
@@ -422,7 +426,7 @@ mod tests {
         let response = app
             .oneshot(
                 axum::http::Request::builder()
-                    .uri("/api/models/org/model/tree/aaaaaaaa?recursive=true&expand=false")
+                    .uri("/api/models/org/model/tree/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa?recursive=true&expand=false")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -443,7 +447,7 @@ mod tests {
             .clone()
             .oneshot(
                 axum::http::Request::builder()
-                    .uri("/org/model/resolve/aaaaaaaa/config.json")
+                    .uri("/org/model/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/config.json")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -458,7 +462,7 @@ mod tests {
         let response = app
             .oneshot(
                 axum::http::Request::builder()
-                    .uri("/org/model/resolve/aaaaaaaa/config.json")
+                    .uri("/org/model/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/config.json")
                     .header(header::RANGE, "bytes=2-5")
                     .body(Body::empty())
                     .unwrap(),
@@ -479,15 +483,21 @@ mod tests {
         let response = app
             .oneshot(
                 axum::http::Request::builder()
-                    .uri("/org/model/resolve/aaaaaaaa/config.json")
-                    .header(header::IF_NONE_MATCH, "\"aaaaaaaa-10\"")
+                    .uri("/org/model/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/config.json")
+                    .header(
+                        header::IF_NONE_MATCH,
+                        "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-10\"",
+                    )
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
-        assert_eq!(response.headers()[header::ETAG], "\"aaaaaaaa-10\"");
+        assert_eq!(
+            response.headers()[header::ETAG],
+            "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-10\""
+        );
         assert_eq!(
             to_bytes(response.into_body(), usize::MAX)
                 .await
@@ -498,13 +508,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mutable_ref_response_uses_the_resolved_commit_identity() {
+        let (app, _directory) = test_router();
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/org/model/resolve/main/config.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::ETAG],
+            "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-10\""
+        );
+        assert_eq!(
+            response.headers()["x-repo-commit"],
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+    }
+
+    #[tokio::test]
     async fn head_returns_metadata_without_body() {
         let (app, _directory) = test_router();
         let response = app
             .oneshot(
                 axum::http::Request::builder()
                     .method("HEAD")
-                    .uri("/org/model/resolve/aaaaaaaa/config.json")
+                    .uri("/org/model/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/config.json")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -531,7 +564,7 @@ mod tests {
             assert!(request.files.is_empty());
             std::fs::write(request.staging.join("tokenizer.json"), b"tokenizer-http").unwrap();
             Ok(crate::upstream::FetchedRevision {
-                commit: "bbbbbbbb".into(),
+                commit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
                 files: vec!["config.json".into(), "tokenizer.json".into()],
                 staging: request.staging.clone(),
             })

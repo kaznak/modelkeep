@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::singleflight::SingleFlight;
 use crate::upstream::{FetchRequest, UpstreamError, UpstreamFetcher};
-use crate::{Archive, ArchiveError, SourceFile};
+use crate::{is_hf_commit, Archive, ArchiveError, SourceFile};
 
 #[derive(Clone)]
 pub struct PullThrough {
@@ -205,16 +205,12 @@ impl PullThrough {
             Err(error) => return Err(error.into()),
         }
         tracing::info!(repo_id = %repo_id, commit = %fetched.commit, "archive publish complete");
-        if !is_commit(requested_revision) {
+        if !is_hf_commit(requested_revision) {
             self.archive
                 .update_ref(repo_id, requested_revision, &fetched.commit)?;
         }
         Ok(fetched.commit)
     }
-}
-
-fn is_commit(value: &str) -> bool {
-    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 impl From<UpstreamError> for PullThroughError {
@@ -264,7 +260,7 @@ mod tests {
             fs::write(request.staging.join("config.json"), b"shared").unwrap();
             self.barrier.wait();
             Ok(FetchedRevision {
-                commit: "dddddddd".into(),
+                commit: "dddddddddddddddddddddddddddddddddddddddd".into(),
                 files: vec!["config.json".into()],
                 staging: request.staging.clone(),
             })
@@ -292,14 +288,20 @@ mod tests {
             .publish_revision(crate::PublishRequest {
                 repo_id: "org/model".into(),
                 requested_revision: "main".into(),
-                commit: "aaaaaaaa".into(),
+                commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
                 files: vec![crate::ArchiveFile {
                     path: "config.json".into(),
                     bytes: b"old".to_vec(),
                 }],
             })
             .unwrap();
-        archive.update_ref("org/model", "main", "aaaaaaaa").unwrap();
+        archive
+            .update_ref(
+                "org/model",
+                "main",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .unwrap();
         (root, archive)
     }
 
@@ -314,7 +316,7 @@ mod tests {
             assert!(request.files.is_empty());
             fs::write(request.staging.join("tokenizer.json"), b"tokenizer").unwrap();
             Ok(FetchedRevision {
-                commit: "aaaaaaaa".into(),
+                commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
                 files: vec!["config.json".into(), "tokenizer.json".into()],
                 staging: request.staging.clone(),
             })
@@ -332,12 +334,15 @@ mod tests {
                 calls: calls.clone(),
             }),
         );
-        assert_eq!(pull.ensure("org/model", "main", &[]).unwrap(), "aaaaaaaa");
+        assert_eq!(
+            pull.ensure("org/model", "main", &[]).unwrap(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             fs::read(
                 archive
-                    .revision_path("org/model", "aaaaaaaa")
+                    .revision_path("org/model", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
                     .unwrap()
                     .join("config.json")
             )
@@ -346,7 +351,27 @@ mod tests {
         );
         assert_eq!(
             archive.resolve_ref("org/model", "main").unwrap(),
-            "aaaaaaaa"
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+    }
+
+    #[test]
+    fn hexadecimal_short_name_is_updated_as_a_mutable_ref() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let pull = PullThrough::new(
+            archive.clone(),
+            Arc::new(FakeFetcher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        assert_eq!(
+            pull.ensure("org/model", "deadbeef", &[]).unwrap(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            archive.resolve_ref("org/model", "deadbeef").unwrap(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
     }
 
@@ -356,20 +381,23 @@ mod tests {
         let pull = PullThrough::new(
             archive.clone(),
             Arc::new(RefreshFetcher {
-                commit: "bbbbbbbb".into(),
+                commit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
                 fail: false,
             }),
         );
         let result = pull.refresh("org/model", "main", true).unwrap();
-        assert_eq!(result.previous.as_deref(), Some("aaaaaaaa"));
-        assert_eq!(result.proposed, "bbbbbbbb");
+        assert_eq!(
+            result.previous.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(result.proposed, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
         assert!(!result.published);
         assert_eq!(
             archive.resolve_ref("org/model", "main").unwrap(),
-            "aaaaaaaa"
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
         assert!(!archive
-            .revision_path("org/model", "bbbbbbbb")
+            .revision_path("org/model", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
             .unwrap()
             .exists());
     }
@@ -380,20 +408,20 @@ mod tests {
         let pull = PullThrough::new(
             archive.clone(),
             Arc::new(RefreshFetcher {
-                commit: "bbbbbbbb".into(),
+                commit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
                 fail: false,
             }),
         );
         pull.refresh("org/model", "main", false).unwrap();
         assert_eq!(
             archive.resolve_ref("org/model", "main").unwrap(),
-            "bbbbbbbb"
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         );
         assert!(archive
-            .is_complete_revision("org/model", "aaaaaaaa")
+            .is_complete_revision("org/model", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
             .unwrap());
         assert!(archive
-            .is_complete_revision("org/model", "bbbbbbbb")
+            .is_complete_revision("org/model", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
             .unwrap());
     }
 
@@ -403,18 +431,18 @@ mod tests {
         let pull = PullThrough::new(
             archive.clone(),
             Arc::new(RefreshFetcher {
-                commit: "bbbbbbbb".into(),
+                commit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
                 fail: true,
             }),
         );
         assert!(pull.refresh("org/model", "main", false).is_err());
         assert_eq!(
             archive.resolve_ref("org/model", "main").unwrap(),
-            "aaaaaaaa"
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
         assert_eq!(
             archive.list_revisions("org/model").unwrap(),
-            vec!["aaaaaaaa"]
+            vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
         );
     }
 
@@ -430,29 +458,41 @@ mod tests {
                 barrier: Arc::new(Barrier::new(3)),
             }),
         ));
-        let threads = ["main", "release", "dddddddd"]
-            .into_iter()
-            .map(|revision| {
-                let pull = pull.clone();
-                std::thread::spawn(move || pull.ensure("org/model", revision, &[]))
-            })
-            .collect::<Vec<_>>();
+        let threads = [
+            "main",
+            "release",
+            "dddddddddddddddddddddddddddddddddddddddd",
+        ]
+        .into_iter()
+        .map(|revision| {
+            let pull = pull.clone();
+            std::thread::spawn(move || pull.ensure("org/model", revision, &[]))
+        })
+        .collect::<Vec<_>>();
         for thread in threads {
-            assert_eq!(thread.join().unwrap().unwrap(), "dddddddd");
+            assert_eq!(
+                thread.join().unwrap().unwrap(),
+                "dddddddddddddddddddddddddddddddddddddddd"
+            );
         }
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         assert_eq!(
             archive.list_revisions("org/model").unwrap(),
-            vec!["dddddddd"]
+            vec!["dddddddddddddddddddddddddddddddddddddddd"]
         );
-        assert_eq!(archive.verify_revision("org/model", "dddddddd").unwrap(), 1);
+        assert_eq!(
+            archive
+                .verify_revision("org/model", "dddddddddddddddddddddddddddddddddddddddd")
+                .unwrap(),
+            1
+        );
         assert_eq!(
             archive.resolve_ref("org/model", "main").unwrap(),
-            "dddddddd"
+            "dddddddddddddddddddddddddddddddddddddddd"
         );
         assert_eq!(
             archive.resolve_ref("org/model", "release").unwrap(),
-            "dddddddd"
+            "dddddddddddddddddddddddddddddddddddddddd"
         );
     }
 
@@ -460,16 +500,21 @@ mod tests {
     fn publication_conflict_rejects_incomplete_winner() {
         let root = tempfile::tempdir().unwrap();
         let archive = Archive::new(root.path()).unwrap();
-        fs::create_dir_all(archive.revision_path("org/model", "dddddddd").unwrap()).unwrap();
+        fs::create_dir_all(
+            archive
+                .revision_path("org/model", "dddddddddddddddddddddddddddddddddddddddd")
+                .unwrap(),
+        )
+        .unwrap();
         let pull = PullThrough::new(
             archive,
             Arc::new(RefreshFetcher {
-                commit: "dddddddd".into(),
+                commit: "dddddddddddddddddddddddddddddddddddddddd".into(),
                 fail: false,
             }),
         );
         assert_eq!(
-            pull.ensure("org/model", "dddddddd", &[]),
+            pull.ensure("org/model", "dddddddddddddddddddddddddddddddddddddddd", &[]),
             Err(PullThroughError::Conflict)
         );
     }

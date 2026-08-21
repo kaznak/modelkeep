@@ -49,15 +49,15 @@ The GitHub Actions workflow builds both architectures from the Nix flake and pub
 a multi-architecture image to GHCR when a `v*` tag is pushed:
 
 ```sh
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 On QNAP:
 
 ```sh
 export MODELKEEP_IMAGE_REPOSITORY=ghcr.io/OWNER/REPOSITORY
-export MODELKEEP_IMAGE_TAG=0.1.0
+export MODELKEEP_IMAGE_TAG=0.2.0
 
 docker login ghcr.io
 docker compose pull

@@ -24,6 +24,9 @@ class HfFetchTests(unittest.TestCase):
             download_calls.append(kwargs)
             self.assertEqual(kwargs["revision"], COMMIT_A)
             Path(kwargs["local_dir"], "config.json").write_bytes(b"commit-a")
+            metadata = Path(kwargs["local_dir"], ".cache", "huggingface")
+            metadata.mkdir(parents=True)
+            Path(metadata, "download.json").write_bytes(b"helper metadata")
 
         with tempfile.TemporaryDirectory() as output:
             result = hf_fetch.acquire(

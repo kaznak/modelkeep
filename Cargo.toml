@@ -1,6 +1,6 @@
 [package]
 name = "modelkeep"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [lib]
@@ -23,4 +23,3 @@ tower = { version = "0.5", features = ["util"] }
 
 [lints.rust]
 unsafe_code = "forbid"
-

@@ -3,6 +3,8 @@ use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
+use crate::is_hf_commit;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchRequest {
     pub repo_id: String,
@@ -89,10 +91,6 @@ impl UpstreamFetcher for OfficialHfFetcher {
             staging: request.staging.clone(),
         })
     }
-}
-
-fn is_hf_commit(value: &str) -> bool {
-    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[derive(Debug, Deserialize)]

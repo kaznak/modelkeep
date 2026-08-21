@@ -227,13 +227,21 @@ impl Archive {
 
         let refs = revision.parent().unwrap().parent().unwrap().join("refs");
         fs::create_dir_all(&refs)?;
-        let temporary = refs.join(format!(".{reference}.part"));
-        let mut file = File::create(&temporary)?;
-        file.write_all(commit.as_bytes())?;
-        file.sync_all()?;
-        fs::rename(&temporary, refs.join(reference))?;
-        sync_directory(&refs)?;
-        Ok(())
+        let temporary = refs.join(format!(".{reference}.{}.part", operation_id()));
+        let result = (|| -> io::Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            file.write_all(commit.as_bytes())?;
+            file.sync_all()?;
+            fs::rename(&temporary, refs.join(reference))?;
+            sync_directory(&refs)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result.map_err(ArchiveError::from)
     }
 
     pub fn recover_incomplete(&self) -> ArchiveResult<usize> {
@@ -404,10 +412,19 @@ impl Archive {
     ) -> ArchiveResult<ResolvedFile> {
         let relative = validate_relative_file_path(relative_path)?;
         let revision = self.revision_path(repo_id, commit)?;
-        if !self.is_complete_revision(repo_id, commit)? {
+        let manifest: Manifest = serde_json::from_str(&self.manifest(repo_id, commit)?)
+            .map_err(|error| ArchiveError::IntegrityMismatch(error.to_string()))?;
+        if !manifest.complete {
             return Err(ArchiveError::IntegrityMismatch(
                 "revision is not complete".into(),
             ));
+        }
+        if !manifest
+            .files
+            .iter()
+            .any(|entry| entry.path == relative_path)
+        {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "archive file not found").into());
         }
         let revision_root = fs::canonicalize(&revision)?;
         let candidate = fs::canonicalize(revision.join(relative))?;
@@ -629,10 +646,22 @@ impl Archive {
         request: &SourcePublishRequest,
     ) -> ArchiveResult<()> {
         let mut entries = Vec::with_capacity(request.files.len());
+        let mut archived_paths = BTreeSet::new();
         for source_file in &request.files {
-            validate_relative_file_path(&source_file.path)?;
+            let relative = validate_relative_file_path(&source_file.path)?;
+            if !archived_paths.insert(source_file.path.clone()) {
+                return Err(ArchiveError::IntegrityMismatch(format!(
+                    "duplicate archive path: {}",
+                    source_file.path
+                )));
+            }
+            let source_metadata = fs::symlink_metadata(&source_file.source)?;
+            if !source_metadata.file_type().is_file() {
+                return Err(ArchiveError::InvalidPath(source_file.path.clone()));
+            }
             let source = fs::canonicalize(&source_file.source)?;
-            if !source.starts_with(source_root) || !source.is_file() {
+            let archived = fs::canonicalize(staging.join(relative))?;
+            if !source.starts_with(source_root) || source != archived {
                 return Err(ArchiveError::InvalidPath(source_file.path.clone()));
             }
             let mut input = File::open(source)?;
@@ -653,6 +682,7 @@ impl Archive {
                 hex_digest(hasher.finalize().as_slice()),
             ));
         }
+        remove_unlisted_staging_entries(staging, staging, &archived_paths)?;
         let mut file = File::create(staging.join(".modelkeep-manifest.json"))?;
         write_manifest(
             &mut file,
@@ -719,6 +749,40 @@ impl Archive {
         sync_directory(staging)?;
         Ok(())
     }
+}
+
+fn remove_unlisted_staging_entries(
+    root: &Path,
+    directory: &Path,
+    archived_paths: &BTreeSet<String>,
+) -> ArchiveResult<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| ArchiveError::InvalidPath(path.display().to_string()))?;
+        if relative == Path::new(STAGING_LEASE_FILE)
+            || relative == Path::new(".modelkeep-manifest.json")
+        {
+            continue;
+        }
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            remove_unlisted_staging_entries(root, &path, archived_paths)?;
+            if fs::read_dir(&path)?.next().is_none() {
+                fs::remove_dir(&path)?;
+            }
+        } else {
+            let value = relative
+                .to_str()
+                .ok_or_else(|| ArchiveError::InvalidPath(relative.display().to_string()))?;
+            if !kind.is_file() || !archived_paths.contains(value) {
+                fs::remove_file(&path)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn operation_id() -> String {
@@ -950,6 +1014,10 @@ pub fn parse_range(value: &str, size: u64) -> Result<Option<ByteRange>, RangeErr
     Ok(Some(ByteRange { start, end }))
 }
 
+pub(crate) fn is_hf_commit(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn hex_digest(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -1076,6 +1144,36 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_ref_updates_publish_only_complete_values() {
+        let (archive, _directory) = archive();
+        let commits = ["aaaaaaaa", "bbbbbbbb"];
+        for commit in commits {
+            archive
+                .publish_revision(request(commit, commit.as_bytes()))
+                .unwrap();
+        }
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let threads = (0..16)
+            .map(|index| {
+                let archive = archive.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    archive.update_ref("org/model", "main", commits[index % 2])
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+        let published = archive.resolve_ref("org/model", "main").unwrap();
+        assert!(commits.contains(&published.as_str()));
+        let revision = archive.revision_path("org/model", commits[0]).unwrap();
+        let refs = revision.parent().unwrap().parent().unwrap().join("refs");
+        assert_eq!(fs::read_dir(refs).unwrap().count(), 1);
+    }
+
+    #[test]
     fn dry_run_preserves_unreferenced_revision() {
         let (archive, _directory) = archive();
         archive
@@ -1156,6 +1254,12 @@ mod tests {
         assert!(archive
             .resolve_file("org/model", "aaaaaaaa", "missing.json")
             .is_err());
+        let revision = archive.revision_path("org/model", "aaaaaaaa").unwrap();
+        fs::write(revision.join("unlisted.json"), b"not in manifest").unwrap();
+        assert!(matches!(
+            archive.resolve_file("org/model", "aaaaaaaa", "unlisted.json"),
+            Err(ArchiveError::Io(error)) if error.kind() == io::ErrorKind::NotFound
+        ));
     }
 
     #[test]
@@ -1181,6 +1285,14 @@ mod tests {
             Err(RangeError::Unsatisfiable)
         );
         assert_eq!(parse_range("bytes=0-1,4-5", 100), Err(RangeError::Invalid));
+    }
+
+    #[test]
+    fn recognizes_only_full_hugging_face_commit_ids() {
+        assert!(is_hf_commit(&"a".repeat(40)));
+        assert!(is_hf_commit(&"A".repeat(40)));
+        assert!(!is_hf_commit("deadbeef"));
+        assert!(!is_hf_commit(&"g".repeat(40)));
     }
 
     #[test]
@@ -1237,6 +1349,12 @@ mod tests {
         let (archive, _directory) = archive();
         let staging = archive.create_fetch_staging().unwrap();
         fs::write(staging.join("model.bin"), vec![3u8; 1024]).unwrap();
+        fs::create_dir_all(staging.join(".cache/huggingface")).unwrap();
+        fs::write(
+            staging.join(".cache/huggingface/download.json"),
+            b"metadata",
+        )
+        .unwrap();
         let published = archive
             .publish_revision_from_directory(SourcePublishRequest {
                 repo_id: "org/model".into(),
@@ -1254,6 +1372,8 @@ mod tests {
             fs::metadata(published.join("model.bin")).unwrap().len(),
             1024
         );
+        assert!(!published.join(".cache").exists());
+        assert_eq!(archive.verify_revision("org/model", "dddddddd").unwrap(), 1);
     }
 
     #[test]

@@ -21,7 +21,7 @@
       cargoValidation = pkgs: name: command:
         pkgs.rustPlatform.buildRustPackage {
           pname = "modelkeep-${name}";
-          version = "0.1.0";
+          version = "0.2.0";
           src = nixpkgs.lib.cleanSource ./.;
           cargoLock.lockFile = ./Cargo.lock;
           nativeBuildInputs = rustToolsFor pkgs;
@@ -48,7 +48,7 @@
         in {
         modelkeep = pkgs.rustPlatform.buildRustPackage {
           pname = "modelkeep";
-          version = "0.1.0";
+          version = "0.2.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
           meta.mainProgram = "modelkeep";
@@ -56,7 +56,7 @@
 
         modelkeep-image = pkgs.dockerTools.buildLayeredImage {
           name = "modelkeep";
-          tag = "0.1.0";
+          tag = "0.2.0";
           contents = [ self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep hfFetcher python pkgs.cacert ];
           config = {
             Entrypoint = [ "${self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep}/bin/modelkeep" "serve" ];

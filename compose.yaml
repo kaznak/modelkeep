@@ -2,7 +2,7 @@ services:
   modelkeep:
     # Build and tag the image from the Nix flake before deployment.
     # Keep this tag pinned to a released version or Git commit; do not use latest.
-    image: ${MODELKEEP_IMAGE_REPOSITORY:-modelkeep}:${MODELKEEP_IMAGE_TAG:-0.1.0}
+    image: ${MODELKEEP_IMAGE_REPOSITORY:-modelkeep}:${MODELKEEP_IMAGE_TAG:-0.2.0}
     restart: unless-stopped
     read_only: true
     user: "10001:10001"

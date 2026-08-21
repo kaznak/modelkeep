@@ -47,15 +47,15 @@ Nix flake から amd64 / arm64 image をビルドし、`v*` tag が push され�
 image を公開します。
 
 ```sh
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 QNAP 側では以下のように起動します。
 
 ```sh
 export MODELKEEP_IMAGE_REPOSITORY=ghcr.io/OWNER/REPOSITORY
-export MODELKEEP_IMAGE_TAG=0.1.0
+export MODELKEEP_IMAGE_TAG=0.2.0
 
 docker login ghcr.io
 docker compose pull
