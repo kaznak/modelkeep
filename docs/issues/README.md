@@ -38,7 +38,6 @@ Priority meanings:
 
 ## Current backlog
 
-- [0019 — Add the QNAP production, backup, and recovery runbook](0019-add-qnap-production-runbook.md) (P1)
 - [0020 — Add an archive integrity audit workflow](0020-add-archive-integrity-audit-workflow.md) (P2)
 - [0004 — Add storage observability](0004-add-storage-observability.md) (P3)
 - [0005 — Define the client network boundary](0005-define-client-network-boundary.md) (P3)

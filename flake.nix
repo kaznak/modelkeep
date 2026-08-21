@@ -138,6 +138,14 @@
             touch $out
           '';
 
+          archive-restore-drill = pkgs.runCommand "modelkeep-archive-restore-drill" {
+            nativeBuildInputs = [ python self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep ];
+          } ''
+            python3 ${./tests/archive_restore_drill.py} \
+              ${self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep}/bin/modelkeep
+            touch $out
+          '';
+
           modelkeep = self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep;
         });
     };
