@@ -38,6 +38,11 @@ Priority meanings:
 
 ## Current backlog
 
+- [0037 — Exclude upstream helper metadata from published revisions](0037-exclude-upstream-helper-metadata.md) (P0)
+- [0038 — Keep resolved commits stable across HTTP responses](0038-keep-http-resolved-commit-stable.md) (P1)
+- [0039 — Recognize only full Hugging Face commit IDs](0039-recognize-full-hf-commit-ids.md) (P2)
+- [0040 — Make mutable ref publication concurrency-safe](0040-make-ref-publication-concurrency-safe.md) (P1)
+- [0041 — Synchronize the minor-release version](0041-synchronize-minor-release-version.md) (P1)
 - [0022 — Complete the protocol observation matrix](0022-complete-protocol-observation-matrix.md) (P1)
 - [0023 — Test multiple supported Hugging Face client versions](0023-test-multiple-hf-client-versions.md) (P1)
 - [0024 — Add black-box crash and upgrade tests](0024-add-black-box-crash-and-upgrade-tests.md) (P1)
