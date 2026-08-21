@@ -11,6 +11,13 @@ pub struct PullThrough {
     flights: Arc<SingleFlight<String, String, String>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshResult {
+    pub previous: Option<String>,
+    pub proposed: String,
+    pub published: bool,
+}
+
 impl PullThrough {
     pub fn new(archive: Archive, fetcher: Arc<dyn UpstreamFetcher>) -> Self {
         Self {
@@ -43,6 +50,67 @@ impl PullThrough {
         self.flights.run(key, move || {
             this.fetch_and_publish(&repo_id, &requested_revision, &files)
                 .map_err(|error| error.to_string())
+        })
+    }
+
+    pub fn refresh(
+        &self,
+        repo_id: &str,
+        reference: &str,
+        dry_run: bool,
+    ) -> Result<RefreshResult, String> {
+        let previous = self.archive.resolve_ref(repo_id, reference).ok();
+        let staging = self
+            .archive
+            .create_fetch_staging()
+            .map_err(|e| e.to_string())?;
+        let fetched = self
+            .fetcher
+            .fetch(&FetchRequest {
+                repo_id: repo_id.into(),
+                revision: reference.into(),
+                files: Vec::new(),
+                staging: staging.clone(),
+            })
+            .map_err(|error| {
+                let _ = std::fs::remove_dir_all(&staging);
+                error.to_string()
+            })?;
+        if dry_run {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Ok(RefreshResult {
+                previous,
+                proposed: fetched.commit,
+                published: false,
+            });
+        }
+        if !self.revision_is_ready(repo_id, &fetched.commit, &[]) {
+            let files = fetched
+                .files
+                .iter()
+                .map(|path| SourceFile {
+                    path: path.clone(),
+                    source: staging.join(path),
+                })
+                .collect();
+            self.archive
+                .publish_revision_from_directory(crate::SourcePublishRequest {
+                    repo_id: repo_id.into(),
+                    requested_revision: reference.into(),
+                    commit: fetched.commit.clone(),
+                    source_root: staging.clone(),
+                    files,
+                })
+                .map_err(|e| e.to_string())?;
+        }
+        let _ = std::fs::remove_dir_all(&staging);
+        self.archive
+            .update_ref(repo_id, reference, &fetched.commit)
+            .map_err(|e| e.to_string())?;
+        Ok(RefreshResult {
+            previous,
+            proposed: fetched.commit,
+            published: true,
         })
     }
 
@@ -132,6 +200,43 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    struct RefreshFetcher {
+        commit: String,
+        fail: bool,
+    }
+
+    impl UpstreamFetcher for RefreshFetcher {
+        fn fetch(&self, request: &FetchRequest) -> Result<FetchedRevision, UpstreamError> {
+            if self.fail {
+                return Err(UpstreamError::Unavailable);
+            }
+            fs::write(request.staging.join("config.json"), self.commit.as_bytes()).unwrap();
+            Ok(FetchedRevision {
+                commit: self.commit.clone(),
+                files: vec!["config.json".into()],
+                staging: request.staging.clone(),
+            })
+        }
+    }
+
+    fn published_archive() -> (tempfile::TempDir, Archive) {
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        archive
+            .publish_revision(crate::PublishRequest {
+                repo_id: "org/model".into(),
+                requested_revision: "main".into(),
+                commit: "aaaaaaaa".into(),
+                files: vec![crate::ArchiveFile {
+                    path: "config.json".into(),
+                    bytes: b"old".to_vec(),
+                }],
+            })
+            .unwrap();
+        archive.update_ref("org/model", "main", "aaaaaaaa").unwrap();
+        (root, archive)
+    }
+
     struct FakeFetcher {
         calls: Arc<AtomicUsize>,
     }
@@ -176,6 +281,74 @@ mod tests {
         assert_eq!(
             archive.resolve_ref("org/model", "main").unwrap(),
             "aaaaaaaa"
+        );
+    }
+
+    #[test]
+    fn refresh_dry_run_changes_nothing() {
+        let (_root, archive) = published_archive();
+        let pull = PullThrough::new(
+            archive.clone(),
+            Arc::new(RefreshFetcher {
+                commit: "bbbbbbbb".into(),
+                fail: false,
+            }),
+        );
+        let result = pull.refresh("org/model", "main", true).unwrap();
+        assert_eq!(result.previous.as_deref(), Some("aaaaaaaa"));
+        assert_eq!(result.proposed, "bbbbbbbb");
+        assert!(!result.published);
+        assert_eq!(
+            archive.resolve_ref("org/model", "main").unwrap(),
+            "aaaaaaaa"
+        );
+        assert!(!archive
+            .revision_path("org/model", "bbbbbbbb")
+            .unwrap()
+            .exists());
+    }
+
+    #[test]
+    fn refresh_publishes_new_revision_and_preserves_old_revision() {
+        let (_root, archive) = published_archive();
+        let pull = PullThrough::new(
+            archive.clone(),
+            Arc::new(RefreshFetcher {
+                commit: "bbbbbbbb".into(),
+                fail: false,
+            }),
+        );
+        pull.refresh("org/model", "main", false).unwrap();
+        assert_eq!(
+            archive.resolve_ref("org/model", "main").unwrap(),
+            "bbbbbbbb"
+        );
+        assert!(archive
+            .is_complete_revision("org/model", "aaaaaaaa")
+            .unwrap());
+        assert!(archive
+            .is_complete_revision("org/model", "bbbbbbbb")
+            .unwrap());
+    }
+
+    #[test]
+    fn failed_refresh_leaves_ref_and_archive_unchanged() {
+        let (_root, archive) = published_archive();
+        let pull = PullThrough::new(
+            archive.clone(),
+            Arc::new(RefreshFetcher {
+                commit: "bbbbbbbb".into(),
+                fail: true,
+            }),
+        );
+        assert!(pull.refresh("org/model", "main", false).is_err());
+        assert_eq!(
+            archive.resolve_ref("org/model", "main").unwrap(),
+            "aaaaaaaa"
+        );
+        assert_eq!(
+            archive.list_revisions("org/model").unwrap(),
+            vec!["aaaaaaaa"]
         );
     }
 }

@@ -123,6 +123,34 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             Ok(())
         }
+        Some("refresh") => {
+            let root = args
+                .next()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/data"));
+            let repo = args.next().ok_or("refresh requires repository id")?;
+            let reference = args.next().ok_or("refresh requires mutable ref")?;
+            let dry_run = parse_remove_option(args.next().as_deref(), args.next().is_some())?;
+            let python = env::var("MODELKEEP_HF_PYTHON")?;
+            let helper = env::var("MODELKEEP_HF_HELPER")?;
+            let archive = Archive::new(root)?;
+            archive.recover_incomplete()?;
+            let pull = PullThrough::new(
+                archive,
+                Arc::new(OfficialHfFetcher {
+                    python: python.into(),
+                    helper: helper.into(),
+                }),
+            );
+            let result = pull.refresh(&repo, &reference, dry_run)?;
+            println!(
+                "{} -> {}{}",
+                result.previous.as_deref().unwrap_or("<none>"),
+                result.proposed,
+                if result.published { "" } else { " (dry-run)" }
+            );
+            Ok(())
+        }
         Some("serve") => {
             let root = args
                 .next()
@@ -160,6 +188,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
        modelkeep serve [archive-root] [bind-address]
        modelkeep health
        modelkeep ready
+       modelkeep refresh [archive-root] <repo-id> <ref> [--dry-run]
        modelkeep verify [archive-root] <repo-id> <commit>
        modelkeep remove [archive-root] <repo-id> <commit> [--dry-run]"
             );

@@ -105,6 +105,7 @@ GHCR へ push し multi-architecture manifest を作成するのは `v*` tag の
 modelkeep serve [archive-root] [bind-address]
 modelkeep health
 modelkeep ready
+modelkeep refresh [archive-root] <repo-id> <ref> [--dry-run]
 modelkeep list [archive-root] <repo-id>
 modelkeep show [archive-root] <repo-id> <commit>
 modelkeep verify [archive-root] <repo-id> <commit>

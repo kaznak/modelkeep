@@ -18,3 +18,4 @@ Initial records:
 - ADR-0009 — lease-protected staging ownership and recovery
 - ADR-0010 — reuse validated fetch staging for publication
 - ADR-0011 — separate archive readiness from process liveness
+- ADR-0012 — explicit administrative refresh of mutable refs
