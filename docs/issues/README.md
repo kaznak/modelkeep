@@ -40,3 +40,5 @@ Priority meanings:
 
 - [0004 — Add storage observability](0004-add-storage-observability.md)
 - [0005 — Define the client network boundary](0005-define-client-network-boundary.md)
+- [0012 — Make Clippy validation reproducible](0012-make-clippy-reproducible.md)
+- [0013 — Make the development environment self-contained](0013-make-development-environment-self-contained.md)

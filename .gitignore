@@ -1,0 +1,29 @@
+# Rust and Cargo build output
+/target/
+*.rs.bk
+
+# Nix build symlinks
+/result
+/result-*
+
+# direnv state (keep a project .envrc trackable)
+/.direnv/
+
+# Python and integration-test state
+__pycache__/
+*.py[cod]
+/.pytest_cache/
+/.venv/
+/.coverage
+/htmlcov/
+
+# Local environment files may contain credentials
+/.env
+/.env.*
+!/.env.example
+
+# Editor and operating-system temporary files
+*~
+*.swp
+*.swo
+.DS_Store
