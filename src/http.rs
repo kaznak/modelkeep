@@ -16,7 +16,7 @@ use tokio::{
 use tokio_util::io::ReaderStream;
 use tracing::info;
 
-use crate::pullthrough::PullThrough;
+use crate::pullthrough::{PullThrough, PullThroughError};
 use crate::{parse_range, Archive, ArchiveError, ByteRange, RangeError};
 
 #[derive(Clone)]
@@ -115,8 +115,8 @@ async fn model_info(
             let repo = repo_id.clone();
             task::spawn_blocking(move || pullthrough.ensure(&repo, &requested, &[]))
                 .await
-                .map_err(|_| StatusCode::BAD_GATEWAY)?
-                .map_err(|_| StatusCode::BAD_GATEWAY)?
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                .map_err(status_for_pullthrough_error)?
         }
         Err(error) => return Err(status_for_archive_error(error)),
     };
@@ -225,8 +225,8 @@ async fn file_response(
                 pullthrough.ensure(&repo, &requested, &[requested_file])
             })
             .await
-            .map_err(|_| StatusCode::BAD_GATEWAY)?
-            .map_err(|_| StatusCode::BAD_GATEWAY)?;
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(status_for_pullthrough_error)?;
             state
                 .archive
                 .resolve_file(&repo_id, &commit, &path)
@@ -301,6 +301,22 @@ fn status_for_archive_error(error: ArchiveError) -> StatusCode {
             StatusCode::NOT_FOUND
         }
         _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn status_for_pullthrough_error(error: PullThroughError) -> StatusCode {
+    tracing::warn!(error_class = ?error, "pull-through request failed");
+    match error {
+        PullThroughError::UpstreamNotFound => StatusCode::NOT_FOUND,
+        PullThroughError::UpstreamUnauthorized => StatusCode::UNAUTHORIZED,
+        PullThroughError::UpstreamUnavailable | PullThroughError::UpstreamFailed => {
+            StatusCode::BAD_GATEWAY
+        }
+        PullThroughError::Storage => StatusCode::INSUFFICIENT_STORAGE,
+        PullThroughError::UnsafePath => StatusCode::BAD_REQUEST,
+        PullThroughError::UpstreamInvalidOutput
+        | PullThroughError::Integrity
+        | PullThroughError::Conflict => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
@@ -522,6 +538,28 @@ mod tests {
         }
     }
 
+    struct ErrorFetcher(UpstreamErrorKind);
+
+    #[derive(Clone, Copy)]
+    enum UpstreamErrorKind {
+        NotFound,
+        Unauthorized,
+        Unavailable,
+    }
+
+    impl crate::upstream::UpstreamFetcher for ErrorFetcher {
+        fn fetch(
+            &self,
+            _request: &crate::upstream::FetchRequest,
+        ) -> Result<crate::upstream::FetchedRevision, crate::upstream::UpstreamError> {
+            Err(match self.0 {
+                UpstreamErrorKind::NotFound => crate::upstream::UpstreamError::NotFound,
+                UpstreamErrorKind::Unauthorized => crate::upstream::UpstreamError::Unauthorized,
+                UpstreamErrorKind::Unavailable => crate::upstream::UpstreamError::Unavailable,
+            })
+        }
+    }
+
     #[tokio::test]
     async fn cold_miss_fetches_then_serves_mutable_revision() {
         let directory = tempfile::tempdir().unwrap();
@@ -541,6 +579,48 @@ mod tests {
         assert_eq!(
             to_bytes(response.into_body(), usize::MAX).await.unwrap(),
             "cold-http"
+        );
+    }
+
+    #[tokio::test]
+    async fn preserves_upstream_failure_classes_in_http_status() {
+        for (kind, expected) in [
+            (UpstreamErrorKind::NotFound, StatusCode::NOT_FOUND),
+            (UpstreamErrorKind::Unauthorized, StatusCode::UNAUTHORIZED),
+            (UpstreamErrorKind::Unavailable, StatusCode::BAD_GATEWAY),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let archive = Archive::new(directory.path()).unwrap();
+            let pullthrough = Arc::new(PullThrough::new(
+                archive.clone(),
+                Arc::new(ErrorFetcher(kind)),
+            ));
+            let response = router_with_pullthrough(archive, pullthrough)
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/api/models/org/model/revision/main")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+    }
+
+    #[test]
+    fn preserves_archive_failure_classes_in_http_status() {
+        assert_eq!(
+            status_for_pullthrough_error(PullThroughError::Integrity),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            status_for_pullthrough_error(PullThroughError::Storage),
+            StatusCode::INSUFFICIENT_STORAGE
+        );
+        assert_eq!(
+            status_for_pullthrough_error(PullThroughError::UnsafePath),
+            StatusCode::BAD_REQUEST
         );
     }
 }

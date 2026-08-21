@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from huggingface_hub import HfApi, snapshot_download
+from huggingface_hub.errors import HfHubHTTPError
 
 
 COMMIT = "a" * 40
@@ -92,6 +93,16 @@ def main():
         root = Path(temporary)
         archive = root / "archive"
         with server(binary, archive, helper) as endpoint:
+            for revision, expected_status in [
+                ("missing", 404),
+                ("private", 401),
+                ("unavailable", 502),
+            ]:
+                try:
+                    HfApi(endpoint=endpoint).repo_info(REPO_ID, revision=revision)
+                    raise AssertionError(f"{revision} unexpectedly succeeded")
+                except HfHubHTTPError as error:
+                    assert error.response.status_code == expected_status
             info = HfApi(endpoint=endpoint).repo_info(REPO_ID, revision="main")
             assert info.sha == COMMIT
             download(endpoint, root / "cold-client", "main")

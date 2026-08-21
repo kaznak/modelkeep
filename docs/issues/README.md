@@ -38,7 +38,6 @@ Priority meanings:
 
 ## Current backlog
 
-- [0017 — Preserve upstream error semantics through HTTP](0017-preserve-upstream-error-semantics.md) (P1)
 - [0018 — Handle cross-alias publication concurrency](0018-handle-cross-alias-publication-concurrency.md) (P1)
 - [0019 — Add the QNAP production, backup, and recovery runbook](0019-add-qnap-production-runbook.md) (P1)
 - [0020 — Add an archive integrity audit workflow](0020-add-archive-integrity-audit-workflow.md) (P2)

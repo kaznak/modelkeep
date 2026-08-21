@@ -2,14 +2,46 @@ use std::sync::Arc;
 
 use crate::singleflight::SingleFlight;
 use crate::upstream::{FetchRequest, UpstreamError, UpstreamFetcher};
-use crate::{Archive, ArchiveError, ArchiveResult, SourceFile};
+use crate::{Archive, ArchiveError, SourceFile};
 
 #[derive(Clone)]
 pub struct PullThrough {
     archive: Archive,
     fetcher: Arc<dyn UpstreamFetcher>,
-    flights: Arc<SingleFlight<String, String, String>>,
+    flights: Arc<SingleFlight<String, String, PullThroughError>>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullThroughError {
+    UpstreamUnavailable,
+    UpstreamNotFound,
+    UpstreamUnauthorized,
+    UpstreamInvalidOutput,
+    UpstreamFailed,
+    UnsafePath,
+    Integrity,
+    Storage,
+    Conflict,
+}
+
+impl std::fmt::Display for PullThroughError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::UpstreamUnavailable => "upstream unavailable",
+            Self::UpstreamNotFound => "upstream not found",
+            Self::UpstreamUnauthorized => "upstream authorization failed",
+            Self::UpstreamInvalidOutput => "upstream invalid output",
+            Self::UpstreamFailed => "upstream acquisition failed",
+            Self::UnsafePath => "unsafe archive path",
+            Self::Integrity => "archive integrity failure",
+            Self::Storage => "archive storage failure",
+            Self::Conflict => "archive publication conflict",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for PullThroughError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefreshResult {
@@ -32,7 +64,7 @@ impl PullThrough {
         repo_id: &str,
         requested_revision: &str,
         files: &[String],
-    ) -> Result<String, String> {
+    ) -> Result<String, PullThroughError> {
         if let Ok(commit) = self.archive.resolve_ref(repo_id, requested_revision) {
             if self.revision_is_ready(repo_id, &commit, files) {
                 return Ok(commit);
@@ -49,7 +81,6 @@ impl PullThrough {
         let this = self.clone();
         self.flights.run(key, move || {
             this.fetch_and_publish(&repo_id, &requested_revision, &files)
-                .map_err(|error| error.to_string())
         })
     }
 
@@ -58,12 +89,12 @@ impl PullThrough {
         repo_id: &str,
         reference: &str,
         dry_run: bool,
-    ) -> Result<RefreshResult, String> {
+    ) -> Result<RefreshResult, PullThroughError> {
         let previous = self.archive.resolve_ref(repo_id, reference).ok();
         let staging = self
             .archive
             .create_fetch_staging()
-            .map_err(|e| e.to_string())?;
+            .map_err(PullThroughError::from)?;
         let fetched = self
             .fetcher
             .fetch(&FetchRequest {
@@ -74,7 +105,7 @@ impl PullThrough {
             })
             .map_err(|error| {
                 let _ = std::fs::remove_dir_all(&staging);
-                error.to_string()
+                PullThroughError::from(error)
             })?;
         if dry_run {
             let _ = std::fs::remove_dir_all(&staging);
@@ -101,12 +132,12 @@ impl PullThrough {
                     source_root: staging.clone(),
                     files,
                 })
-                .map_err(|e| e.to_string())?;
+                .map_err(PullThroughError::from)?;
         }
         let _ = std::fs::remove_dir_all(&staging);
         self.archive
             .update_ref(repo_id, reference, &fetched.commit)
-            .map_err(|e| e.to_string())?;
+            .map_err(PullThroughError::from)?;
         Ok(RefreshResult {
             previous,
             proposed: fetched.commit,
@@ -128,7 +159,7 @@ impl PullThrough {
         repo_id: &str,
         requested_revision: &str,
         files: &[String],
-    ) -> ArchiveResult<String> {
+    ) -> Result<String, PullThroughError> {
         if let Ok(commit) = self.archive.resolve_ref(repo_id, requested_revision) {
             if self.revision_is_ready(repo_id, &commit, files) {
                 return Ok(commit);
@@ -146,7 +177,7 @@ impl PullThrough {
             Ok(result) => result,
             Err(error) => {
                 let _ = std::fs::remove_dir_all(&staging);
-                return Err(upstream_error(error));
+                return Err(error.into());
             }
         };
         let source_files = fetched
@@ -181,16 +212,27 @@ fn is_commit(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn upstream_error(error: UpstreamError) -> ArchiveError {
-    let message = match error {
-        UpstreamError::Unavailable => "upstream unavailable",
-        UpstreamError::NotFound => "upstream not found",
-        UpstreamError::Unauthorized => "upstream authorization failed",
-        UpstreamError::InvalidOutput => "upstream invalid helper output",
-        UpstreamError::Failed => "upstream acquisition failed",
-        UpstreamError::Io(_) => "upstream I/O failure",
-    };
-    ArchiveError::InvalidPath(message.into())
+impl From<UpstreamError> for PullThroughError {
+    fn from(error: UpstreamError) -> Self {
+        match error {
+            UpstreamError::Unavailable => Self::UpstreamUnavailable,
+            UpstreamError::NotFound => Self::UpstreamNotFound,
+            UpstreamError::Unauthorized => Self::UpstreamUnauthorized,
+            UpstreamError::InvalidOutput => Self::UpstreamInvalidOutput,
+            UpstreamError::Failed | UpstreamError::Io(_) => Self::UpstreamFailed,
+        }
+    }
+}
+
+impl From<ArchiveError> for PullThroughError {
+    fn from(error: ArchiveError) -> Self {
+        match error {
+            ArchiveError::InvalidPath(_) => Self::UnsafePath,
+            ArchiveError::IntegrityMismatch(_) => Self::Integrity,
+            ArchiveError::AlreadyPublished(_) => Self::Conflict,
+            ArchiveError::Io(_) | ArchiveError::ReferencedRevision(_) => Self::Storage,
+        }
+    }
 }
 
 #[cfg(test)]
