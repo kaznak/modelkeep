@@ -198,7 +198,12 @@ impl PullThrough {
                 files: source_files,
             });
         let _ = std::fs::remove_dir_all(&staging);
-        publish?;
+        match publish {
+            Ok(_) => {}
+            Err(ArchiveError::AlreadyPublished(_))
+                if self.revision_is_ready(repo_id, &fetched.commit, files) => {}
+            Err(error) => return Err(error.into()),
+        }
         tracing::info!(repo_id = %repo_id, commit = %fetched.commit, "archive publish complete");
         if !is_commit(requested_revision) {
             self.archive
@@ -241,10 +246,29 @@ mod tests {
     use crate::upstream::FetchedRevision;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Barrier;
 
     struct RefreshFetcher {
         commit: String,
         fail: bool,
+    }
+
+    struct AliasedFetcher {
+        calls: Arc<AtomicUsize>,
+        barrier: Arc<Barrier>,
+    }
+
+    impl UpstreamFetcher for AliasedFetcher {
+        fn fetch(&self, request: &FetchRequest) -> Result<FetchedRevision, UpstreamError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            fs::write(request.staging.join("config.json"), b"shared").unwrap();
+            self.barrier.wait();
+            Ok(FetchedRevision {
+                commit: "dddddddd".into(),
+                files: vec!["config.json".into()],
+                staging: request.staging.clone(),
+            })
+        }
     }
 
     impl UpstreamFetcher for RefreshFetcher {
@@ -391,6 +415,62 @@ mod tests {
         assert_eq!(
             archive.list_revisions("org/model").unwrap(),
             vec!["aaaaaaaa"]
+        );
+    }
+
+    #[test]
+    fn cross_alias_publications_converge_on_complete_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let pull = Arc::new(PullThrough::new(
+            archive.clone(),
+            Arc::new(AliasedFetcher {
+                calls: calls.clone(),
+                barrier: Arc::new(Barrier::new(3)),
+            }),
+        ));
+        let threads = ["main", "release", "dddddddd"]
+            .into_iter()
+            .map(|revision| {
+                let pull = pull.clone();
+                std::thread::spawn(move || pull.ensure("org/model", revision, &[]))
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            assert_eq!(thread.join().unwrap().unwrap(), "dddddddd");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            archive.list_revisions("org/model").unwrap(),
+            vec!["dddddddd"]
+        );
+        assert_eq!(archive.verify_revision("org/model", "dddddddd").unwrap(), 1);
+        assert_eq!(
+            archive.resolve_ref("org/model", "main").unwrap(),
+            "dddddddd"
+        );
+        assert_eq!(
+            archive.resolve_ref("org/model", "release").unwrap(),
+            "dddddddd"
+        );
+    }
+
+    #[test]
+    fn publication_conflict_rejects_incomplete_winner() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        fs::create_dir_all(archive.revision_path("org/model", "dddddddd").unwrap()).unwrap();
+        let pull = PullThrough::new(
+            archive,
+            Arc::new(RefreshFetcher {
+                commit: "dddddddd".into(),
+                fail: false,
+            }),
+        );
+        assert_eq!(
+            pull.ensure("org/model", "dddddddd", &[]),
+            Err(PullThroughError::Conflict)
         );
     }
 }
