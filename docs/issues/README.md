@@ -38,6 +38,7 @@ Priority meanings:
 
 ## Current backlog
 
+- [0042 — Bootstrap QNAP archive ownership from Compose](0042-bootstrap-qnap-archive-ownership.md) (P1)
 - [0022 — Complete the protocol observation matrix](0022-complete-protocol-observation-matrix.md) (P1)
 - [0023 — Test multiple supported Hugging Face client versions](0023-test-multiple-hf-client-versions.md) (P1)
 - [0024 — Add black-box crash and upgrade tests](0024-add-black-box-crash-and-upgrade-tests.md) (P1)
