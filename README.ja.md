@@ -6,6 +6,8 @@ ModelKeep は、Hugging Face モデルリポジトリ向けの persistent pull-t
 取得済み revision を永続ストレージ上の通常ファイルとして保存し、`HF_ENDPOINT` を設定した
 既存の `hf` / `huggingface_hub` クライアントへ HTTP で再配信します。
 
+architecture、milestone、要件と Issue の対応は[開発計画](docs/development-plan.md)で管理します。
+
 QNAP の archive が永続データの正本です。クライアントキャッシュ、index、サーバープロセス、
 コンテナイメージを交換・再構築しても、保存済みモデルを再ダウンロードする必要はありません。
 

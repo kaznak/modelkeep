@@ -6,7 +6,7 @@ ModelKeep is a persistent pull-through mirror for model repositories, initially 
 
 The QNAP archive is durable state. Local client caches, server processes, databases, indexes, and container images are replaceable. A server upgrade or implementation change must never require redownloading already archived model data.
 
-Read `DEVELOPMENT_PLAN.md` before making architectural changes. Read applicable records under `docs/adr/` before changing a recorded decision.
+Read `docs/development-plan.md` before making architectural changes. Read applicable records under `docs/adr/` before changing a recorded decision.
 
 ## Core invariants
 

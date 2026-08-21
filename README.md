@@ -6,6 +6,9 @@ ModelKeep is a persistent pull-through mirror for Hugging Face model repositorie
 It stores archived revisions as ordinary files on durable storage and exposes an HTTP
 endpoint that existing `hf` and `huggingface_hub` clients can use through `HF_ENDPOINT`.
 
+Architecture, milestones, and requirement traceability are maintained in the
+[development plan](docs/development-plan.md).
+
 The QNAP archive is the durable source of truth. Client caches, indexes, server
 processes, and container images are replaceable and must not require archived model
 data to be downloaded again.

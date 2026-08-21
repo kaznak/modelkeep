@@ -38,5 +38,20 @@ Priority meanings:
 
 ## Current backlog
 
+- [0022 — Complete the protocol observation matrix](0022-complete-protocol-observation-matrix.md) (P1)
+- [0023 — Test multiple supported Hugging Face client versions](0023-test-multiple-hf-client-versions.md) (P1)
+- [0024 — Add black-box crash and upgrade tests](0024-add-black-box-crash-and-upgrade-tests.md) (P1)
+- [0025 — Validate large Hugging Face cache migration](0025-validate-large-hf-cache-migration.md) (P1)
+- [0026 — Complete QNAP and GX10 acceptance testing](0026-complete-qnap-gx10-acceptance-testing.md) (P1)
+- [0027 — Complete structured operational events](0027-complete-structured-operational-events.md) (P2)
 - [0021 — Add tailnet identity-aware authorization](0021-add-tailnet-identity-aware-authorization.md) (P3)
 - [0004 — Add storage observability](0004-add-storage-observability.md) (P3)
+- [0028 — Define private and gated repository credential policy](0028-define-private-gated-credential-policy.md) (P3)
+- [0029 — Add dataset repository support](0029-add-dataset-repository-support.md) (P3)
+- [0030 — Add a management API](0030-add-management-api.md) (P3)
+- [0031 — Define repository pinning policy](0031-define-repository-pinning-policy.md) (P3)
+- [0032 — Add multi-QNAP replication](0032-add-multi-qnap-replication.md) (P3)
+- [0033 — Add an S3 storage backend](0033-add-s3-storage-backend.md) (P3)
+- [0034 — Add an OCI model registry backend](0034-add-oci-model-registry-backend.md) (P3)
+- [0035 — Add archive export and import interoperability](0035-add-archive-interoperability.md) (P3)
+- [0036 — Add non-Hugging-Face upstream sources](0036-add-non-hugging-face-upstreams.md) (P3)
