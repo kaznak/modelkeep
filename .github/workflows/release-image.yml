@@ -39,6 +39,8 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v22
 
+      - name: Run flake checks on ${{ matrix.arch }}
+        run: nix flake check
 
       - name: Build OCI image from flake
         run: nix build .#packages.${{ matrix.nix_system }}.modelkeep-image

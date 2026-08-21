@@ -1,5 +1,5 @@
 ---
-status: in_progress
+status: done
 priority: P1
 related_adrs: []
 created: 2026-08-21
@@ -7,7 +7,7 @@ updated: 2026-08-21
 ---
 # Issue 0012: Make Clippy validation reproducible
 
-- Status: In Progress
+- Status: Done
 - Priority: P1
 - Related ADR: None
 
@@ -62,3 +62,9 @@ nix flake check
 The pinned nixpkgs revision is assumed to provide compatible `cargo`, `rustc`,
 `rustfmt`, and `clippy` packages on both `x86_64-linux` and `aarch64-linux`.
 Cross-system evaluation does not replace an aarch64 execution test.
+
+## Resolution
+
+The explicit development shell and its pinned Rust tools are implemented together
+with the broader self-contained environment in Issue 0013. Clippy is also exposed as
+an independent flake check.

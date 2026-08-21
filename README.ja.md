@@ -68,12 +68,26 @@ private / gated repository を使う場合は、deploy 環境から `HF_TOKEN` �
 
 ## 開発
 
+ホスト側の前提は Nix と Linux 実行環境だけです。Rust や Hugging Face のツールを使う前に、
+固定された開発環境へ入ります。
+
 ```sh
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
+nix develop
+```
+
+標準チェックはその環境内で実行します。
+
+```sh
+nix develop -c cargo fmt --check
+nix develop -c cargo clippy --all-targets --all-features -- -D warnings
+nix develop -c cargo test --all-features
 nix flake check
 ```
+
+Cargo、Rustc、Rustfmt、Clippy、Python、`hf` client、Git、CA証明書はすべて
+`flake.lock` が固定するrevisionから提供されます。flakeはformat、Clippy、unit test、
+Hugging Face client環境を個別のcheckとして公開します。実際のHugging Faceへ接続する
+テストには引き続きnetwork accessが必要です。
 
 正式な build 定義は Nix flake にあります。
 

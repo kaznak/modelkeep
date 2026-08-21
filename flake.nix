@@ -8,10 +8,38 @@
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forAllSystems = function: nixpkgs.lib.genAttrs systems (system:
         function (import nixpkgs { inherit system; }));
+      pythonFor = pkgs:
+        pkgs.python3.withPackages (pythonPackages: [
+          pythonPackages."huggingface-hub"
+        ]);
+      rustToolsFor = pkgs: [
+        pkgs.cargo
+        pkgs.clippy
+        pkgs.rustc
+        pkgs.rustfmt
+      ];
+      cargoValidation = pkgs: name: command:
+        pkgs.rustPlatform.buildRustPackage {
+          pname = "modelkeep-${name}";
+          version = "0.1.0";
+          src = nixpkgs.lib.cleanSource ./.;
+          cargoLock.lockFile = ./Cargo.lock;
+          nativeBuildInputs = rustToolsFor pkgs;
+          buildPhase = ''
+            runHook preBuild
+            ${command}
+            runHook postBuild
+          '';
+          doCheck = false;
+          installPhase = ''
+            mkdir -p $out
+            touch $out/passed
+          '';
+        };
     in {
       packages = forAllSystems (pkgs:
         let
-          python = pkgs.python3.withPackages (pythonPackages: [ pythonPackages."huggingface-hub" ]);
+          python = pythonFor pkgs;
           hfFetcher = pkgs.runCommand "modelkeep-hf-fetcher" {} ''
             mkdir -p $out/bin
             cp ${./upstream/hf_fetch.py} $out/bin/hf_fetch.py
@@ -41,8 +69,51 @@
         default = self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep;
       });
 
-      checks = forAllSystems (pkgs: {
-        modelkeep = self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep;
+      devShells = forAllSystems (pkgs: {
+        default = pkgs.mkShell {
+          packages = rustToolsFor pkgs ++ [
+            (pythonFor pkgs)
+            pkgs.cacert
+            pkgs.git
+          ];
+          SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+        };
       });
+
+      checks = forAllSystems (pkgs:
+        let
+          source = nixpkgs.lib.cleanSource ./.;
+          python = pythonFor pkgs;
+        in {
+          format = pkgs.runCommand "modelkeep-format" {
+            nativeBuildInputs = [ pkgs.cargo pkgs.rustfmt ];
+          } ''
+            cp -R ${source} source
+            chmod -R u+w source
+            cd source
+            cargo fmt --check
+            touch $out
+          '';
+
+          clippy = cargoValidation pkgs "clippy" ''
+            cargo clippy --offline --all-targets --all-features -- -D warnings
+          '';
+
+          tests = cargoValidation pkgs "tests" ''
+            cargo test --offline --all-features
+          '';
+
+          hf-client-environment = pkgs.runCommand "modelkeep-hf-client-environment" {
+            nativeBuildInputs = [ python pkgs.cacert pkgs.git ];
+            SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+          } ''
+            python3 -c "import huggingface_hub"
+            hf --help >/dev/null
+            git --version >/dev/null
+            touch $out
+          '';
+
+          modelkeep = self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep;
+        });
     };
 }

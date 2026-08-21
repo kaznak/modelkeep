@@ -71,14 +71,26 @@ environment. Never put credentials in URLs, manifests, or logs.
 
 ## Development
 
-Run the standard checks locally:
+Nix and a Linux execution environment are the only host prerequisites. Enter the
+pinned development environment before running Rust or Hugging Face tooling:
 
 ```sh
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
+nix develop
+```
+
+Run the standard checks inside that environment:
+
+```sh
+nix develop -c cargo fmt --check
+nix develop -c cargo clippy --all-targets --all-features -- -D warnings
+nix develop -c cargo test --all-features
 nix flake check
 ```
+
+Cargo, Rustc, Rustfmt, Clippy, Python, the `hf` client, Git, and CA certificates all
+come from the revision pinned by `flake.lock`. The flake exposes formatting, Clippy,
+unit-test, and Hugging Face client-environment checks separately. Tests that contact
+the real Hugging Face service still require network access.
 
 Build the package or OCI image from the canonical Nix definition:
 

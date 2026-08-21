@@ -1,6 +1,6 @@
 ---
 status: open
-priority: P1
+priority: P3
 related_adrs:
   - ADR-0004
   - ADR-0006
@@ -10,7 +10,7 @@ updated: 2026-08-21
 # Issue 0004: Add storage observability
 
 - Status: Open
-- Priority: P1
+- Priority: P3
 - Related ADR: ADR-0004, ADR-0006
 
 ## Objective

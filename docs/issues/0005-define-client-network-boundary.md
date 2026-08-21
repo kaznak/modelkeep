@@ -1,6 +1,6 @@
 ---
 status: open
-priority: P2
+priority: P3
 related_adrs:
   - ADR-0003
   - ADR-0005
@@ -10,7 +10,7 @@ updated: 2026-08-21
 # Issue 0005: Define the client network boundary
 
 - Status: Open
-- Priority: P2
+- Priority: P3
 - Related ADR: ADR-0003, ADR-0005
 
 ## Objective

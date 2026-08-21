@@ -1,5 +1,5 @@
 ---
-status: open
+status: done
 priority: P1
 related_adrs: []
 created: 2026-08-21
@@ -7,7 +7,7 @@ updated: 2026-08-21
 ---
 # Issue 0013: Make the development environment self-contained
 
-- Status: Open
+- Status: Done
 - Priority: P1
 - Related ADR: None
 
@@ -106,3 +106,13 @@ documentation.
   access and must remain distinguishable from offline unit checks.
 - Native `aarch64-linux` execution may require separate hardware or CI even though
   the output evaluates on an x86_64 development host.
+
+## Resolution
+
+The flake now provides a default development shell on both supported systems with a
+single pinned Rust toolchain, Python and the official Hugging Face client, Git, and
+CA certificates. Formatting, Clippy, unit tests, and the supported-client environment
+are separate flake checks. There is not yet a repository-owned live Hugging Face
+integration suite; when one is added, it must remain distinct from offline checks.
+The GitHub Actions image matrix runs `nix flake check` natively on both its amd64 and
+arm64 runners before building the corresponding OCI image.
