@@ -46,7 +46,7 @@ Priority meanings:
 - [0030 — Define the management control-plane contract](0030-add-management-api.md) (P1)
 - [0045 — Add the read-only management API](0045-add-read-only-management-api.md) (P1)
 - [0046 — Add asynchronous archive jobs](0046-add-asynchronous-archive-jobs.md) (P1)
-- [0047 — Add the QNAP management web UI](0047-add-qnap-management-web-ui.md) (P1)
+- [0047 — Add the management web UI](0047-add-management-web-ui.md) (P1)
 - [0027 — Complete structured operational events](0027-complete-structured-operational-events.md) (P2)
 - [0048 — Add the remote revision deletion workflow](0048-add-remote-revision-deletion-workflow.md) (P2)
 - [0021 — Add tailnet identity-aware authorization](0021-add-tailnet-identity-aware-authorization.md) (P3)
