@@ -879,7 +879,7 @@ MVP 後の候補:
 - ~~management control-plane contract — [Issue 0030](https://github.com/kaznak/modelkeep/commit/2e637bc)~~
 - ~~read-only management API — [Issue 0045](https://github.com/kaznak/modelkeep/commit/e4a7c88)~~
 - ~~asynchronous prefetch/refresh/verify/audit jobs — [completed in 9beba30](https://github.com/kaznak/modelkeep/commit/9beba30)~~
-- management Web UI — [Issue 0047](issues/0047-add-management-web-ui.md)
+- ~~management Web UI — [completed in d55c850](https://github.com/kaznak/modelkeep/commit/d55c850)~~
 - remote explicit revision deletion — [Issue 0048](issues/0048-add-remote-revision-deletion-workflow.md)
 - repository pin/unpin policy — [Issue 0031](issues/0031-define-repository-pinning-policy.md)
 - ~~explicit archive deletion workflow — [ADR-0007](adr/0007-explicit-revision-deletion.md)、[implementation](https://github.com/kaznak/modelkeep/commit/e8aa9cce7aaccf1d9f5b8e701d317b0d678b343b)~~
