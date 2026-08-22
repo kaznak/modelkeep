@@ -23,7 +23,7 @@ does not certify unrecorded QNAP firmware, ACL, snapshot, or filesystem behavior
 ## First deployment
 
 1. Apply [qnap-permissions.md](qnap-permissions.md).
-2. Use the Compose image `ghcr.io/kaznak/modelkeep:v0.2.1`, or edit the literal
+2. Use the Compose image `ghcr.io/kaznak/modelkeep:v0.3.0`, or edit the literal
    `image:` field to a different released or `sha-...` image tag, and record
    `docker image inspect` output. Do not use Compose variable-default expressions in
    a QNAP Container Station Application.
