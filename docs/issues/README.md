@@ -43,6 +43,7 @@ Priority meanings:
 - [0024 — Add black-box crash and upgrade tests](0024-add-black-box-crash-and-upgrade-tests.md) (P1)
 - [0025 — Validate large Hugging Face cache migration](0025-validate-large-hf-cache-migration.md) (P1)
 - [0026 — Complete QNAP and GX10 acceptance testing](0026-complete-qnap-gx10-acceptance-testing.md) (P1)
+- [0043 — Add startup and lifecycle logging](0043-add-startup-and-lifecycle-logging.md) (P1)
 - [0027 — Complete structured operational events](0027-complete-structured-operational-events.md) (P2)
 - [0021 — Add tailnet identity-aware authorization](0021-add-tailnet-identity-aware-authorization.md) (P3)
 - [0004 — Add storage observability](0004-add-storage-observability.md) (P3)
