@@ -63,5 +63,6 @@ credential-leakage, and upstream-offline warm-download scenarios.
 
 ## Risks and assumptions
 
-Issues 0030 and 0045 must define and implement the control-plane foundation first.
-Job metadata is operational state and must not become the authority for model bytes.
+ADR-0015 and the completed Issue 0045 implementation define the control-plane
+foundation. Job metadata is operational state and must not become the authority for
+model bytes.
