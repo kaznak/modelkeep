@@ -17,6 +17,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(filter)
+        .with_writer(std::io::stderr)
         .init();
     if let Err(error) = run().await {
         tracing::error!(event = "process_failed", error = %error, "modelkeep command failed");
