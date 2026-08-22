@@ -530,7 +530,7 @@ services:
   modelkeep-init:
     image: ghcr.io/kaznak/modelkeep:<version>
     user: "0:0"
-    entrypoint: ["/bin/chown", "10001:10001", "/data"]
+    entrypoint: ["/bin/modelkeep", "init-ownership", "/data"]
     volumes:
       - /share/Services/modelkeep:/data
     cap_drop: [ALL]

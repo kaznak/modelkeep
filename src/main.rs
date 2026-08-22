@@ -3,7 +3,7 @@ use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
     path::PathBuf,
-    process,
+    process::{self, Command},
     sync::Arc,
     time::Duration,
 };
@@ -13,14 +13,71 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() {
+    let filter = log_filter();
     tracing_subscriber::fmt()
         .json()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(filter)
         .init();
     if let Err(error) = run().await {
-        eprintln!("modelkeep: {error}");
+        tracing::error!(event = "process_failed", error = %error, "modelkeep command failed");
         process::exit(1);
     }
+}
+
+fn log_filter() -> EnvFilter {
+    log_filter_from(env::var("RUST_LOG"))
+}
+
+fn log_filter_from(value: Result<String, env::VarError>) -> EnvFilter {
+    match value {
+        Ok(value) => EnvFilter::try_new(value).unwrap_or_else(|error| {
+            eprintln!("modelkeep: invalid RUST_LOG filter; using info: {error}");
+            EnvFilter::new("info")
+        }),
+        Err(env::VarError::NotPresent) => EnvFilter::new("info"),
+        Err(error) => {
+            eprintln!("modelkeep: invalid RUST_LOG value; using info: {error}");
+            EnvFilter::new("info")
+        }
+    }
+}
+
+fn initialize_ownership(target: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!(
+        event = "ownership_initialization_started",
+        target = %target.display(),
+        owner = "10001:10001",
+        "archive ownership initialization started"
+    );
+    let status = Command::new("/bin/chown")
+        .arg("10001:10001")
+        .arg(&target)
+        .status()
+        .map_err(|error| {
+            tracing::error!(
+                event = "ownership_initialization_failed",
+                target = %target.display(),
+                error = %error,
+                "could not execute ownership initialization"
+            );
+            error
+        })?;
+    if !status.success() {
+        tracing::error!(
+            event = "ownership_initialization_failed",
+            target = %target.display(),
+            exit_status = %status,
+            "archive ownership initialization failed"
+        );
+        return Err(format!("ownership initialization failed with {status}").into());
+    }
+    tracing::info!(
+        event = "ownership_initialization_completed",
+        target = %target.display(),
+        owner = "10001:10001",
+        "archive ownership initialization completed"
+    );
+    Ok(())
 }
 
 fn parse_remove_option(option: Option<&str>, has_extra: bool) -> Result<bool, String> {
@@ -181,13 +238,67 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .next()
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/data"));
-            let bind = args
-                .next()
-                .unwrap_or_else(|| "0.0.0.0:8090".to_string())
-                .parse::<SocketAddr>()?;
-            let archive = Archive::new(root)?;
-            archive.recover_incomplete()?;
-            match (
+            let bind_value = args.next().unwrap_or_else(|| "0.0.0.0:8090".to_string());
+            let bind = bind_value.parse::<SocketAddr>().map_err(|error| {
+                tracing::error!(
+                    event = "configuration_failed",
+                    field = "listen_address",
+                    value = %bind_value,
+                    error = %error,
+                    "invalid listen address"
+                );
+                error
+            })?;
+            tracing::info!(
+                event = "startup_started",
+                version = env!("CARGO_PKG_VERSION"),
+                archive_root = %root.display(),
+                listen_address = %bind,
+                "modelkeep startup started"
+            );
+            tracing::info!(
+                event = "archive_initialization_started",
+                archive_root = %root.display(),
+                "archive initialization started"
+            );
+            let archive = Archive::new(root).map_err(|error| {
+                tracing::error!(
+                    event = "archive_initialization_failed",
+                    error = %error,
+                    "archive initialization failed"
+                );
+                error
+            })?;
+            tracing::info!(
+                event = "archive_initialization_completed",
+                "archive initialization completed"
+            );
+            tracing::info!(
+                event = "archive_recovery_started",
+                "archive recovery started"
+            );
+            let recovered = archive.recover_incomplete().map_err(|error| {
+                tracing::error!(
+                    event = "archive_recovery_failed",
+                    error = %error,
+                    "archive recovery failed"
+                );
+                error
+            })?;
+            tracing::info!(
+                event = "archive_recovery_completed",
+                recovered_staging_directories = recovered,
+                "archive recovery completed"
+            );
+            archive.check_readiness().map_err(|error| {
+                tracing::error!(
+                    event = "archive_readiness_failed",
+                    error = %error,
+                    "archive did not become ready during startup"
+                );
+                error
+            })?;
+            let upstream = match (
                 env::var("MODELKEEP_HF_PYTHON"),
                 env::var("MODELKEEP_HF_HELPER"),
             ) {
@@ -197,11 +308,32 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         helper: helper.into(),
                     });
                     let pullthrough = Arc::new(PullThrough::new(archive.clone(), fetcher));
-                    http::serve_with_pullthrough(archive, pullthrough, bind).await?;
+                    Some(pullthrough)
                 }
-                _ => http::serve(archive, bind).await?,
+                _ => None,
+            };
+            tracing::info!(
+                event = "startup_configuration",
+                pullthrough_enabled = upstream.is_some(),
+                "startup configuration loaded"
+            );
+            match upstream {
+                Some(pullthrough) => {
+                    http::serve_with_pullthrough(archive, pullthrough, bind).await?
+                }
+                None => http::serve(archive, bind).await?,
             }
             Ok(())
+        }
+        Some("init-ownership") => {
+            let target = args
+                .next()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/data"));
+            if args.next().is_some() {
+                return Err("init-ownership accepts only target path".into());
+            }
+            initialize_ownership(target)
         }
         Some("health") => probe_endpoint("/healthz"),
         Some("ready") => probe_endpoint("/readyz"),
@@ -211,6 +343,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
        modelkeep show [archive-root] <repo-id> <commit>
        modelkeep import-hf-cache <cache-path> [archive-root]
        modelkeep serve [archive-root] [bind-address]
+       modelkeep init-ownership [target-path]
        modelkeep health
        modelkeep ready
        modelkeep audit [archive-root]
@@ -226,7 +359,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_remove_option;
+    use super::{log_filter_from, parse_remove_option};
+    use std::env::VarError;
 
     #[test]
     fn remove_option_parser_accepts_real_delete_and_dry_run() {
@@ -239,5 +373,18 @@ mod tests {
         assert!(parse_remove_option(Some("--other"), false).is_err());
         assert!(parse_remove_option(None, true).is_err());
         assert!(parse_remove_option(Some("--dry-run"), true).is_err());
+    }
+
+    #[test]
+    fn log_filter_accepts_valid_directives_and_defaults_invalid_values() {
+        assert_eq!(
+            log_filter_from(Err(VarError::NotPresent)).to_string(),
+            "info"
+        );
+        assert_eq!(
+            log_filter_from(Ok("modelkeep=debug".into())).to_string(),
+            "modelkeep=debug"
+        );
+        assert_eq!(log_filter_from(Ok("[".into())).to_string(), "info");
     }
 }

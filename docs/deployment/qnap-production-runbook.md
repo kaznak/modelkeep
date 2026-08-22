@@ -34,11 +34,19 @@ does not certify unrecorded QNAP firmware, ACL, snapshot, or filesystem behavior
 5. Configure Tailscale Serve as described in
    [qnap-tailscale-serve.md](qnap-tailscale-serve.md). Confirm loopback HTTP and
    tailnet HTTPS work, and direct LAN port 8090 does not.
-6. Check `docker compose ps`, readiness, and structured logs.
+6. Check `docker compose ps`, readiness, and structured logs. At the default
+   `RUST_LOG=info`, expect ownership initialization, startup, archive recovery, and
+   `server_ready` events. Successful health probes are intentionally quiet.
 7. Import a small model, verify it, and complete the restore drill below.
 
 Keep `HF_TOKEN` in the deployment environment or QNAP secret facility, never in
 `/data`, backup metadata, recorded commands, or URLs.
+
+For temporary probe diagnostics, change the Compose setting to `RUST_LOG=debug` and
+recreate the service. Successful `/healthz` and `/readyz` requests then appear as
+debug events. Restore `RUST_LOG=info` afterward to avoid a log entry for every
+healthcheck. A failed readiness check remains visible as a warning at the default
+level. Invalid `RUST_LOG` syntax is reported and falls back to `info`.
 
 ## Backup and restore drill
 

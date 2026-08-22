@@ -11,7 +11,7 @@ use axum::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt},
-    task,
+    signal, task,
 };
 use tokio_util::io::ReaderStream;
 use tracing::info;
@@ -25,8 +25,7 @@ pub struct HttpState {
     pullthrough: Option<Arc<PullThrough>>,
 }
 pub async fn serve(archive: Archive, address: std::net::SocketAddr) -> std::io::Result<()> {
-    let listener = tokio::net::TcpListener::bind(address).await?;
-    axum::serve(listener, router(archive)).await
+    serve_router(router(archive), address).await
 }
 
 pub async fn serve_with_pullthrough(
@@ -34,8 +33,49 @@ pub async fn serve_with_pullthrough(
     pullthrough: Arc<PullThrough>,
     address: std::net::SocketAddr,
 ) -> std::io::Result<()> {
-    let listener = tokio::net::TcpListener::bind(address).await?;
-    axum::serve(listener, router_with_pullthrough(archive, pullthrough)).await
+    serve_router(router_with_pullthrough(archive, pullthrough), address).await
+}
+
+async fn serve_router(router: Router, address: std::net::SocketAddr) -> std::io::Result<()> {
+    let listener = match tokio::net::TcpListener::bind(address).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            tracing::error!(
+                event = "server_bind_failed",
+                listen_address = %address,
+                error = %error,
+                "failed to bind HTTP listener"
+            );
+            return Err(error);
+        }
+    };
+    tracing::info!(
+        event = "server_ready",
+        listen_address = %address,
+        "modelkeep is ready to serve requests"
+    );
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    tracing::info!(event = "shutdown_completed", "modelkeep shutdown completed");
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate = signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    signal::ctrl_c()
+        .await
+        .expect("failed to install shutdown signal handler");
+    tracing::info!(event = "shutdown_started", "modelkeep shutdown started");
 }
 
 pub fn router(archive: Archive) -> Router {
@@ -72,14 +112,26 @@ fn router_with_state(state: HttpState) -> Router {
 }
 
 async fn healthz() -> StatusCode {
+    tracing::debug!(
+        event = "health_probe_succeeded",
+        endpoint = "/healthz",
+        "health probe succeeded"
+    );
     StatusCode::OK
 }
 
 async fn readyz(State(state): State<HttpState>) -> StatusCode {
     match state.archive.check_readiness() {
-        Ok(()) => StatusCode::OK,
+        Ok(()) => {
+            tracing::debug!(
+                event = "readiness_probe_succeeded",
+                endpoint = "/readyz",
+                "readiness probe succeeded"
+            );
+            StatusCode::OK
+        }
         Err(error) => {
-            tracing::warn!(error = %error, "archive readiness check failed");
+            tracing::warn!(event = "readiness_probe_failed", endpoint = "/readyz", error = %error, "archive readiness check failed");
             StatusCode::SERVICE_UNAVAILABLE
         }
     }
@@ -333,7 +385,49 @@ mod tests {
 
     use super::*;
     use axum::body::to_bytes;
+    use std::io::Write;
+    use std::sync::Mutex;
     use tower::ServiceExt;
+    use tracing_subscriber::EnvFilter;
+
+    #[derive(Clone, Default)]
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl LogWriter {
+        fn output(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    fn capture_logs(filter: &str) -> (LogWriter, tracing::subscriber::DefaultGuard) {
+        let writer = LogWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(EnvFilter::new(filter))
+            .with_writer(writer.clone())
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (writer, guard)
+    }
 
     fn test_router() -> (Router, tempfile::TempDir) {
         let directory = tempfile::tempdir().unwrap();
@@ -372,6 +466,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn successful_probe_events_are_available_at_debug() {
+        let (writer, _guard) = capture_logs("debug");
+        let (app, _directory) = test_router();
+        for endpoint in ["/healthz", "/readyz"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(endpoint)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let output = writer.output();
+        assert!(output.contains("health_probe_succeeded"));
+        assert!(output.contains("readiness_probe_succeeded"));
+    }
+
+    #[tokio::test]
+    async fn successful_probe_events_are_quiet_at_info() {
+        let (writer, _guard) = capture_logs("info");
+        let (app, _directory) = test_router();
+        for endpoint in ["/healthz", "/readyz"] {
+            app.clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(endpoint)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        let output = writer.output();
+        assert!(!output.contains("health_probe_succeeded"));
+        assert!(!output.contains("readiness_probe_succeeded"));
     }
 
     #[tokio::test]
