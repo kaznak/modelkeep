@@ -876,7 +876,11 @@ MVP 後の候補:
 - datasets対応 — [Issue 0029](issues/0029-add-dataset-repository-support.md)
 - gated/private repositoryの認証policy — [Issue 0028](issues/0028-define-private-gated-credential-policy.md)
 - tailnet identity-aware authorization — [Issue 0021](issues/0021-add-tailnet-identity-aware-authorization.md)
-- Web/API management interface — [Issue 0030](issues/0030-add-management-api.md)
+- management control-plane contract — [Issue 0030](issues/0030-add-management-api.md)
+- read-only management API — [Issue 0045](issues/0045-add-read-only-management-api.md)
+- asynchronous prefetch/refresh/verify/audit jobs — [Issue 0046](issues/0046-add-asynchronous-archive-jobs.md)
+- QNAP management Web UI — [Issue 0047](issues/0047-add-qnap-management-web-ui.md)
+- remote explicit revision deletion — [Issue 0048](issues/0048-add-remote-revision-deletion-workflow.md)
 - repository pin/unpin policy — [Issue 0031](issues/0031-define-repository-pinning-policy.md)
 - ~~explicit archive deletion workflow — [ADR-0007](adr/0007-explicit-revision-deletion.md)、[implementation](https://github.com/kaznak/modelkeep/commit/e8aa9cce7aaccf1d9f5b8e701d317b0d678b343b)~~
 - multi-QNAP replication — [Issue 0032](issues/0032-add-multi-qnap-replication.md)
