@@ -60,5 +60,5 @@ reconstruction tests, and credential/header leakage assertions.
 
 ## Risks and assumptions
 
-Issue 0030 and its ADR must complete first. Storage capacity semantics tracked by
-Issue 0004 may initially expose only reliably portable values.
+The control-plane contract is fixed by ADR-0015. Storage capacity semantics tracked
+by Issue 0004 may initially expose only reliably portable values.
