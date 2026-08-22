@@ -1,4 +1,16 @@
-use std::{env, net::SocketAddr, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    env,
+    fs::{self, File, OpenOptions},
+    io::Write,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use axum::{
     extract::{Path, Query, State},
@@ -9,9 +21,15 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{pullthrough::PullThrough, Archive, ArchiveError, RepositorySummary};
+use sha2::{Digest, Sha256};
+
+use crate::{
+    pullthrough::PullThrough, validate_repository_id, validate_revision_ref, Archive, ArchiveError,
+    RepositorySummary,
+};
 
 const ADMIN_CAPABILITY: &str = "io.modelkeep/cap/admin";
+static JOB_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 pub struct Config {
@@ -60,6 +78,8 @@ impl Config {
 struct AdminState {
     archive: Arc<Archive>,
     config: Config,
+    pullthrough: Option<Arc<PullThrough>>,
+    jobs: JobManager,
 }
 
 #[derive(Debug, Serialize)]
@@ -88,12 +108,345 @@ struct RepositoryPage {
     next_cursor: Option<String>,
 }
 
-pub fn router(archive: Archive, config: Config, pullthrough_enabled: bool) -> Router {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum JobKind {
+    Prefetch,
+    Refresh,
+    Verify,
+    Audit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum JobState {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Job {
+    id: String,
+    kind: JobKind,
+    state: JobState,
+    phase: String,
+    repo_id: Option<String>,
+    revision: Option<String>,
+    resolved_commit: Option<String>,
+    progress_bytes: Option<u64>,
+    total_bytes: Option<u64>,
+    error_class: Option<String>,
+    message: Option<String>,
+    idempotency_hash: Option<String>,
+    created_at: u64,
+    updated_at: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct JobView {
+    id: String,
+    kind: JobKind,
+    state: JobState,
+    phase: String,
+    repo_id: Option<String>,
+    revision: Option<String>,
+    resolved_commit: Option<String>,
+    progress_bytes: Option<u64>,
+    total_bytes: Option<u64>,
+    error_class: Option<String>,
+    message: Option<String>,
+    created_at: u64,
+    updated_at: u64,
+}
+
+impl From<Job> for JobView {
+    fn from(job: Job) -> Self {
+        Self {
+            id: job.id,
+            kind: job.kind,
+            state: job.state,
+            phase: job.phase,
+            repo_id: job.repo_id,
+            revision: job.revision,
+            resolved_commit: job.resolved_commit,
+            progress_bytes: job.progress_bytes,
+            total_bytes: job.total_bytes,
+            error_class: job.error_class,
+            message: job.message,
+            created_at: job.created_at,
+            updated_at: job.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct JobPage {
+    items: Vec<JobView>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JobRequest {
+    kind: JobKind,
+    repo_id: Option<String>,
+    revision: Option<String>,
+}
+
+#[derive(Clone)]
+struct JobManager {
+    inner: Arc<JobManagerInner>,
+}
+
+struct JobManagerInner {
+    directory: PathBuf,
+    jobs: Mutex<BTreeMap<String, Job>>,
+}
+
+impl JobManager {
+    fn open(archive: &Archive) -> Result<Self, ArchiveError> {
+        let directory = archive.root.join("state").join("jobs");
+        fs::create_dir_all(&directory)?;
+        let manager = Self {
+            inner: Arc::new(JobManagerInner {
+                directory,
+                jobs: Mutex::new(BTreeMap::new()),
+            }),
+        };
+        for entry in fs::read_dir(&manager.inner.directory)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file()
+                || entry.path().extension().and_then(|value| value.to_str()) != Some("json")
+            {
+                continue;
+            }
+            let mut job: Job = serde_json::from_slice(&fs::read(entry.path())?)
+                .map_err(|error| ArchiveError::IntegrityMismatch(error.to_string()))?;
+            if matches!(job.state, JobState::Queued | JobState::Running) {
+                job.state = JobState::Failed;
+                job.phase = "interrupted".into();
+                job.error_class = Some("interrupted".into());
+                job.message = Some("job interrupted by process restart".into());
+                job.updated_at = unix_timestamp();
+                manager.persist(&job)?;
+            }
+            manager
+                .inner
+                .jobs
+                .lock()
+                .unwrap()
+                .insert(job.id.clone(), job);
+        }
+        Ok(manager)
+    }
+
+    fn list(&self) -> Vec<Job> {
+        self.inner
+            .jobs
+            .lock()
+            .unwrap()
+            .values()
+            .rev()
+            .cloned()
+            .collect()
+    }
+
+    fn get(&self, id: &str) -> Option<Job> {
+        self.inner.jobs.lock().unwrap().get(id).cloned()
+    }
+
+    fn submit(
+        &self,
+        request: JobRequest,
+        idempotency_key: Option<&str>,
+        archive: Arc<Archive>,
+        pullthrough: Option<Arc<PullThrough>>,
+    ) -> Result<(Job, bool), &'static str> {
+        validate_job_request(&request)?;
+        let idempotency_hash = idempotency_key.map(hash_idempotency_key).transpose()?;
+        let mut jobs = self.inner.jobs.lock().unwrap();
+        if let Some(hash) = &idempotency_hash {
+            if let Some(existing) = jobs
+                .values()
+                .find(|job| job.idempotency_hash.as_ref() == Some(hash))
+                .cloned()
+            {
+                return Ok((existing, false));
+            }
+        }
+        let now = unix_timestamp();
+        let job = Job {
+            id: format!("{now}-{}", JOB_SEQUENCE.fetch_add(1, Ordering::Relaxed)),
+            kind: request.kind,
+            state: JobState::Queued,
+            phase: "queued".into(),
+            repo_id: request.repo_id,
+            revision: request.revision,
+            resolved_commit: None,
+            progress_bytes: None,
+            total_bytes: None,
+            error_class: None,
+            message: None,
+            idempotency_hash,
+            created_at: now,
+            updated_at: now,
+        };
+        self.persist(&job).map_err(|_| "storage")?;
+        jobs.insert(job.id.clone(), job.clone());
+        drop(jobs);
+        let manager = self.clone();
+        let job_id = job.id.clone();
+        tokio::task::spawn_blocking(move || manager.run(&job_id, archive, pullthrough));
+        Ok((job, true))
+    }
+
+    fn run(&self, id: &str, archive: Arc<Archive>, pullthrough: Option<Arc<PullThrough>>) {
+        let Some(job) = self.update(id, |job| {
+            if job.state == JobState::Cancelled {
+                return;
+            }
+            job.state = JobState::Running;
+            job.phase = match job.kind {
+                JobKind::Prefetch | JobKind::Refresh => "acquiring_snapshot",
+                JobKind::Verify => "verifying_revision",
+                JobKind::Audit => "auditing_archive",
+            }
+            .into();
+        }) else {
+            return;
+        };
+        if job.state == JobState::Cancelled {
+            return;
+        }
+        let result: Result<Option<String>, (&'static str, String)> = match job.kind {
+            JobKind::Prefetch => pullthrough
+                .as_ref()
+                .ok_or_else(|| ("upstream_disabled", "pull-through is disabled".into()))
+                .and_then(|pullthrough| {
+                    pullthrough
+                        .ensure(
+                            job.repo_id.as_deref().unwrap(),
+                            job.revision.as_deref().unwrap(),
+                            &[],
+                        )
+                        .map(Some)
+                        .map_err(classify_pullthrough_error)
+                }),
+            JobKind::Refresh => pullthrough
+                .as_ref()
+                .ok_or_else(|| ("upstream_disabled", "pull-through is disabled".into()))
+                .and_then(|pullthrough| {
+                    pullthrough
+                        .refresh(
+                            job.repo_id.as_deref().unwrap(),
+                            job.revision.as_deref().unwrap(),
+                            false,
+                        )
+                        .map(|result| Some(result.proposed))
+                        .map_err(classify_pullthrough_error)
+                }),
+            JobKind::Verify => archive
+                .verify_revision(
+                    job.repo_id.as_deref().unwrap(),
+                    job.revision.as_deref().unwrap(),
+                )
+                .map(|_| job.revision.clone())
+                .map_err(classify_archive_error),
+            JobKind::Audit => archive
+                .audit()
+                .map_err(classify_archive_error)
+                .and_then(|report| {
+                    if report.failures.is_empty() {
+                        Ok(None)
+                    } else {
+                        Err((
+                            "integrity",
+                            format!("{} revisions failed audit", report.failures.len()),
+                        ))
+                    }
+                }),
+        };
+        match result {
+            Ok(commit) => {
+                self.update(id, |job| {
+                    job.state = JobState::Completed;
+                    job.phase = "completed".into();
+                    job.resolved_commit = commit;
+                });
+            }
+            Err((class, message)) => {
+                self.update(id, |job| {
+                    job.state = JobState::Failed;
+                    job.phase = "failed".into();
+                    job.error_class = Some(class.into());
+                    job.message = Some(message);
+                });
+            }
+        }
+    }
+
+    fn cancel(&self, id: &str) -> Result<Job, &'static str> {
+        let mut jobs = self.inner.jobs.lock().unwrap();
+        let job = jobs.get_mut(id).ok_or("not_found")?;
+        if job.state != JobState::Queued {
+            return Err("not_cancellable");
+        }
+        job.state = JobState::Cancelled;
+        job.phase = "cancelled".into();
+        job.updated_at = unix_timestamp();
+        let snapshot = job.clone();
+        drop(jobs);
+        self.persist(&snapshot).map_err(|_| "storage")?;
+        Ok(snapshot)
+    }
+
+    fn update(&self, id: &str, update: impl FnOnce(&mut Job)) -> Option<Job> {
+        let mut jobs = self.inner.jobs.lock().unwrap();
+        let job = jobs.get_mut(id)?;
+        update(job);
+        job.updated_at = unix_timestamp();
+        let snapshot = job.clone();
+        drop(jobs);
+        if let Err(error) = self.persist(&snapshot) {
+            tracing::error!(event = "admin_job_persist_failed", job_id = %id, error = %error, "failed to persist management job");
+        }
+        Some(snapshot)
+    }
+
+    fn persist(&self, job: &Job) -> Result<(), ArchiveError> {
+        let temporary = self.inner.directory.join(format!(".{}.tmp", job.id));
+        let final_path = self.inner.directory.join(format!("{}.json", job.id));
+        let bytes = serde_json::to_vec(job)
+            .map_err(|error| ArchiveError::IntegrityMismatch(error.to_string()))?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, final_path)?;
+        File::open(&self.inner.directory)?.sync_all()?;
+        Ok(())
+    }
+}
+
+pub fn router(
+    archive: Archive,
+    config: Config,
+    pullthrough: Option<Arc<PullThrough>>,
+) -> Result<Router, ArchiveError> {
+    let jobs = JobManager::open(&archive)?;
     let state = AdminState {
         archive: Arc::new(archive),
         config,
+        pullthrough,
+        jobs,
     };
-    Router::new()
+    let pullthrough_enabled = state.pullthrough.is_some();
+    Ok(Router::new()
         .route(
             "/api/admin/v1/status",
             get(move |State(state), headers| status(state, headers, pullthrough_enabled)),
@@ -103,7 +456,9 @@ pub fn router(archive: Archive, config: Config, pullthrough_enabled: bool) -> Ro
             "/api/admin/v1/repositories/{namespace}/{repository}",
             get(repository),
         )
-        .with_state(state)
+        .route("/api/admin/v1/jobs", get(list_jobs).post(create_job))
+        .route("/api/admin/v1/jobs/{id}", get(job).delete(cancel_job))
+        .with_state(state))
 }
 
 pub async fn serve(
@@ -128,9 +483,147 @@ pub async fn serve(
         listen_address = %address,
         "management API is ready"
     );
-    axum::serve(listener, router(archive, config, pullthrough.is_some()))
+    let router = router(archive, config, pullthrough)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    axum::serve(listener, router)
         .with_graceful_shutdown(crate::http::shutdown_signal())
         .await
+}
+
+async fn list_jobs(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Query(query): Query<PageQuery>,
+) -> Response {
+    if !authorized(&state.config, &headers) {
+        return unauthorized();
+    }
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let mut jobs = state
+        .jobs
+        .list()
+        .into_iter()
+        .filter(|job| query.cursor.as_ref().is_none_or(|cursor| job.id < *cursor))
+        .take(limit + 1)
+        .collect::<Vec<_>>();
+    let next_cursor = (jobs.len() > limit).then(|| jobs[limit - 1].id.clone());
+    jobs.truncate(limit);
+    Json(JobPage {
+        items: jobs.into_iter().map(JobView::from).collect(),
+        next_cursor,
+    })
+    .into_response()
+}
+
+async fn job(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if !authorized(&state.config, &headers) {
+        return unauthorized();
+    }
+    match state.jobs.get(&id) {
+        Some(job) => Json(JobView::from(job)).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody { error: "not_found" }),
+        )
+            .into_response(),
+    }
+}
+
+async fn create_job(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Json(request): Json<JobRequest>,
+) -> Response {
+    if !authorized(&state.config, &headers) {
+        return unauthorized();
+    }
+    if !csrf_authorized(&headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: "csrf_required",
+            }),
+        )
+            .into_response();
+    }
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok());
+    match state.jobs.submit(
+        request,
+        idempotency_key,
+        state.archive.clone(),
+        state.pullthrough.clone(),
+    ) {
+        Ok((job, created)) => (
+            if created {
+                StatusCode::ACCEPTED
+            } else {
+                StatusCode::OK
+            },
+            Json(JobView::from(job)),
+        )
+            .into_response(),
+        Err("invalid_request") | Err("invalid_idempotency_key") => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: "invalid_request",
+            }),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: "job_storage_error",
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn cancel_job(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if !authorized(&state.config, &headers) {
+        return unauthorized();
+    }
+    if !csrf_authorized(&headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: "csrf_required",
+            }),
+        )
+            .into_response();
+    }
+    match state.jobs.cancel(&id) {
+        Ok(job) => Json(JobView::from(job)).into_response(),
+        Err("not_found") => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody { error: "not_found" }),
+        )
+            .into_response(),
+        Err("not_cancellable") => (
+            StatusCode::CONFLICT,
+            Json(ErrorBody {
+                error: "not_cancellable",
+            }),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: "job_storage_error",
+            }),
+        )
+            .into_response(),
+    }
 }
 
 async fn status(state: AdminState, headers: HeaderMap, pullthrough_enabled: bool) -> Response {
@@ -227,6 +720,77 @@ fn authorized(config: &Config, headers: &HeaderMap) -> bool {
     bearer_authorized || tailscale_authorized
 }
 
+fn csrf_authorized(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-modelkeep-csrf")
+        .and_then(|value| value.to_str().ok())
+        == Some("1")
+}
+
+fn validate_job_request(request: &JobRequest) -> Result<(), &'static str> {
+    match request.kind {
+        JobKind::Audit => {
+            if request.repo_id.is_some() || request.revision.is_some() {
+                return Err("invalid_request");
+            }
+        }
+        JobKind::Prefetch | JobKind::Refresh | JobKind::Verify => {
+            let repo_id = request.repo_id.as_deref().ok_or("invalid_request")?;
+            let revision = request.revision.as_deref().ok_or("invalid_request")?;
+            if validate_repository_id(repo_id).is_err() || validate_revision_ref(revision).is_err()
+            {
+                return Err("invalid_request");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn hash_idempotency_key(value: &str) -> Result<String, &'static str> {
+    if value.is_empty() || value.len() > 128 || value.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err("invalid_idempotency_key");
+    }
+    Ok(Sha256::digest(value.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn classify_pullthrough_error(
+    error: crate::pullthrough::PullThroughError,
+) -> (&'static str, String) {
+    use crate::pullthrough::PullThroughError;
+    let class = match error {
+        PullThroughError::UpstreamUnavailable | PullThroughError::UpstreamFailed => "upstream",
+        PullThroughError::UpstreamNotFound => "not_found",
+        PullThroughError::UpstreamUnauthorized => "authorization",
+        PullThroughError::Integrity | PullThroughError::UpstreamInvalidOutput => "integrity",
+        PullThroughError::Storage => "storage",
+        PullThroughError::UnsafePath => "unsafe_path",
+        PullThroughError::Conflict => "conflict",
+    };
+    (class, error.to_string())
+}
+
+fn classify_archive_error(error: ArchiveError) -> (&'static str, String) {
+    let class = match &error {
+        ArchiveError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => "not_found",
+        ArchiveError::Io(_) => "storage",
+        ArchiveError::InvalidPath(_) => "unsafe_path",
+        ArchiveError::IntegrityMismatch(_) => "integrity",
+        ArchiveError::AlreadyPublished(_) => "conflict",
+        ArchiveError::ReferencedRevision(_) => "referenced",
+    };
+    (class, error.to_string())
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 fn constant_time_eq(expected: &[u8], provided: &[u8]) -> bool {
     let mut difference = expected.len() ^ provided.len();
     let length = expected.len().max(provided.len());
@@ -263,8 +827,24 @@ fn archive_error(error: ArchiveError) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::upstream::{FetchRequest, FetchedRevision, UpstreamError, UpstreamFetcher};
     use axum::{body::to_bytes, body::Body, http::Request};
     use tower::ServiceExt;
+
+    struct FixtureFetcher;
+
+    impl UpstreamFetcher for FixtureFetcher {
+        fn fetch(&self, request: &FetchRequest) -> Result<FetchedRevision, UpstreamError> {
+            std::fs::create_dir_all(&request.staging).map_err(UpstreamError::Io)?;
+            std::fs::write(request.staging.join("config.json"), b"model")
+                .map_err(UpstreamError::Io)?;
+            Ok(FetchedRevision {
+                commit: "c".repeat(40),
+                files: vec!["config.json".into()],
+                staging: request.staging.clone(),
+            })
+        }
+    }
 
     fn request(path: &str, token: Option<&str>) -> Request<Body> {
         let mut request = Request::builder().uri(path);
@@ -274,6 +854,33 @@ mod tests {
         request.body(Body::empty()).unwrap()
     }
 
+    fn job_request(csrf: bool, idempotency_key: &str) -> Request<Body> {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/api/admin/v1/jobs")
+            .header(header::AUTHORIZATION, "Bearer secret")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("idempotency-key", idempotency_key);
+        if csrf {
+            request = request.header("x-modelkeep-csrf", "1");
+        }
+        request.body(Body::from(r#"{"kind":"audit"}"#)).unwrap()
+    }
+
+    fn prefetch_request() -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/api/admin/v1/jobs")
+            .header(header::AUTHORIZATION, "Bearer secret")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-modelkeep-csrf", "1")
+            .header("idempotency-key", "prefetch-model")
+            .body(Body::from(
+                r#"{"kind":"prefetch","repo_id":"org/model","revision":"main"}"#,
+            ))
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn management_inventory_requires_authorization_and_paginates() {
         let directory = tempfile::tempdir().unwrap();
@@ -281,8 +888,9 @@ mod tests {
         let app = router(
             archive,
             Config::token("127.0.0.1:0".parse().unwrap(), "secret"),
-            false,
-        );
+            None,
+        )
+        .unwrap();
 
         let denied = app
             .clone()
@@ -306,6 +914,116 @@ mod tests {
         let body = to_bytes(allowed.into_body(), usize::MAX).await.unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["items"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn job_submission_requires_csrf_and_is_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        let app = router(
+            archive,
+            Config::token("127.0.0.1:0".parse().unwrap(), "secret"),
+            None,
+        )
+        .unwrap();
+
+        let denied = app
+            .clone()
+            .oneshot(job_request(false, "audit-once"))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        let first = app
+            .clone()
+            .oneshot(job_request(true, "audit-once"))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let first: serde_json::Value =
+            serde_json::from_slice(&to_bytes(first.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+
+        let repeated = app.oneshot(job_request(true, "audit-once")).await.unwrap();
+        assert_eq!(repeated.status(), StatusCode::OK);
+        let repeated: serde_json::Value =
+            serde_json::from_slice(&to_bytes(repeated.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(first["id"], repeated["id"]);
+        assert!(first.get("idempotency_hash").is_none());
+        assert!(first["progress_bytes"].is_null());
+        assert!(first["total_bytes"].is_null());
+    }
+
+    #[tokio::test]
+    async fn prefetch_job_publishes_complete_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        let pullthrough = Arc::new(PullThrough::new(archive.clone(), Arc::new(FixtureFetcher)));
+        let app = router(
+            archive.clone(),
+            Config::token("127.0.0.1:0".parse().unwrap(), "secret"),
+            Some(pullthrough),
+        )
+        .unwrap();
+        let response = app.clone().oneshot(prefetch_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let submitted: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let id = submitted["id"].as_str().unwrap();
+
+        let mut completed = None;
+        for _ in 0..100 {
+            let response = app
+                .clone()
+                .oneshot(request(&format!("/api/admin/v1/jobs/{id}"), Some("secret")))
+                .await
+                .unwrap();
+            let value: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            if value["state"] == "completed" {
+                completed = Some(value);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let completed = completed.expect("prefetch job did not complete");
+        assert_eq!(completed["resolved_commit"], "c".repeat(40));
+        assert!(archive
+            .is_complete_revision("org/model", &"c".repeat(40))
+            .unwrap());
+    }
+
+    #[test]
+    fn active_jobs_become_interrupted_failures_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        let manager = JobManager::open(&archive).unwrap();
+        let job = Job {
+            id: "restart-test".into(),
+            kind: JobKind::Audit,
+            state: JobState::Running,
+            phase: "auditing_archive".into(),
+            repo_id: None,
+            revision: None,
+            resolved_commit: None,
+            progress_bytes: None,
+            total_bytes: None,
+            error_class: None,
+            message: None,
+            idempotency_hash: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        manager.persist(&job).unwrap();
+        drop(manager);
+
+        let reopened = JobManager::open(&archive).unwrap();
+        let interrupted = reopened.get("restart-test").unwrap();
+        assert_eq!(interrupted.state, JobState::Failed);
+        assert_eq!(interrupted.error_class.as_deref(), Some("interrupted"));
     }
 
     #[test]

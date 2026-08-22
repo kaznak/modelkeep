@@ -171,7 +171,7 @@ pub struct RepositoryInventory {
 
 #[derive(Debug, Clone)]
 pub struct Archive {
-    root: PathBuf,
+    pub(crate) root: PathBuf,
 }
 
 impl Archive {
@@ -964,6 +964,14 @@ fn validate_repo_id(repo_id: &str) -> ArchiveResult<(&str, &str)> {
     validate_component(namespace)?;
     validate_component(name)?;
     Ok((namespace, name))
+}
+
+pub(crate) fn validate_repository_id(repo_id: &str) -> ArchiveResult<()> {
+    validate_repo_id(repo_id).map(|_| ())
+}
+
+pub(crate) fn validate_revision_ref(revision: &str) -> ArchiveResult<()> {
+    validate_component(revision)
 }
 
 fn validate_revision(revision: &str) -> ArchiveResult<()> {
