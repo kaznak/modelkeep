@@ -447,6 +447,10 @@ pub fn router(
     };
     let pullthrough_enabled = state.pullthrough.is_some();
     Ok(Router::new()
+        .route("/", get(crate::admin_ui::root))
+        .route("/admin/", get(crate::admin_ui::index))
+        .route("/admin/app.js", get(crate::admin_ui::script))
+        .route("/admin/style.css", get(crate::admin_ui::style))
         .route(
             "/api/admin/v1/status",
             get(move |State(state), headers| status(state, headers, pullthrough_enabled)),

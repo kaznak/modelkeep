@@ -31,40 +31,88 @@ For example, if that prints `/share/CACHEDEV1_DATA/.qpkg/Tailscale`, use
 
 ## Start ModelKeep and Serve
 
-The Compose mapping is deliberately `127.0.0.1:8090:8090`. Start ModelKeep and check
-the local backend before configuring ingress:
+The Compose mappings are deliberately bound to loopback. Port 8090 is the download
+endpoint and port 8091 is the authenticated management API/UI. Start ModelKeep and
+check both local backends before configuring ingress:
 
 ```sh
 docker compose up -d
 curl --fail http://127.0.0.1:8090/healthz
+curl --fail http://127.0.0.1:8091/admin/
 ```
 
-Configure persistent tailnet-only HTTPS proxying on the QNAP host:
+Tailscale Services require Tailscale 1.92 or newer. Configure two persistent,
+tailnet-only HTTPS services on the QNAP host so routine model downloads and privileged
+administration have different hostnames and grants:
 
 ```sh
-tailscale serve --bg http://127.0.0.1:8090
+tailscale serve --service=svc:modelkeep --bg http://127.0.0.1:8090
+tailscale serve --service=svc:modelkeep-admin --accept-app-caps=io.modelkeep/cap/admin --bg http://127.0.0.1:8091
 tailscale serve status
 ```
 
-Serve reports the assigned URL, for example:
+Serve reports assigned URLs resembling:
 
 ```text
-https://qnap-name.example-tailnet.ts.net
+https://modelkeep.example-tailnet.ts.net
+https://modelkeep-admin.example-tailnet.ts.net
 ```
 
 Verify it from an allowed tailnet client and then use it as the Hugging Face endpoint:
 
 ```sh
-curl --fail https://qnap-name.example-tailnet.ts.net/healthz
-export HF_ENDPOINT=https://qnap-name.example-tailnet.ts.net
+curl --fail https://modelkeep.example-tailnet.ts.net/healthz
+export HF_ENDPOINT=https://modelkeep.example-tailnet.ts.net
 hf download Qwen/example-model
 ```
 
-Use Tailscale grants to restrict which users or devices may reach the QNAP HTTPS
-service; do not rely on a broad allow-all tailnet policy. Clients do not need a
+Open `https://modelkeep-admin.example-tailnet.ts.net/admin/` for archive inventory,
+prefetch, refresh, verification, audit, and job status. The actual hostnames shown by
+`tailscale serve status` are authoritative.
+
+Grant ordinary clients access only to `svc:modelkeep`. Grant administrators access to
+`svc:modelkeep-admin` and attach the `io.modelkeep/cap/admin` application capability.
+The management Serve command forwards that authorized capability in the
+`Tailscale-App-Capabilities` header. ModelKeep trusts this header only on its separate
+loopback-published management listener; direct LAN publication of port 8091 would
+break that trust boundary.
+
+For example, after defining `group:modelkeep-admins`, the relevant grants are:
+
+```json
+{
+  "grants": [
+    {
+      "src": ["autogroup:member"],
+      "dst": ["svc:modelkeep"],
+      "ip": ["tcp:443"]
+    },
+    {
+      "src": ["group:modelkeep-admins"],
+      "dst": ["svc:modelkeep-admin"],
+      "ip": ["tcp:443"],
+      "app": {
+        "io.modelkeep/cap/admin": [{}]
+      }
+    }
+  ]
+}
+```
+
+Merge these with the tailnet's existing policy rather than replacing unrelated
+grants. Use the policy editor's validation before saving.
+
+If the installed QNAP Tailscale version does not yet support Services and application
+capabilities, upgrade it. As a temporary fallback, set a strong
+`MODELKEEP_ADMIN_TOKEN`, disable `MODELKEEP_TRUST_TAILSCALE_HEADERS`, proxy port 8091
+with ordinary tailnet-only Serve, and enter the token in the UI. The browser stores it
+only in the current tab's session storage.
+
+Use Tailscale grants to restrict which users or devices may reach each HTTPS service;
+do not rely on a broad allow-all tailnet policy. Download clients do not need a
 separate ModelKeep password because their node identity and connection authorization
 are enforced by Tailscale before Serve forwards the request. Never run `tailscale
-funnel` for ModelKeep.
+funnel` for either ModelKeep service.
 
 This does not replace Hugging Face upstream authentication. `HF_TOKEN`, when required
 for a private or gated upstream repository, remains only in the ModelKeep deployment
@@ -78,6 +126,7 @@ be reachable:
 
 ```sh
 curl --connect-timeout 3 http://QNAP_LAN_ADDRESS:8090/healthz
+curl --connect-timeout 3 http://QNAP_LAN_ADDRESS:8091/admin/
 ```
 
 That command is expected to fail. If it succeeds, stop deployment and inspect the
@@ -88,12 +137,14 @@ check both layers separately:
 
 ```sh
 curl --fail http://127.0.0.1:8090/healthz
+curl --fail http://127.0.0.1:8091/admin/
 tailscale serve status
-curl --fail https://qnap-name.example-tailnet.ts.net/readyz
+curl --fail https://modelkeep.example-tailnet.ts.net/readyz
 ```
 
 To remove the HTTPS ingress without stopping ModelKeep, run:
 
 ```sh
-tailscale serve off
+tailscale serve --service=svc:modelkeep off
+tailscale serve --service=svc:modelkeep-admin off
 ```

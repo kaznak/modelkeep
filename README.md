@@ -61,7 +61,8 @@ docker compose up -d
 curl --fail http://127.0.0.1:8090/healthz
 
 # Run this with the official Tailscale QPKG CLI installed on the QNAP host.
-tailscale serve --bg http://127.0.0.1:8090
+tailscale serve --service=svc:modelkeep --bg http://127.0.0.1:8090
+tailscale serve --service=svc:modelkeep-admin --accept-app-caps=io.modelkeep/cap/admin --bg http://127.0.0.1:8091
 tailscale serve status
 ```
 
@@ -75,7 +76,9 @@ new directory needs no SSH permission setup. The application container runs as
 UID/GID `10001:10001`, uses a read-only root filesystem,
 drops Linux capabilities, writes durable state only under `/data`, and publishes its
 HTTP port only on QNAP host loopback. Configure the host's official Tailscale app to
-provide the tailnet-only HTTPS endpoint; do not expose port 8090 directly on the LAN.
+provide separate tailnet-only HTTPS endpoints for downloads and administration; do
+not expose ports 8090 or 8091 directly on the LAN. The management UI is served at
+`/admin/` on the `svc:modelkeep-admin` hostname.
 See [`docs/deployment/qnap-permissions.md`](docs/deployment/qnap-permissions.md) for the host-side UID/GID and permission preflight.
 See [`docs/deployment/qnap-tailscale-serve.md`](docs/deployment/qnap-tailscale-serve.md)
 for Tailscale Serve setup and boundary checks.

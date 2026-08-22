@@ -1,6 +1,7 @@
 # Ready to use on QNAP after changing the archive share below when necessary.
 # Tailscale runs on the QNAP host, not in this container. After startup, run:
-#   tailscale serve --bg http://127.0.0.1:8090
+#   tailscale serve --service=svc:modelkeep --bg http://127.0.0.1:8090
+#   tailscale serve --service=svc:modelkeep-admin --accept-app-caps=io.modelkeep/cap/admin --bg http://127.0.0.1:8091
 #   tailscale serve status
 services:
   modelkeep-init:
