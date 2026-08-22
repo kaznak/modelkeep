@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use modelkeep::{http, pullthrough::PullThrough, upstream::OfficialHfFetcher, Archive};
+use modelkeep::{admin, http, pullthrough::PullThrough, upstream::OfficialHfFetcher, Archive};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -313,16 +313,30 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 _ => None,
             };
+            let admin_config = admin::Config::from_env()?;
             tracing::info!(
                 event = "startup_configuration",
                 pullthrough_enabled = upstream.is_some(),
+                management_enabled = admin_config.is_some(),
                 "startup configuration loaded"
             );
-            match upstream {
-                Some(pullthrough) => {
+            match (upstream, admin_config) {
+                (Some(pullthrough), Some(config)) => {
+                    tokio::try_join!(
+                        http::serve_with_pullthrough(archive.clone(), pullthrough.clone(), bind),
+                        admin::serve(archive, Some(pullthrough), config)
+                    )?;
+                }
+                (None, Some(config)) => {
+                    tokio::try_join!(
+                        http::serve(archive.clone(), bind),
+                        admin::serve(archive, None, config)
+                    )?;
+                }
+                (Some(pullthrough), None) => {
                     http::serve_with_pullthrough(archive, pullthrough, bind).await?
                 }
-                None => http::serve(archive, bind).await?,
+                (None, None) => http::serve(archive, bind).await?,
             }
             Ok(())
         }

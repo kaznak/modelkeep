@@ -159,6 +159,9 @@
           } ''
             port_mapping="$(yq -r '.services.modelkeep.ports[0]' ${./compose.yaml})"
             test "$port_mapping" = "127.0.0.1:8090:8090"
+            test "$(yq -r '.services.modelkeep.ports[1]' ${./compose.yaml})" = "127.0.0.1:8091:8091"
+            test "$(yq -r '.services.modelkeep.environment.MODELKEEP_ADMIN_ADDRESS' ${./compose.yaml})" = "0.0.0.0:8091"
+            test "$(yq -r '.services.modelkeep.environment.MODELKEEP_TRUST_TAILSCALE_HEADERS' ${./compose.yaml})" = "true"
             image="$(yq -r '.services.modelkeep.image' ${./compose.yaml})"
             init_image="$(yq -r '.services."modelkeep-init".image' ${./compose.yaml})"
             test "$image" = "ghcr.io/kaznak/modelkeep:v0.2.1"

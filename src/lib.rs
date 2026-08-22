@@ -4,7 +4,7 @@
 //! A revision becomes visible only after all files and its manifest have been
 //! written and synchronized to disk.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -14,9 +14,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub mod admin;
 pub mod http;
 pub mod importer;
 pub mod pullthrough;
@@ -143,6 +144,29 @@ pub struct AuditFailure {
 pub struct AuditReport {
     pub checked: usize,
     pub failures: Vec<AuditFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RepositorySummary {
+    pub repo_id: String,
+    pub revision_count: usize,
+    pub ref_count: usize,
+    pub logical_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RevisionSummary {
+    pub commit: String,
+    pub file_count: usize,
+    pub logical_bytes: u64,
+    pub references: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RepositoryInventory {
+    pub repo_id: String,
+    pub refs: BTreeMap<String, String>,
+    pub revisions: Vec<RevisionSummary>,
 }
 
 #[derive(Debug, Clone)]
@@ -291,6 +315,91 @@ impl Archive {
         }
         commits.sort();
         Ok(commits)
+    }
+
+    pub fn list_repositories(&self) -> ArchiveResult<Vec<RepositorySummary>> {
+        let mut repositories = Vec::new();
+        for namespace in fs::read_dir(self.root.join("models"))? {
+            let namespace = namespace?;
+            if !namespace.file_type()?.is_dir() {
+                continue;
+            }
+            let namespace_name = namespace.file_name().to_string_lossy().into_owned();
+            validate_component(&namespace_name)?;
+            for repository in fs::read_dir(namespace.path())? {
+                let repository = repository?;
+                if !repository.file_type()?.is_dir() {
+                    continue;
+                }
+                let repository_name = repository.file_name().to_string_lossy().into_owned();
+                validate_component(&repository_name)?;
+                let repo_id = format!("{namespace_name}/{repository_name}");
+                let inventory = self.repository_inventory(&repo_id)?;
+                repositories.push(RepositorySummary {
+                    repo_id,
+                    revision_count: inventory.revisions.len(),
+                    ref_count: inventory.refs.len(),
+                    logical_bytes: inventory
+                        .revisions
+                        .iter()
+                        .map(|revision| revision.logical_bytes)
+                        .sum(),
+                });
+            }
+        }
+        repositories.sort_by(|left, right| left.repo_id.cmp(&right.repo_id));
+        Ok(repositories)
+    }
+
+    pub fn repository_inventory(&self, repo_id: &str) -> ArchiveResult<RepositoryInventory> {
+        let (namespace, name) = validate_repo_id(repo_id)?;
+        let repository = self.root.join("models").join(namespace).join(name);
+        if !repository.is_dir() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "repository not found").into());
+        }
+        let mut refs = BTreeMap::new();
+        let refs_path = repository.join("refs");
+        if refs_path.is_dir() {
+            for entry in fs::read_dir(refs_path)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
+                let reference = entry.file_name().to_string_lossy().into_owned();
+                validate_component(&reference)?;
+                let commit = fs::read_to_string(entry.path())?.trim().to_string();
+                validate_revision(&commit)?;
+                refs.insert(reference, commit);
+            }
+        }
+        let mut revisions = Vec::new();
+        for commit in self.list_revisions(repo_id)? {
+            validate_revision(&commit)?;
+            let manifest: Manifest = serde_json::from_str(&self.manifest(repo_id, &commit)?)
+                .map_err(|error| ArchiveError::IntegrityMismatch(error.to_string()))?;
+            if !manifest.complete {
+                return Err(ArchiveError::IntegrityMismatch(format!(
+                    "revision {commit} is not complete"
+                )));
+            }
+            revisions.push(RevisionSummary {
+                references: refs
+                    .iter()
+                    .filter_map(|(reference, target)| {
+                        (target == &commit).then_some(reference.clone())
+                    })
+                    .collect(),
+                commit,
+                file_count: manifest.files.len(),
+                logical_bytes: manifest.files.iter().map(|file| file.size).sum(),
+            });
+        }
+        revisions.sort_by(|left, right| left.commit.cmp(&right.commit));
+        Ok(RepositoryInventory {
+            repo_id: repo_id.to_string(),
+            refs,
+            revisions,
+        })
     }
 
     pub fn remove_revision(
@@ -1083,6 +1192,30 @@ mod tests {
             .manifest("org/model", "aaaaaaaa")
             .unwrap()
             .contains("repo_id"));
+    }
+
+    #[test]
+    fn inventory_is_reconstructed_from_manifests_and_refs() {
+        let (archive, _directory) = archive();
+        let first = "a".repeat(40);
+        let second = "b".repeat(40);
+        archive.publish_revision(request(&first, b"one")).unwrap();
+        archive
+            .publish_revision(request(&second, b"second"))
+            .unwrap();
+        archive.update_ref("org/model", "main", &second).unwrap();
+
+        let repositories = archive.list_repositories().unwrap();
+        assert_eq!(repositories.len(), 1);
+        assert_eq!(repositories[0].repo_id, "org/model");
+        assert_eq!(repositories[0].revision_count, 2);
+        assert_eq!(repositories[0].ref_count, 1);
+        assert_eq!(repositories[0].logical_bytes, 9);
+
+        let inventory = archive.repository_inventory("org/model").unwrap();
+        assert_eq!(inventory.refs["main"], second);
+        assert!(inventory.revisions[0].references.is_empty());
+        assert_eq!(inventory.revisions[1].references, vec!["main"]);
     }
 
     #[test]

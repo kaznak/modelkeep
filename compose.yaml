@@ -34,6 +34,8 @@ services:
       # Tailscale Serve runs on the QNAP host and is the only supported ingress.
       # Do not change this to 8090:8090: that would also expose ModelKeep on the LAN.
       - "127.0.0.1:8090:8090"
+      # Management API/UI ingress is a separate Tailscale Service and grant.
+      - "127.0.0.1:8091:8091"
     volumes:
       # Change the host path to the QNAP share reserved for ModelKeep.
       - /share/Services/modelkeep:/data
@@ -51,6 +53,8 @@ services:
       - no-new-privileges:true
     environment:
       RUST_LOG: info
+      MODELKEEP_ADMIN_ADDRESS: "0.0.0.0:8091"
+      MODELKEEP_TRUST_TAILSCALE_HEADERS: "true"
       HF_HOME: /tmp/huggingface
       # For private or gated upstream repositories, replace the empty value with a
       # token supplied through QNAP's protected deployment configuration.

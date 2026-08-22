@@ -61,7 +61,7 @@ async fn serve_router(router: Router, address: std::net::SocketAddr) -> std::io:
     Ok(())
 }
 
-async fn shutdown_signal() {
+pub(crate) async fn shutdown_signal() {
     #[cfg(unix)]
     {
         let mut terminate = signal::unix::signal(signal::unix::SignalKind::terminate())
