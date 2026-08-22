@@ -29,8 +29,11 @@ does not certify unrecorded QNAP firmware, ACL, snapshot, or filesystem behavior
    a QNAP Container Station Application.
 3. Run `docker compose config`; confirm both services mount only
    `/share/Services/modelkeep` at `/data`.
-4. Run `docker compose up -d`; confirm `modelkeep-init` exits successfully and
-   `modelkeep` becomes healthy.
+4. Run `docker compose up -d`; confirm the `modelkeep-init` container stops with exit
+   code zero and the `modelkeep` container becomes healthy. A stopped initializer is
+   the expected steady state, not a service failure. Container Station may summarize
+   the Compose Application as "Other" because it includes this completed service;
+   use the two per-container states to distinguish success from failure.
 5. Configure Tailscale Serve as described in
    [qnap-tailscale-serve.md](qnap-tailscale-serve.md). Confirm loopback HTTP and
    tailnet HTTPS work, and direct LAN port 8090 does not.
@@ -47,6 +50,17 @@ recreate the service. Successful `/healthz` and `/readyz` requests then appear a
 debug events. Restore `RUST_LOG=info` afterward to avoid a log entry for every
 healthcheck. A failed readiness check remains visible as a warning at the default
 level. Invalid `RUST_LOG` syntax is reported and falls back to `info`.
+
+The Compose file fixes the container names to `modelkeep` and `modelkeep-init` so
+they remain concise in Container Station. Those names permit one supported
+ModelKeep deployment per Docker host. To run a second independent deployment, first
+choose distinct `container_name` values, ports, and archive shares.
+
+When startup is ambiguous in the GUI, inspect the initializer's state and logs. Exit
+code `0` plus an `ownership_initialization_completed` event means initialization
+succeeded. A non-zero exit code or `ownership_initialization_failed` event indicates
+a mount or ACL problem. Do not keep the initializer running: it intentionally exits
+so the root identity and `CHOWN` capability are absent from the long-running service.
 
 ## Backup and restore drill
 

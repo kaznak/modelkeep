@@ -163,6 +163,8 @@
             init_image="$(yq -r '.services."modelkeep-init".image' ${./compose.yaml})"
             test "$image" = "ghcr.io/kaznak/modelkeep:v0.2.1"
             test "$init_image" = "$image"
+            test "$(yq -r '.services."modelkeep-init".container_name' ${./compose.yaml})" = "modelkeep-init"
+            test "$(yq -r '.services.modelkeep.container_name' ${./compose.yaml})" = "modelkeep"
             test "$(yq -r '.services."modelkeep-init".user' ${./compose.yaml})" = "0:0"
             test "$(yq -r '.services."modelkeep-init".entrypoint | join(" ")' ${./compose.yaml})" = "/bin/modelkeep init-ownership /data"
             test "$(yq -r '.services."modelkeep-init".cap_add[0]' ${./compose.yaml})" = "CHOWN"

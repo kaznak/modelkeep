@@ -7,8 +7,11 @@ The Compose deployment runs ModelKeep as UID/GID `10001:10001` and mounts the du
 Paste `compose.yaml` into a QNAP Container Station Application and start it. The
 short-lived `modelkeep-init` service changes ownership of the mounted
 `/share/Services/modelkeep` directory itself to `10001:10001`, then exits. Container
-Station starts the non-root ModelKeep service only after that succeeds. No SSH setup
-is required for a new empty directory.
+Station starts the non-root ModelKeep service only after that succeeds. The expected
+steady state is the `modelkeep-init` container stopped with exit code zero and the
+`modelkeep` container running and healthy. Container Station may label the overall
+Application "Other" because the initializer has completed. No SSH setup is required
+for a new empty directory.
 
 The ownership change is deliberately non-recursive. If an existing archive already
 contains children with incompatible ownership, the init service fails to conceal
@@ -34,6 +37,7 @@ equivalent checks are:
 
 ```sh
 docker compose ps -a
+docker inspect modelkeep-init --format '{{.State.Status}} {{.State.ExitCode}}'
 curl --fail http://127.0.0.1:8090/readyz
 ```
 
@@ -50,3 +54,7 @@ volumes:
 
 Only the completed init service uses `user: "0:0"` and `cap_add: [CHOWN]`; it has no
 ports and does not remain running.
+
+The fixed container names `modelkeep` and `modelkeep-init` are intended for one
+deployment per QNAP host. Rename them together with the port and archive share before
+creating any second independent deployment.

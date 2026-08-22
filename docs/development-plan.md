@@ -528,6 +528,7 @@ Compose の基本方針:
 ```yaml
 services:
   modelkeep-init:
+    container_name: modelkeep-init
     image: ghcr.io/kaznak/modelkeep:<version>
     user: "0:0"
     entrypoint: ["/bin/modelkeep", "init-ownership", "/data"]
@@ -537,6 +538,7 @@ services:
     cap_add: [CHOWN]
 
   modelkeep:
+    container_name: modelkeep
     image: ghcr.io/kaznak/modelkeep:<version>
     restart: unless-stopped
     read_only: true

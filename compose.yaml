@@ -4,6 +4,7 @@
 #   tailscale serve status
 services:
   modelkeep-init:
+    container_name: modelkeep-init
     image: ghcr.io/kaznak/modelkeep:v0.2.1
     restart: "no"
     read_only: true
@@ -19,6 +20,7 @@ services:
       - no-new-privileges:true
 
   modelkeep:
+    container_name: modelkeep
     # Keep this literal for QNAP Container Station, which does not expand Compose
     # default-value expressions consistently when creating an Application.
     image: ghcr.io/kaznak/modelkeep:v0.2.1
