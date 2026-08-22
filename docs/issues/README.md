@@ -44,7 +44,6 @@ Priority meanings:
 - [0025 — Validate large Hugging Face cache migration](0025-validate-large-hf-cache-migration.md) (P1)
 - [0026 — Complete QNAP and GX10 acceptance testing](0026-complete-qnap-gx10-acceptance-testing.md) (P1)
 - [0027 — Complete structured operational events](0027-complete-structured-operational-events.md) (P2)
-- [0044 — Improve QNAP container identification](0044-improve-qnap-container-identification.md) (P2)
 - [0021 — Add tailnet identity-aware authorization](0021-add-tailnet-identity-aware-authorization.md) (P3)
 - [0004 — Add storage observability](0004-add-storage-observability.md) (P3)
 - [0028 — Define private and gated repository credential policy](0028-define-private-gated-credential-policy.md) (P3)
