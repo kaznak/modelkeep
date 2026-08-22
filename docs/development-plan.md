@@ -878,7 +878,7 @@ MVP 後の候補:
 - tailnet identity-aware authorization — [Issue 0021](issues/0021-add-tailnet-identity-aware-authorization.md)
 - ~~management control-plane contract — [Issue 0030](https://github.com/kaznak/modelkeep/commit/2e637bc)~~
 - ~~read-only management API — [Issue 0045](https://github.com/kaznak/modelkeep/commit/e4a7c88)~~
-- asynchronous prefetch/refresh/verify/audit jobs — [Issue 0046](issues/0046-add-asynchronous-archive-jobs.md)
+- ~~asynchronous prefetch/refresh/verify/audit jobs — [completed in 9beba30](https://github.com/kaznak/modelkeep/commit/9beba30)~~
 - management Web UI — [Issue 0047](issues/0047-add-management-web-ui.md)
 - remote explicit revision deletion — [Issue 0048](issues/0048-add-remote-revision-deletion-workflow.md)
 - repository pin/unpin policy — [Issue 0031](issues/0031-define-repository-pinning-policy.md)

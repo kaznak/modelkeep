@@ -43,7 +43,6 @@ Priority meanings:
 - [0024 — Add black-box crash and upgrade tests](0024-add-black-box-crash-and-upgrade-tests.md) (P1)
 - [0025 — Validate large Hugging Face cache migration](0025-validate-large-hf-cache-migration.md) (P1)
 - [0026 — Complete QNAP and GX10 acceptance testing](0026-complete-qnap-gx10-acceptance-testing.md) (P1)
-- [0046 — Add asynchronous archive jobs](0046-add-asynchronous-archive-jobs.md) (P1)
 - [0047 — Add the management web UI](0047-add-management-web-ui.md) (P1)
 - [0027 — Complete structured operational events](0027-complete-structured-operational-events.md) (P2)
 - [0048 — Add the remote revision deletion workflow](0048-add-remote-revision-deletion-workflow.md) (P2)

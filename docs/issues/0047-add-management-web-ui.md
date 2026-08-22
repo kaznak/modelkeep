@@ -27,7 +27,7 @@ QNAP-specific behavior.
 
 ## Scope
 
-- Build a replaceable UI on the versioned APIs from Issues 0045 and 0046.
+- Build a replaceable UI on the completed versioned inventory and job APIs.
 - Show service/readiness state, repositories, revisions, refs, capacity, jobs, and
   credential-safe failure details.
 - Allow prefetch, refresh, verify, and audit submission and job monitoring.
@@ -65,6 +65,6 @@ runtime dependency.
 
 ## Risks and assumptions
 
-Issues 0030, 0045, and 0046 must complete first. The UI is not durable state and must
-not introduce a second archive metadata authority. QNAP is the initial production
-target, not part of the UI architecture.
+The prerequisite control-plane API and asynchronous job implementation are complete.
+The UI is not durable state and must not introduce a second archive metadata
+authority. QNAP is the initial production target, not part of the UI architecture.
