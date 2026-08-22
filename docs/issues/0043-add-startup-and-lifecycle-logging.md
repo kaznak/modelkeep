@@ -41,6 +41,10 @@ diagnose startup from the QNAP GUI.
   supported termination signal.
 - Keep routine health checks from flooding the default log while retaining enough
   information to diagnose health-check failures.
+- Preserve `RUST_LOG` as the operator-facing log filter and document practical
+  `info` and `debug` settings for Container Station.
+- Emit successful `/healthz` and `/readyz` probe events at `debug`, while keeping
+  failed readiness checks at an operator-visible warning level.
 - Document the expected startup event sequence in the QNAP deployment runbook.
 
 ## Acceptance criteria
@@ -55,6 +59,11 @@ diagnose startup from the QNAP GUI.
 - Startup and failure logs do not contain `HF_TOKEN`, authorization headers, signed
   URLs, or other credentials.
 - Default logs do not emit one request event for every successful `/healthz` probe.
+- With `RUST_LOG=debug`, successful `/healthz` and `/readyz` requests are visible and
+  distinguishable; with the default `RUST_LOG=info`, they remain quiet.
+- Changing `RUST_LOG` to a valid supported filter changes verbosity without rebuilding
+  the image, and an invalid filter fails clearly or falls back according to a
+  documented policy.
 - The event names and stable fields are covered by log-capture tests.
 - The QNAP deployment documentation shows how to find both initialization and
   ModelKeep service logs in Container Station.
