@@ -41,8 +41,9 @@ privileged initializer running or weakening the non-root application boundary.
   initializer stopped with exit code zero.
 - Add GUI-oriented troubleshooting guidance for distinguishing a successfully
   completed initializer from an initialization failure.
-- Keep lifecycle output itself in Issue 0043 and preserve the ownership/security
-  design accepted by ADR-0014.
+- Keep lifecycle output in the completed
+  [Issue 0043 implementation](https://github.com/kaznak/modelkeep/commit/35c6c28)
+  and preserve the ownership/security design accepted by ADR-0014.
 
 ## Acceptance criteria
 
