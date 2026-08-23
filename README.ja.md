@@ -47,8 +47,8 @@ Nix flake から amd64 / arm64 image をビルドし、`v*` tag が push され�
 image を公開します。
 
 ```sh
-git tag v0.2.1
-git push origin v0.2.1
+git tag v0.4.0
+git push origin v0.4.0
 ```
 
 QNAP 側では以下のように起動します。
@@ -59,11 +59,12 @@ docker compose up -d
 curl --fail http://127.0.0.1:8090/healthz
 
 # QNAP ホストにインストールした公式 Tailscale QPKG の CLI で実行します。
-tailscale serve --bg http://127.0.0.1:8090
+tailscale serve --service=svc:modelkeep --bg http://127.0.0.1:8090
+tailscale serve --service=svc:modelkeep-admin --accept-app-caps=io.modelkeep/cap/admin --bg http://127.0.0.1:8091
 tailscale serve status
 ```
 
-`compose.yaml` は公開済みの `ghcr.io/kaznak/modelkeep:v0.2.1` を既定で使用するため、
+`compose.yaml` は公開済みの `ghcr.io/kaznak/modelkeep:v0.4.0` を既定で使用するため、
 image 用の環境変数や GHCR ログインは不要です。QNAP Container Station の Application 作成では
 Compose の環境変数デフォルト値が展開されないため、別 registry や別 release を使う場合は
 `compose.yaml` の `image:` を直接変更してください。
