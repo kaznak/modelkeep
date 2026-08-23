@@ -132,7 +132,9 @@ modelkeep verify /data Qwen/ExampleModel <commit>
 ```
 
 `GET /healthz` は軽量な liveness check です。QNAP 用 Compose 設定では、コンテナの
-healthcheck に `modelkeep health` を使用します。
+healthcheck に `modelkeep ready` を使用し、archive path が利用可能かつ書込み可能かを
+`/readyz` で確認します。管理APIの `ready` は起動時または直近の `/readyz` probe結果を
+返します。管理画面のpolling自体はarchiveへの書込みprobeを実行しません。
 
 ## Durable archive
 

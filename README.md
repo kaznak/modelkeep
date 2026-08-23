@@ -147,6 +147,9 @@ modelkeep verify /data Qwen/ExampleModel <commit>
 ```
 
 The `GET /healthz` endpoint is a lightweight process liveness check. `GET /readyz` verifies that the archive paths are available and writable. The QNAP Compose deployment uses `modelkeep ready` for its container healthcheck.
+The management status field `ready` reports the most recent startup or `/readyz`
+probe result. Reading management status never performs its own archive write probe,
+so normal UI polling does not create continuous QNAP filesystem flushes.
 
 ## Durable archive
 

@@ -512,7 +512,10 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_endpoint_reports_archive_state() {
-        let (app, directory) = test_router();
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        let app = router(archive.clone());
+        assert_eq!(archive.last_readiness(), None);
         let response = app
             .clone()
             .oneshot(
@@ -524,6 +527,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(archive.last_readiness(), Some(true));
         std::fs::remove_dir_all(directory.path().join("tmp")).unwrap();
         let response = app
             .oneshot(
@@ -535,6 +539,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(archive.last_readiness(), Some(false));
+
+        std::fs::create_dir(directory.path().join("tmp")).unwrap();
+        assert!(archive.check_readiness().is_ok());
+        assert_eq!(archive.last_readiness(), Some(true));
     }
 
     #[tokio::test]

@@ -729,7 +729,10 @@ async fn status(state: AdminState, headers: HeaderMap, pullthrough_enabled: bool
     match state.archive.list_repositories() {
         Ok(repositories) => Json(StatusBody {
             version: env!("CARGO_PKG_VERSION"),
-            ready: state.archive.check_readiness().is_ok(),
+            // Startup and `/readyz` perform the active write probe. Management UI
+            // polling only reports its last result so it cannot create continuous
+            // fsync traffic on the archive volume.
+            ready: state.archive.last_readiness().unwrap_or(false),
             pullthrough_enabled,
             repository_count: repositories.len(),
             logical_archive_bytes: repositories
@@ -1045,6 +1048,33 @@ mod tests {
         let body = to_bytes(allowed.into_body(), usize::MAX).await.unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["items"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn management_status_reports_cached_readiness_without_probing_storage() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        archive.check_readiness().unwrap();
+        let app = router(
+            archive,
+            Config::token("127.0.0.1:0".parse().unwrap(), "secret"),
+            None,
+        )
+        .unwrap();
+
+        std::fs::remove_dir_all(directory.path().join("tmp")).unwrap();
+        for _ in 0..3 {
+            let response = app
+                .clone()
+                .oneshot(request("/api/admin/v1/status", Some("secret")))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["ready"], true);
+            assert!(!directory.path().join("tmp").exists());
+        }
     }
 
     #[tokio::test]

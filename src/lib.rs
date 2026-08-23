@@ -11,6 +11,7 @@ use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -173,6 +174,7 @@ pub struct RepositoryInventory {
 #[derive(Debug, Clone)]
 pub struct Archive {
     pub(crate) root: PathBuf,
+    readiness: Arc<Mutex<Option<bool>>>,
 }
 
 impl Archive {
@@ -180,7 +182,10 @@ impl Archive {
         let root = root.into();
         fs::create_dir_all(root.join("models"))?;
         fs::create_dir_all(root.join("tmp"))?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            readiness: Arc::new(Mutex::new(None)),
+        })
     }
 
     /// Opens an existing archive without creating or modifying durable state.
@@ -189,7 +194,10 @@ impl Archive {
         if !root.is_dir() || !root.join("models").is_dir() {
             return Err(io::Error::new(io::ErrorKind::NotFound, "archive root not found").into());
         }
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            readiness: Arc::new(Mutex::new(None)),
+        })
     }
 
     /// Publishes one complete immutable revision.
@@ -466,30 +474,41 @@ impl Archive {
     }
 
     pub fn check_readiness(&self) -> ArchiveResult<()> {
-        for directory in [self.root.join("models"), self.root.join("tmp")] {
-            if !directory.is_dir() {
-                return Err(ArchiveError::Io(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "required archive directory is unavailable: {}",
-                        directory.display()
-                    ),
-                )));
+        let result = (|| {
+            for directory in [self.root.join("models"), self.root.join("tmp")] {
+                if !directory.is_dir() {
+                    return Err(ArchiveError::Io(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "required archive directory is unavailable: {}",
+                            directory.display()
+                        ),
+                    )));
+                }
             }
+            let probe = self
+                .root
+                .join("tmp")
+                .join(format!("readiness-{}", operation_id()));
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&probe)?;
+            file.write_all(b"modelkeep-readiness")?;
+            file.sync_all()?;
+            fs::remove_file(&probe)?;
+            sync_directory(&self.root.join("tmp"))?;
+            Ok(())
+        })();
+        if let Ok(mut readiness) = self.readiness.lock() {
+            *readiness = Some(result.is_ok());
         }
-        let probe = self
-            .root
-            .join("tmp")
-            .join(format!("readiness-{}", operation_id()));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&probe)?;
-        file.write_all(b"modelkeep-readiness")?;
-        file.sync_all()?;
-        fs::remove_file(&probe)?;
-        sync_directory(&self.root.join("tmp"))?;
-        Ok(())
+        result
+    }
+
+    /// Returns the last active readiness-probe result without touching durable state.
+    pub fn last_readiness(&self) -> Option<bool> {
+        self.readiness.lock().ok().and_then(|value| *value)
     }
 
     pub fn create_fetch_staging(&self) -> ArchiveResult<PathBuf> {
