@@ -1,5 +1,22 @@
 {
   "nodes": {
+    "modelkeepV021": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1787295953,
+        "narHash": "sha256-+uQFLZwUSPgAigF21y5WMqrsMXvupjW25rhdd5Km3Q0=",
+        "owner": "kaznak",
+        "repo": "modelkeep",
+        "rev": "1e7c82b5b0d0b5f89d463b18dbb6c4d2398367d4",
+        "type": "github"
+      },
+      "original": {
+        "owner": "kaznak",
+        "repo": "modelkeep",
+        "rev": "1e7c82b5b0d0b5f89d463b18dbb6c4d2398367d4",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1787172299,
@@ -18,6 +35,7 @@
     },
     "root": {
       "inputs": {
+        "modelkeepV021": "modelkeepV021",
         "nixpkgs": "nixpkgs"
       }
     }

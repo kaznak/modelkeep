@@ -2,8 +2,13 @@
   description = "ModelKeep persistent Hugging Face model mirror";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+  # Fixed released writer used only by the cross-version archive compatibility check.
+  inputs.modelkeepV021 = {
+    url = "github:kaznak/modelkeep/1e7c82b5b0d0b5f89d463b18dbb6c4d2398367d4";
+    flake = false;
+  };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, modelkeepV021 }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forAllSystems = function: nixpkgs.lib.genAttrs systems (system:
@@ -84,6 +89,13 @@
         let
           source = nixpkgs.lib.cleanSource ./.;
           python = pythonFor pkgs;
+          oldModelkeep = pkgs.rustPlatform.buildRustPackage {
+            pname = "modelkeep-upgrade-fixture";
+            version = "0.2.1";
+            src = modelkeepV021;
+            cargoLock.lockFile = "${modelkeepV021}/Cargo.lock";
+            doCheck = false;
+          };
         in {
           format = pkgs.runCommand "modelkeep-format" {
             nativeBuildInputs = [ pkgs.cargo pkgs.rustfmt ];
@@ -143,6 +155,20 @@
           } ''
             python3 ${./tests/archive_restore_drill.py} \
               ${self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep}/bin/modelkeep
+            touch $out
+          '';
+
+          archive-crash-upgrade = pkgs.runCommand "modelkeep-archive-crash-upgrade" {
+            nativeBuildInputs = [
+              pkgs.python3
+              oldModelkeep
+              self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep
+            ];
+          } ''
+            python3 ${./tests/archive_crash_upgrade.py} \
+              ${self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep}/bin/modelkeep \
+              ${oldModelkeep}/bin/modelkeep \
+              ${./tests/fixtures/hf_fetch_crash_fixture.py}
             touch $out
           '';
 
