@@ -9,6 +9,7 @@ pub struct PullThrough {
     archive: Archive,
     fetcher: Arc<dyn UpstreamFetcher>,
     flights: Arc<SingleFlight<String, String, PullThroughError>>,
+    refresh_flights: Arc<SingleFlight<(String, String, bool), RefreshResult, PullThroughError>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +57,7 @@ impl PullThrough {
             archive,
             fetcher,
             flights: Arc::new(SingleFlight::new()),
+            refresh_flights: Arc::new(SingleFlight::new()),
         }
     }
 
@@ -110,6 +112,22 @@ impl PullThrough {
         dry_run: bool,
         progress: &(dyn Fn(FetchProgress) + Send + Sync),
     ) -> Result<RefreshResult, PullThroughError> {
+        let key = (repo_id.to_string(), reference.to_string(), dry_run);
+        self.refresh_flights.run(key, || {
+            // Joined callers receive the same final result. Progress belongs to the
+            // leader callback; followers remain in their acquiring phase until the
+            // shared operation completes.
+            self.refresh_once(repo_id, reference, dry_run, progress)
+        })
+    }
+
+    fn refresh_once(
+        &self,
+        repo_id: &str,
+        reference: &str,
+        dry_run: bool,
+        progress: &(dyn Fn(FetchProgress) + Send + Sync),
+    ) -> Result<RefreshResult, PullThroughError> {
         let previous = self.archive.resolve_ref(repo_id, reference).ok();
         let staging = self
             .archive
@@ -147,15 +165,20 @@ impl PullThrough {
                     source: staging.join(path),
                 })
                 .collect();
-            self.archive
+            match self
+                .archive
                 .publish_revision_from_directory(crate::SourcePublishRequest {
                     repo_id: repo_id.into(),
                     requested_revision: reference.into(),
                     commit: fetched.commit.clone(),
                     source_root: staging.clone(),
                     files,
-                })
-                .map_err(PullThroughError::from)?;
+                }) {
+                Ok(_) => {}
+                Err(ArchiveError::AlreadyPublished(_))
+                    if self.revision_is_ready(repo_id, &fetched.commit, &[]) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         let _ = std::fs::remove_dir_all(&staging);
         self.archive
@@ -267,6 +290,7 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Barrier;
+    use std::time::Duration;
 
     struct RefreshFetcher {
         commit: String,
@@ -276,6 +300,44 @@ mod tests {
     struct AliasedFetcher {
         calls: Arc<AtomicUsize>,
         barrier: Arc<Barrier>,
+    }
+
+    struct SlowRefreshFetcher {
+        calls: Arc<AtomicUsize>,
+        commit: String,
+    }
+
+    struct RetryRefreshFetcher {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl UpstreamFetcher for RetryRefreshFetcher {
+        fn fetch(&self, request: &FetchRequest) -> Result<FetchedRevision, UpstreamError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(50));
+            if call == 0 {
+                return Err(UpstreamError::Unavailable);
+            }
+            fs::write(request.staging.join("config.json"), b"retry").unwrap();
+            Ok(FetchedRevision {
+                commit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                files: vec!["config.json".into()],
+                staging: request.staging.clone(),
+            })
+        }
+    }
+
+    impl UpstreamFetcher for SlowRefreshFetcher {
+        fn fetch(&self, request: &FetchRequest) -> Result<FetchedRevision, UpstreamError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(50));
+            fs::write(request.staging.join("config.json"), self.commit.as_bytes()).unwrap();
+            Ok(FetchedRevision {
+                commit: self.commit.clone(),
+                files: vec!["config.json".into()],
+                staging: request.staging.clone(),
+            })
+        }
     }
 
     impl UpstreamFetcher for AliasedFetcher {
@@ -447,6 +509,114 @@ mod tests {
         assert!(archive
             .is_complete_revision("org/model", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
             .unwrap());
+    }
+
+    #[test]
+    fn concurrent_same_ref_refreshes_share_one_acquisition() {
+        let (_root, archive) = published_archive();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let pull = Arc::new(PullThrough::new(
+            archive.clone(),
+            Arc::new(SlowRefreshFetcher {
+                calls: calls.clone(),
+                commit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            }),
+        ));
+        let start = Arc::new(Barrier::new(3));
+        let threads = (0..2)
+            .map(|_| {
+                let pull = pull.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    pull.refresh("org/model", "main", false)
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+
+        for thread in threads {
+            let result = thread.join().unwrap().unwrap();
+            assert_eq!(result.proposed, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+            assert!(result.published);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            archive.resolve_ref("org/model", "main").unwrap(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+    }
+
+    #[test]
+    fn concurrent_different_ref_refreshes_are_independent_and_converge() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let pull = Arc::new(PullThrough::new(
+            archive.clone(),
+            Arc::new(AliasedFetcher {
+                calls: calls.clone(),
+                barrier: Arc::new(Barrier::new(2)),
+            }),
+        ));
+        let threads = ["main", "release"].map(|reference| {
+            let pull = pull.clone();
+            std::thread::spawn(move || pull.refresh("org/model", reference, false))
+        });
+
+        for thread in threads {
+            assert_eq!(
+                thread.join().unwrap().unwrap().proposed,
+                "dddddddddddddddddddddddddddddddddddddddd"
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            archive.list_revisions("org/model").unwrap(),
+            vec!["dddddddddddddddddddddddddddddddddddddddd"]
+        );
+        assert_eq!(
+            archive.resolve_ref("org/model", "main").unwrap(),
+            "dddddddddddddddddddddddddddddddddddddddd"
+        );
+        assert_eq!(
+            archive.resolve_ref("org/model", "release").unwrap(),
+            "dddddddddddddddddddddddddddddddddddddddd"
+        );
+    }
+
+    #[test]
+    fn concurrent_refresh_failure_is_shared_and_later_call_retries() {
+        let (_root, archive) = published_archive();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let pull = Arc::new(PullThrough::new(
+            archive,
+            Arc::new(RetryRefreshFetcher {
+                calls: calls.clone(),
+            }),
+        ));
+        let start = Arc::new(Barrier::new(3));
+        let threads = (0..2)
+            .map(|_| {
+                let pull = pull.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    pull.refresh("org/model", "main", false)
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+
+        for thread in threads {
+            assert_eq!(
+                thread.join().unwrap(),
+                Err(PullThroughError::UpstreamUnavailable)
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(pull.refresh("org/model", "main", false).is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
