@@ -46,6 +46,8 @@ Priority meanings:
 - [0049 — Report progress for long-running management jobs](0049-report-management-job-progress.md) (P1)
 - [0027 — Complete structured operational events](0027-complete-structured-operational-events.md) (P2)
 - [0048 — Add the remote revision deletion workflow](0048-add-remote-revision-deletion-workflow.md) (P2)
+- [0050 — Surface the authenticated tailnet operator identity](0050-surface-tailnet-operator-identity.md) (P2)
+- [0051 — Make the management authentication UI match the active mode](0051-fix-management-authentication-ui.md) (P2)
 - [0021 — Add tailnet identity-aware authorization](0021-add-tailnet-identity-aware-authorization.md) (P3)
 - [0004 — Add storage observability](0004-add-storage-observability.md) (P3)
 - [0028 — Define private and gated repository credential policy](0028-define-private-gated-credential-policy.md) (P3)
