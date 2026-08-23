@@ -38,99 +38,52 @@ getcfg Tailscale Install_Path -f /etc/config/qpkg.conf
 For example, if that prints `/share/CACHEDEV1_DATA/.qpkg/Tailscale`, use
 `/share/CACHEDEV1_DATA/.qpkg/Tailscale/tailscale` in the commands below.
 
-## Start ModelKeep and Serve
+## Working configuration
 
-The Compose mappings are deliberately bound to loopback. Port 8090 is the download
-endpoint and port 8091 is the authenticated management API/UI. Start ModelKeep and
-check both local backends before configuring ingress:
+The verified deployment uses two Tailscale Services hosted by the tagged QNAP node:
 
-```sh
-docker compose up -d
-curl --fail http://127.0.0.1:8090/healthz
-curl --fail http://127.0.0.1:8091/admin/
-```
+| Purpose | Tailscale Service | QNAP backend | Authorization |
+|---|---|---|---|
+| Hugging Face downloads | `svc:modelkeep` | `127.0.0.1:8090` | Service network grant |
+| Management API/UI | `svc:modelkeep-admin` | `127.0.0.1:8091` | Service network grant plus `io.modelkeep/cap/admin` |
 
-After confirming Tailscale 1.92 or newer, configure two persistent, tailnet-only HTTPS
-services on the QNAP host so routine model downloads and privileged administration
-have different hostnames and grants:
+Do not use plain `tailscale serve --bg http://127.0.0.1:8090` on the QNAP. Without
+`--service`, Serve configures the QNAP device hostname itself on HTTPS port 443 and
+can replace or conflict with the route used for the QNAP administration UI. If this
+happens, run `tailscale serve off` to restore access, then configure the two named
+Services below.
 
-Before advertising the Services, assign the QNAP node a tag authorized to host
-Services (the examples below use `tag:service`). Define `svc:modelkeep` and
-`svc:modelkeep-admin` in the Tailscale admin console, and approve the QNAP as a
-Service Proxy when prompted. A Service hostname is not usable until that approval is
-complete.
+## 1. Define and tag the Service host
 
-```sh
-tailscale serve --service=svc:modelkeep --bg http://127.0.0.1:8090
-tailscale serve --service=svc:modelkeep-admin --accept-app-caps=io.modelkeep/cap/admin --bg http://127.0.0.1:8091
-tailscale serve status
-```
+In the Tailscale admin console:
 
-Serve reports assigned URLs resembling:
+1. Create `tag:service` under **Access controls → Tags**, with an appropriate owner
+   such as `autogroup:admin`.
+2. Assign `tag:service` to the QNAP node that runs ModelKeep. Tailscale Service hosts
+   must be tagged nodes; otherwise Serve reports `service hosts must be tagged nodes`.
+3. Under **Services → Advertised**, define `modelkeep` and `modelkeep-admin`, both on
+   HTTPS port 443. Their policy names are `svc:modelkeep` and
+   `svc:modelkeep-admin`.
 
-```text
-https://modelkeep.example-tailnet.ts.net
-https://modelkeep-admin.example-tailnet.ts.net
-```
+Defining a Service does not yet make it reachable. The QNAP must advertise it and an
+administrator must approve that advertisement in a later step.
 
-Verify it from an allowed tailnet client and then use it as the Hugging Face endpoint:
+## 2. Configure access policies
 
-```sh
-curl --fail https://modelkeep.example-tailnet.ts.net/healthz
-export HF_ENDPOINT=https://modelkeep.example-tailnet.ts.net
-hf download Qwen/example-model
-```
+Network access to a Tailscale Service and the application capability consumed by
+Serve have different destinations:
 
-Open `https://modelkeep-admin.example-tailnet.ts.net/admin/` for archive inventory,
-prefetch, refresh, verification, audit, and job status. The actual hostnames shown by
-`tailscale serve status` are authoritative.
+- use `svc:modelkeep` or `svc:modelkeep-admin` as `dst` for network access;
+- use the actual Service Proxy node tag, `tag:service`, as `dst` for
+  `io.modelkeep/cap/admin`.
 
-Grant ordinary clients access only to `svc:modelkeep`. Grant administrators access to
-`svc:modelkeep-admin`. Separately, attach the `io.modelkeep/cap/admin` application
-capability to the QNAP Service Proxy destination, `tag:service`. The capability's
-destination is the tagged node running Serve, not the virtual
-`svc:modelkeep-admin` destination. The management Serve command forwards that
-authorized capability in the
-`Tailscale-App-Capabilities` header. ModelKeep trusts this header only on its separate
-loopback-published management listener; direct LAN publication of port 8091 would
-break that trust boundary.
+The capability must not target `svc:modelkeep-admin`. That configuration permits the
+HTTPS connection but does not cause Serve to forward the capability, so ModelKeep
+returns `401 Unauthorized`.
 
-For example, after defining `group:modelkeep-admins`, a restricted tailnet can use
-three grants:
-
-```json
-{
-  "grants": [
-    {
-      "src": ["autogroup:member"],
-      "dst": ["svc:modelkeep"],
-      "ip": ["tcp:443"]
-    },
-    {
-      "src": ["group:modelkeep-admins"],
-      "dst": ["svc:modelkeep-admin"],
-      "ip": ["tcp:443"]
-    },
-    {
-      "src": ["group:modelkeep-admins"],
-      "dst": ["tag:service"],
-      "app": {
-        "io.modelkeep/cap/admin": [{}]
-      }
-    }
-  ]
-}
-```
-
-In the visual policy editor, each object inside `grants` is entered as a separate
-Policy. Do not paste the outer `{"grants": [...]}` wrapper into a single Policy.
-Merge the rules with the tailnet's existing policy rather than replacing unrelated
-grants, and use the editor's validation before saving.
-
-New tailnets commonly already contain an **All users and devices** Policy equivalent
-to `src: ["*"]`, `dst: ["*"]`, `ip: ["*"]`. If retaining that broad rule, it already
-permits HTTPS access to both Services, so add only the separate application-capability
-Policy:
+If the tailnet retains its default **All users and devices** Policy (`src: ["*"]`,
+`dst: ["*"]`, `ip: ["*"]`), network access is already allowed. Add one separate
+Policy in the visual editor:
 
 ```json
 {
@@ -142,24 +95,112 @@ Policy:
 }
 ```
 
-The allow-all Policy grants network connectivity but does not grant the ModelKeep
-admin capability. Keeping it is convenient for a trusted personal tailnet, but it
-also means every tailnet member can reach both Service front doors. Remove or narrow
-it when network-level isolation is required.
+The visual editor accepts one grant object per Policy. Do not paste an outer
+`{"grants": [...]}` wrapper into that field. The allow-all Policy grants connectivity
+only; it does not grant ModelKeep administration.
 
-After saving the policies, confirm that Serve retained capability forwarding and
-that an authorized tailnet client receives a successful management response:
+For a restricted tailnet, replace the broad network Policy with three separate
+Policies equivalent to:
+
+```json
+{
+  "grants": [
+    {
+      "src": ["autogroup:member"],
+      "dst": ["svc:modelkeep"],
+      "ip": ["tcp:443"]
+    },
+    {
+      "src": ["autogroup:admin", "autogroup:owner"],
+      "dst": ["svc:modelkeep-admin"],
+      "ip": ["tcp:443"]
+    },
+    {
+      "src": ["autogroup:admin", "autogroup:owner"],
+      "dst": ["tag:service"],
+      "app": {
+        "io.modelkeep/cap/admin": [{}]
+      }
+    }
+  ]
+}
+```
+
+The outer object above shows the combined policy-file representation; enter its three
+inner objects separately when using the visual editor. Merge them with unrelated
+tailnet policy rather than replacing it.
+
+## 3. Start ModelKeep
+
+The Compose mappings are deliberately bound to loopback. Port 8090 is the download
+endpoint and port 8091 is the authenticated management API/UI. Start ModelKeep and
+check both local backends before configuring ingress:
+
+```sh
+docker compose up -d
+curl --fail http://127.0.0.1:8090/healthz
+curl --fail http://127.0.0.1:8091/admin/
+```
+
+## 4. Advertise both Services from QNAP
+
+After confirming Tailscale 1.92 or newer and starting ModelKeep, run:
+
+```sh
+tailscale serve --service=svc:modelkeep --bg http://127.0.0.1:8090
+tailscale serve --service=svc:modelkeep-admin --accept-app-caps=io.modelkeep/cap/admin --bg http://127.0.0.1:8091
+tailscale serve status --json
+```
+
+Tailscale Services run in background mode persistently. `--bg` is retained here
+because it makes the intended persistence explicit and works with the verified QNAP
+version.
+
+The first command may report that administrator approval is required. In the
+Tailscale admin console, open each Service under **Services → Advertised**, find the
+pending QNAP advertisement in **Service hosts**, and select **Approve**. Approve both
+`modelkeep` and `modelkeep-admin`. `tailscale serve status` showing a local proxy
+configuration does not by itself mean that the Service advertisement has been
+approved or propagated.
+
+After approval, allow a short period for route propagation. The Services page should
+show the QNAP host as connected for both Services.
+
+Serve reports assigned URLs resembling:
+
+```text
+https://modelkeep.example-tailnet.ts.net
+https://modelkeep-admin.example-tailnet.ts.net
+```
+
+## 5. Verify from a tailnet client
+
+Verify both endpoints from a user included in the Policies:
+
+```sh
+curl --fail https://modelkeep.example-tailnet.ts.net/healthz
+curl --fail https://modelkeep-admin.example-tailnet.ts.net/api/admin/v1/status
+export HF_ENDPOINT=https://modelkeep.example-tailnet.ts.net
+hf download Qwen/example-model
+```
+
+Open `https://modelkeep-admin.example-tailnet.ts.net/admin/` for archive inventory,
+prefetch, refresh, verification, audit, and job status. The actual hostnames shown by
+`tailscale serve status` are authoritative.
+
+On QNAP, confirm that the management Serve configuration retained capability
+forwarding:
 
 ```sh
 tailscale serve status --json
-curl --fail https://modelkeep-admin.example-tailnet.ts.net/api/admin/v1/status
 ```
 
 The JSON Serve configuration must show
-`io.modelkeep/cap/admin` in `AcceptAppCaps`. A `401 Unauthorized` from the second
-command means the connection reached ModelKeep but Serve did not attach the required
-capability; first check that the capability Policy targets the Service Proxy's
-`tag:service`, rather than `svc:modelkeep-admin`.
+`io.modelkeep/cap/admin` in `AcceptAppCaps`. A `401 Unauthorized` from the management
+API means the connection reached ModelKeep but Serve did not attach the required
+capability. Check that the grant targets the QNAP's `tag:service`, then confirm that
+the requesting user belongs to `autogroup:admin`, `autogroup:owner`, or the configured
+administrator group.
 
 For user-owned source devices, Serve also adds `Tailscale-User-Login` and
 `Tailscale-User-Name`. ModelKeep shows that identity in the management UI and records
@@ -190,6 +231,33 @@ for a private or gated upstream repository, remains only in the ModelKeep deploy
 environment. It is unrelated to tailnet client identity and must never be placed in
 the Serve URL or tailnet policy.
 
+## Troubleshooting
+
+If a Service hostname times out:
+
+1. Confirm that the Service exists under **Services → Advertised** and that the QNAP
+   advertisement is approved and connected.
+2. Confirm the proxy with `tailscale serve status --json` on QNAP.
+3. Confirm the local backend with `curl --fail http://127.0.0.1:8090/healthz` or
+   `curl --fail http://127.0.0.1:8091/admin/`.
+4. Check the client Tailscale version. Clients 1.94 and newer accept Service routes
+   without enabling general route acceptance. On Linux clients running 1.93 or
+   earlier, enable it with `sudo tailscale set --accept-routes` or upgrade first.
+
+If the management hostname responds with 401, test the backend authorization path on
+QNAP without exposing the management port:
+
+```sh
+curl --fail \
+  -H 'Tailscale-App-Capabilities: {"io.modelkeep/cap/admin":[{}]}' \
+  http://127.0.0.1:8091/api/admin/v1/status
+```
+
+If that succeeds, ModelKeep and `MODELKEEP_TRUST_TAILSCALE_HEADERS` are configured;
+the remaining problem is the Tailscale capability Policy or Serve forwarding. If it
+fails, inspect the Container Station environment and ModelKeep logs before changing
+Tailscale policy.
+
 ## Boundary checks and recovery
 
 From another LAN machine that is not using the tailnet, the direct backend must not
@@ -216,6 +284,6 @@ curl --fail https://modelkeep.example-tailnet.ts.net/readyz
 To remove the HTTPS ingress without stopping ModelKeep, run:
 
 ```sh
-tailscale serve --service=svc:modelkeep off
-tailscale serve --service=svc:modelkeep-admin off
+tailscale serve --service=svc:modelkeep --https=443 off
+tailscale serve --service=svc:modelkeep-admin --https=443 off
 ```
