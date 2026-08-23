@@ -2,9 +2,10 @@ use std::{
     collections::BTreeMap,
     env,
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     net::SocketAddr,
     path::PathBuf,
+    process,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -170,6 +171,8 @@ struct Job {
     error_class: Option<String>,
     message: Option<String>,
     idempotency_hash: Option<String>,
+    #[serde(default)]
+    idempotency_request_hash: Option<String>,
     created_at: u64,
     updated_at: u64,
 }
@@ -280,14 +283,21 @@ impl JobManager {
     }
 
     fn list(&self) -> Vec<Job> {
-        self.inner
+        let mut jobs = self
+            .inner
             .jobs
             .lock()
             .unwrap()
             .values()
-            .rev()
             .cloned()
-            .collect()
+            .collect::<Vec<_>>();
+        jobs.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        jobs
     }
 
     fn get(&self, id: &str) -> Option<Job> {
@@ -304,6 +314,9 @@ impl JobManager {
     ) -> Result<(Job, bool), &'static str> {
         validate_job_request(&request)?;
         let idempotency_hash = idempotency_key.map(hash_idempotency_key).transpose()?;
+        let idempotency_request_hash = idempotency_hash
+            .as_ref()
+            .map(|_| hash_idempotency_request(&request, &principal));
         let mut jobs = self.inner.jobs.lock().unwrap();
         if let Some(hash) = &idempotency_hash {
             if let Some(existing) = jobs
@@ -311,31 +324,46 @@ impl JobManager {
                 .find(|job| job.idempotency_hash.as_ref() == Some(hash))
                 .cloned()
             {
-                return Ok((existing, false));
+                return if existing.idempotency_request_hash == idempotency_request_hash {
+                    Ok((existing, false))
+                } else {
+                    Err("idempotency_conflict")
+                };
             }
         }
         let now = unix_timestamp();
-        let job = Job {
-            id: format!("{now}-{}", JOB_SEQUENCE.fetch_add(1, Ordering::Relaxed)),
-            kind: request.kind,
-            state: JobState::Queued,
-            phase: "queued".into(),
-            repo_id: request.repo_id,
-            revision: request.revision,
-            resolved_commit: None,
-            progress_bytes: None,
-            total_bytes: None,
-            progress_files: None,
-            total_files: None,
-            last_progress_at: None,
-            principal: Some(principal),
-            error_class: None,
-            message: None,
-            idempotency_hash,
-            created_at: now,
-            updated_at: now,
-        };
-        self.persist(&job).map_err(|_| "storage")?;
+        let mut job = None;
+        for _ in 0..16 {
+            let candidate = Job {
+                id: new_job_id(now),
+                kind: request.kind,
+                state: JobState::Queued,
+                phase: "queued".into(),
+                repo_id: request.repo_id.clone(),
+                revision: request.revision.clone(),
+                resolved_commit: None,
+                progress_bytes: None,
+                total_bytes: None,
+                progress_files: None,
+                total_files: None,
+                last_progress_at: None,
+                principal: Some(principal.clone()),
+                error_class: None,
+                message: None,
+                idempotency_hash: idempotency_hash.clone(),
+                idempotency_request_hash: idempotency_request_hash.clone(),
+                created_at: now,
+                updated_at: now,
+            };
+            if jobs.contains_key(&candidate.id) {
+                continue;
+            }
+            if self.persist_new(&candidate).map_err(|_| "storage")? {
+                job = Some(candidate);
+                break;
+            }
+        }
+        let job = job.ok_or("storage")?;
         jobs.insert(job.id.clone(), job.clone());
         drop(jobs);
         let manager = self.clone();
@@ -522,6 +550,32 @@ impl JobManager {
         File::open(&self.inner.directory)?.sync_all()?;
         Ok(())
     }
+
+    fn persist_new(&self, job: &Job) -> Result<bool, ArchiveError> {
+        let reservation = self.inner.directory.join(format!(".{}.reserve", job.id));
+        let final_path = self.inner.directory.join(format!("{}.json", job.id));
+        let reservation_file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&reservation)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        reservation_file.sync_all()?;
+        if final_path.exists() {
+            let _ = fs::remove_file(&reservation);
+            File::open(&self.inner.directory)?.sync_all()?;
+            return Ok(false);
+        }
+        let result = self.persist(job);
+        let remove_result = fs::remove_file(&reservation);
+        File::open(&self.inner.directory)?.sync_all()?;
+        result?;
+        remove_result?;
+        Ok(true)
+    }
 }
 
 pub fn router(
@@ -594,11 +648,16 @@ async fn list_jobs(
         return unauthorized(&state.config);
     }
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
-    let mut jobs = state
-        .jobs
-        .list()
+    let all_jobs = state.jobs.list();
+    let start = query.cursor.as_ref().map_or(0, |cursor| {
+        all_jobs
+            .iter()
+            .position(|job| &job.id == cursor)
+            .map_or(all_jobs.len(), |index| index + 1)
+    });
+    let mut jobs = all_jobs
         .into_iter()
-        .filter(|job| query.cursor.as_ref().is_none_or(|cursor| job.id < *cursor))
+        .skip(start)
         .take(limit + 1)
         .collect::<Vec<_>>();
     let next_cursor = (jobs.len() > limit).then(|| jobs[limit - 1].id.clone());
@@ -668,6 +727,13 @@ async fn create_job(
             StatusCode::BAD_REQUEST,
             Json(ErrorBody {
                 error: "invalid_request",
+            }),
+        )
+            .into_response(),
+        Err("idempotency_conflict") => (
+            StatusCode::CONFLICT,
+            Json(ErrorBody {
+                error: "idempotency_conflict",
             }),
         )
             .into_response(),
@@ -881,6 +947,42 @@ fn hash_idempotency_key(value: &str) -> Result<String, &'static str> {
         .collect())
 }
 
+fn hash_idempotency_request(request: &JobRequest, principal: &PrincipalView) -> String {
+    let value = format!(
+        "{:?}\0{}\0{}\0{}\0{}",
+        request.kind,
+        request.repo_id.as_deref().unwrap_or(""),
+        request.revision.as_deref().unwrap_or(""),
+        principal.auth_method,
+        principal.login.as_deref().unwrap_or("")
+    );
+    Sha256::digest(value.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn new_job_id(now: u64) -> String {
+    let mut random = [0u8; 16];
+    if File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut random))
+        .is_ok()
+    {
+        return format!(
+            "{now}-{}",
+            random
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+    }
+    format!(
+        "{now}-fallback-{}-{}",
+        process::id(),
+        JOB_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 fn classify_pullthrough_error(
     error: crate::pullthrough::PullThroughError,
 ) -> (&'static str, String) {
@@ -989,6 +1091,14 @@ mod tests {
     }
 
     fn job_request(csrf: bool, idempotency_key: &str) -> Request<Body> {
+        job_request_with_body(csrf, idempotency_key, r#"{"kind":"audit"}"#)
+    }
+
+    fn job_request_with_body(
+        csrf: bool,
+        idempotency_key: &str,
+        body: &'static str,
+    ) -> Request<Body> {
         let mut request = Request::builder()
             .method("POST")
             .uri("/api/admin/v1/jobs")
@@ -998,7 +1108,31 @@ mod tests {
         if csrf {
             request = request.header("x-modelkeep-csrf", "1");
         }
-        request.body(Body::from(r#"{"kind":"audit"}"#)).unwrap()
+        request.body(Body::from(body)).unwrap()
+    }
+
+    fn stored_job(id: &str, created_at: u64) -> Job {
+        Job {
+            id: id.into(),
+            kind: JobKind::Audit,
+            state: JobState::Completed,
+            phase: "completed".into(),
+            repo_id: None,
+            revision: None,
+            resolved_commit: None,
+            progress_bytes: None,
+            total_bytes: None,
+            progress_files: None,
+            total_files: None,
+            last_progress_at: None,
+            principal: None,
+            error_class: None,
+            message: None,
+            idempotency_hash: None,
+            idempotency_request_hash: None,
+            created_at,
+            updated_at: created_at,
+        }
     }
 
     fn prefetch_request() -> Request<Body> {
@@ -1105,7 +1239,11 @@ mod tests {
             serde_json::from_slice(&to_bytes(first.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
 
-        let repeated = app.oneshot(job_request(true, "audit-once")).await.unwrap();
+        let repeated = app
+            .clone()
+            .oneshot(job_request(true, "audit-once"))
+            .await
+            .unwrap();
         assert_eq!(repeated.status(), StatusCode::OK);
         let repeated: serde_json::Value =
             serde_json::from_slice(&to_bytes(repeated.into_body(), usize::MAX).await.unwrap())
@@ -1114,6 +1252,138 @@ mod tests {
         assert!(first.get("idempotency_hash").is_none());
         assert!(first["progress_bytes"].is_null());
         assert!(first["total_bytes"].is_null());
+
+        let conflict = app
+            .oneshot(job_request_with_body(
+                true,
+                "audit-once",
+                r#"{"kind":"prefetch","repo_id":"org/model","revision":"main"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn initial_job_persistence_never_overwrites_an_existing_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        let manager = JobManager::open(&archive).unwrap();
+        let original = stored_job("collision", 1);
+        assert!(manager.persist_new(&original).unwrap());
+
+        let mut replacement = stored_job("collision", 2);
+        replacement.message = Some("must not replace".into());
+        assert!(!manager.persist_new(&replacement).unwrap());
+        let persisted: Job = serde_json::from_slice(
+            &fs::read(manager.inner.directory.join("collision.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted.created_at, 1);
+        assert_eq!(persisted.message, None);
+    }
+
+    #[tokio::test]
+    async fn job_pagination_is_stable_for_same_timestamp_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        let manager = JobManager::open(&archive).unwrap();
+        for id in ["job-a", "job-c", "job-b"] {
+            assert!(manager.persist_new(&stored_job(id, 10)).unwrap());
+        }
+        drop(manager);
+        let app = router(
+            archive,
+            Config::token("127.0.0.1:0".parse().unwrap(), "secret"),
+            None,
+        )
+        .unwrap();
+
+        let first = app
+            .clone()
+            .oneshot(request("/api/admin/v1/jobs?limit=2", Some("secret")))
+            .await
+            .unwrap();
+        let first: serde_json::Value =
+            serde_json::from_slice(&to_bytes(first.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(first["items"][0]["id"], "job-c");
+        assert_eq!(first["items"][1]["id"], "job-b");
+        assert_eq!(first["next_cursor"], "job-b");
+
+        let second = app
+            .oneshot(request(
+                "/api/admin/v1/jobs?limit=2&cursor=job-b",
+                Some("secret"),
+            ))
+            .await
+            .unwrap();
+        let second: serde_json::Value =
+            serde_json::from_slice(&to_bytes(second.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(second["items"].as_array().unwrap().len(), 1);
+        assert_eq!(second["items"][0]["id"], "job-a");
+    }
+
+    #[tokio::test]
+    async fn idempotency_key_is_scoped_to_request_and_principal() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Arc::new(Archive::new(directory.path()).unwrap());
+        let manager = JobManager::open(&archive).unwrap();
+        let first = manager.submit(
+            JobRequest {
+                kind: JobKind::Audit,
+                repo_id: None,
+                revision: None,
+            },
+            Some("shared-key"),
+            archive.clone(),
+            None,
+            PrincipalView {
+                auth_method: "tailscale".into(),
+                login: Some("first@example.com".into()),
+                name: None,
+            },
+        );
+        assert!(first.is_ok());
+
+        let different_principal = manager.submit(
+            JobRequest {
+                kind: JobKind::Audit,
+                repo_id: None,
+                revision: None,
+            },
+            Some("shared-key"),
+            archive,
+            None,
+            PrincipalView {
+                auth_method: "tailscale".into(),
+                login: Some("second@example.com".into()),
+                name: None,
+            },
+        );
+        assert!(matches!(different_principal, Err("idempotency_conflict")));
+    }
+
+    #[test]
+    fn legacy_job_records_without_request_hash_remain_readable() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        let manager = JobManager::open(&archive).unwrap();
+        let mut value = serde_json::to_value(stored_job("legacy", 1)).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("idempotency_request_hash");
+        fs::write(
+            manager.inner.directory.join("legacy.json"),
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+        drop(manager);
+
+        let reopened = JobManager::open(&archive).unwrap();
+        assert!(reopened.get("legacy").is_some());
     }
 
     #[tokio::test]
@@ -1179,6 +1449,7 @@ mod tests {
             error_class: None,
             message: None,
             idempotency_hash: None,
+            idempotency_request_hash: None,
             created_at: 1,
             updated_at: 1,
         };
