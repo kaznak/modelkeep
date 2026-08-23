@@ -71,6 +71,15 @@
           };
         };
 
+        qnap-client-acceptance = pkgs.writeShellApplication {
+          name = "qnap-client-acceptance";
+          runtimeInputs = [ python pkgs.cacert ];
+          text = ''
+            export SSL_CERT_FILE="${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+            exec python3 ${./tests/qnap_client_acceptance.py} "$@"
+          '';
+        };
+
         default = self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep;
       });
 
@@ -177,6 +186,15 @@
           } ''
             python3 ${./tests/archive_audit_cli.py} \
               ${self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep}/bin/modelkeep
+            touch $out
+          '';
+
+          qnap-client-acceptance-tests = pkgs.runCommand "modelkeep-qnap-client-acceptance-tests" {
+            nativeBuildInputs = [ pkgs.python3 ];
+          } ''
+            cp ${./tests/qnap_client_acceptance.py} qnap_client_acceptance.py
+            cp ${./tests/test_qnap_client_acceptance.py} test_qnap_client_acceptance.py
+            python3 test_qnap_client_acceptance.py -v
             touch $out
           '';
 

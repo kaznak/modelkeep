@@ -71,6 +71,9 @@ QNAP の archive share が別の場所にある場合は、`compose.yaml` の `/
 短時間だけ動く `modelkeep-init` がマウントルートを `10001:10001` に設定して終了するため、新規ディレクトリならSSHでの権限設定は不要です。本体コンテナは UID/GID `10001:10001`、read-only root filesystem、capability drop で動作し、永続データは `/data` のみに書き込みます。HTTP port は QNAP host の loopback のみに公開されます。host の公式 Tailscale app で tailnet 限定 HTTPS endpoint を構成し、port 8090 を LAN に直接公開しないでください。
 ホスト側の UID/GID と権限 preflight は [`docs/deployment/qnap-permissions.md`](docs/deployment/qnap-permissions.md) を参照してください。
 Tailscale Serve の設定と境界確認は [`docs/deployment/qnap-tailscale-serve.md`](docs/deployment/qnap-tailscale-serve.md) を参照してください。
+実運用開始前には GX10 から段階実行型の
+[`QNAP client acceptance suite`](docs/deployment/qnap-client-acceptance.md) を実行し、cold、warm、
+offline、再起動、QNAP reboot、restore 後の動作を確認してください。
 
 private / gated repository を使う場合は、deploy 環境から `HF_TOKEN` を渡します。認証情報を URL、manifest、log に保存しないでください。
 QNAP Container Station の Application では Compose 変数展開に依存せず、保護された設定方法で

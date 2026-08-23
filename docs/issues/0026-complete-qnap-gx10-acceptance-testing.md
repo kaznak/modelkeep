@@ -5,7 +5,7 @@ related_adrs:
   - ADR-0011
   - ADR-0013
 created: 2026-08-21
-updated: 2026-08-21
+updated: 2026-08-24
 ---
 # Issue 0026: Complete QNAP and GX10 acceptance testing
 
@@ -29,6 +29,8 @@ operation.
 - Exercise cold miss, empty-client warm hit, upstream-offline download, and Range.
 - Restart the container and reboot QNAP; verify readiness, Serve, and archived data.
 - Confirm LAN port 8090 is closed and tailnet HTTPS works from GX10.
+- Run the repository-provided phased client suite and retain its JSON/Markdown
+  acceptance record.
 
 ## Acceptance criteria
 
@@ -48,6 +50,9 @@ curl --fail <modelkeep-tailnet-url>/readyz
 
 Follow the QNAP production runbook, run cold/warm/offline client scenarios, reboot
 QNAP, repeat readiness/download checks, and attach the site acceptance record.
+
+The client-side commands and the required operator transitions are documented in
+[`docs/deployment/qnap-client-acceptance.md`](../deployment/qnap-client-acceptance.md).
 
 ## Risks and assumptions
 

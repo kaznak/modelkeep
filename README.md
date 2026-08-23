@@ -85,6 +85,9 @@ for Service Proxy approval, the required `tag:service` application-capability Po
 Tailscale Serve setup, and boundary checks. The admin capability must target the
 tagged QNAP Service Proxy; targeting only `svc:modelkeep-admin` results in an
 unauthorized management API response.
+Before production use, run the phased
+[`QNAP client acceptance suite`](docs/deployment/qnap-client-acceptance.md) from the
+GX10 to verify cold, warm, offline, restart, reboot, and restore behavior.
 
 For private or gated upstream repositories, provide `HF_TOKEN` through the deployment
 environment. Never put credentials in URLs, manifests, or logs.
