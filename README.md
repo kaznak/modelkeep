@@ -81,7 +81,10 @@ not expose ports 8090 or 8091 directly on the LAN. The management UI is served a
 `/admin/` on the `svc:modelkeep-admin` hostname.
 See [`docs/deployment/qnap-permissions.md`](docs/deployment/qnap-permissions.md) for the host-side UID/GID and permission preflight.
 See [`docs/deployment/qnap-tailscale-serve.md`](docs/deployment/qnap-tailscale-serve.md)
-for Tailscale Serve setup and boundary checks.
+for Service Proxy approval, the required `tag:service` application-capability Policy,
+Tailscale Serve setup, and boundary checks. The admin capability must target the
+tagged QNAP Service Proxy; targeting only `svc:modelkeep-admin` results in an
+unauthorized management API response.
 
 For private or gated upstream repositories, provide `HF_TOKEN` through the deployment
 environment. Never put credentials in URLs, manifests, or logs.

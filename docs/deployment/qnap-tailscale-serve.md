@@ -54,6 +54,12 @@ After confirming Tailscale 1.92 or newer, configure two persistent, tailnet-only
 services on the QNAP host so routine model downloads and privileged administration
 have different hostnames and grants:
 
+Before advertising the Services, assign the QNAP node a tag authorized to host
+Services (the examples below use `tag:service`). Define `svc:modelkeep` and
+`svc:modelkeep-admin` in the Tailscale admin console, and approve the QNAP as a
+Service Proxy when prompted. A Service hostname is not usable until that approval is
+complete.
+
 ```sh
 tailscale serve --service=svc:modelkeep --bg http://127.0.0.1:8090
 tailscale serve --service=svc:modelkeep-admin --accept-app-caps=io.modelkeep/cap/admin --bg http://127.0.0.1:8091
@@ -80,13 +86,17 @@ prefetch, refresh, verification, audit, and job status. The actual hostnames sho
 `tailscale serve status` are authoritative.
 
 Grant ordinary clients access only to `svc:modelkeep`. Grant administrators access to
-`svc:modelkeep-admin` and attach the `io.modelkeep/cap/admin` application capability.
-The management Serve command forwards that authorized capability in the
+`svc:modelkeep-admin`. Separately, attach the `io.modelkeep/cap/admin` application
+capability to the QNAP Service Proxy destination, `tag:service`. The capability's
+destination is the tagged node running Serve, not the virtual
+`svc:modelkeep-admin` destination. The management Serve command forwards that
+authorized capability in the
 `Tailscale-App-Capabilities` header. ModelKeep trusts this header only on its separate
 loopback-published management listener; direct LAN publication of port 8091 would
 break that trust boundary.
 
-For example, after defining `group:modelkeep-admins`, the relevant grants are:
+For example, after defining `group:modelkeep-admins`, a restricted tailnet can use
+three grants:
 
 ```json
 {
@@ -99,7 +109,11 @@ For example, after defining `group:modelkeep-admins`, the relevant grants are:
     {
       "src": ["group:modelkeep-admins"],
       "dst": ["svc:modelkeep-admin"],
-      "ip": ["tcp:443"],
+      "ip": ["tcp:443"]
+    },
+    {
+      "src": ["group:modelkeep-admins"],
+      "dst": ["tag:service"],
       "app": {
         "io.modelkeep/cap/admin": [{}]
       }
@@ -108,8 +122,44 @@ For example, after defining `group:modelkeep-admins`, the relevant grants are:
 }
 ```
 
-Merge these with the tailnet's existing policy rather than replacing unrelated
-grants. Use the policy editor's validation before saving.
+In the visual policy editor, each object inside `grants` is entered as a separate
+Policy. Do not paste the outer `{"grants": [...]}` wrapper into a single Policy.
+Merge the rules with the tailnet's existing policy rather than replacing unrelated
+grants, and use the editor's validation before saving.
+
+New tailnets commonly already contain an **All users and devices** Policy equivalent
+to `src: ["*"]`, `dst: ["*"]`, `ip: ["*"]`. If retaining that broad rule, it already
+permits HTTPS access to both Services, so add only the separate application-capability
+Policy:
+
+```json
+{
+  "src": ["autogroup:admin", "autogroup:owner"],
+  "dst": ["tag:service"],
+  "app": {
+    "io.modelkeep/cap/admin": [{}]
+  }
+}
+```
+
+The allow-all Policy grants network connectivity but does not grant the ModelKeep
+admin capability. Keeping it is convenient for a trusted personal tailnet, but it
+also means every tailnet member can reach both Service front doors. Remove or narrow
+it when network-level isolation is required.
+
+After saving the policies, confirm that Serve retained capability forwarding and
+that an authorized tailnet client receives a successful management response:
+
+```sh
+tailscale serve status --json
+curl --fail https://modelkeep-admin.example-tailnet.ts.net/api/admin/v1/status
+```
+
+The JSON Serve configuration must show
+`io.modelkeep/cap/admin` in `AcceptAppCaps`. A `401 Unauthorized` from the second
+command means the connection reached ModelKeep but Serve did not attach the required
+capability; first check that the capability Policy targets the Service Proxy's
+`tag:service`, rather than `svc:modelkeep-admin`.
 
 If the installed QNAP Tailscale version does not yet support Services and application
 capabilities, upgrade it. As a temporary fallback, set a strong
