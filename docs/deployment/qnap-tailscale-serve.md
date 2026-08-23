@@ -6,11 +6,20 @@ ModelKeep container.
 
 ## Prerequisites
 
-Install and connect Tailscale from QNAP App Center. Enable MagicDNS and HTTPS
-certificates for the tailnet. These are administrative actions: QNAP must first be
-authenticated as a tailnet node, and enabling tailnet HTTPS may require approval in
-the Tailscale admin console. The first `tailscale serve` invocation can print a URL
-for that one-time approval.
+Install and connect Tailscale from QNAP App Center. Tailscale Services and application
+capability forwarding require Tailscale 1.92 or newer. If App Center offers an older
+version, follow Tailscale's official
+[manual QPKG installation instructions](https://tailscale.com/docs/integrations/qnap#manual-installation-steps)
+and select the package matching the NAS architecture from the
+[stable QNAP package directory](https://pkgs.tailscale.com/stable/#qnap).
+Install the downloaded `.qpkg` with App Center's **Install Manually** action; do not
+replace only the CLI binary. Perform the update through the NAS LAN interface because
+Tailscale connectivity can be interrupted while the package restarts.
+
+Enable MagicDNS and HTTPS certificates for the tailnet. These are administrative
+actions: QNAP must first be authenticated as a tailnet node, and enabling tailnet
+HTTPS may require approval in the Tailscale admin console. The first `tailscale serve`
+invocation can print a URL for that one-time approval.
 
 SSH to the QNAP with an account allowed to administer the Tailscale QPKG and confirm
 that the installed CLI has Serve support:
@@ -41,9 +50,9 @@ curl --fail http://127.0.0.1:8090/healthz
 curl --fail http://127.0.0.1:8091/admin/
 ```
 
-Tailscale Services require Tailscale 1.92 or newer. Configure two persistent,
-tailnet-only HTTPS services on the QNAP host so routine model downloads and privileged
-administration have different hostnames and grants:
+After confirming Tailscale 1.92 or newer, configure two persistent, tailnet-only HTTPS
+services on the QNAP host so routine model downloads and privileged administration
+have different hostnames and grants:
 
 ```sh
 tailscale serve --service=svc:modelkeep --bg http://127.0.0.1:8090
