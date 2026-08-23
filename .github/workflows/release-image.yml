@@ -2,11 +2,33 @@ name: Release OCI image
 
 on:
   pull_request:
+    paths:
+      - ".github/workflows/release-image.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "flake.nix"
+      - "flake.lock"
+      - "compose.yaml"
+      - "src/**"
+      - "upstream/**"
+      - "tests/**"
   push:
     branches:
       - main
     tags:
       - "v*"
+    # GitHub does not evaluate path filters for tag pushes, so every v* release
+    # still builds and publishes both architectures.
+    paths:
+      - ".github/workflows/release-image.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "flake.nix"
+      - "flake.lock"
+      - "compose.yaml"
+      - "src/**"
+      - "upstream/**"
+      - "tests/**"
   workflow_dispatch:
 
 permissions:
