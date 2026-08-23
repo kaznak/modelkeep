@@ -206,7 +206,7 @@ $('job-form').addEventListener('submit', async (event) => {
   event.preventDefault(); const kind = $('kind').value; const body = {kind};
   if (kind !== 'audit') { body.repo_id = $('repo-id').value.trim(); body.revision = $('revision').value.trim(); }
   $('submit-job').disabled = true; $('form-message').textContent = 'Submitting…';
-  try { const job = await api('/api/admin/v1/jobs', {method: 'POST', body: JSON.stringify(body)}); $('form-message').textContent = `Job ${job.id} queued.`; await load(); }
+  try { const job = await api('/api/admin/v1/jobs', {method: 'POST', body: JSON.stringify(body)}); $('repo-id').value = ''; $('form-message').textContent = `Job ${job.id} queued.`; await load(); }
   catch (error) { $('form-message').textContent = error.message; }
   finally { $('submit-job').disabled = false; }
 });
@@ -233,5 +233,7 @@ mod tests {
         assert!(INDEX.contains("class=\"panel authentication\" hidden"));
         assert!(SCRIPT.contains("x-modelkeep-auth-methods"));
         assert!(SCRIPT.contains("Connected as"));
+        assert!(SCRIPT.contains("const job = await api('/api/admin/v1/jobs'"));
+        assert!(SCRIPT.contains("$('repo-id').value = ''; $('form-message').textContent"));
     }
 }
