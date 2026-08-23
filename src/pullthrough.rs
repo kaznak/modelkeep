@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::singleflight::SingleFlight;
-use crate::upstream::{FetchRequest, UpstreamError, UpstreamFetcher};
+use crate::upstream::{FetchProgress, FetchRequest, UpstreamError, UpstreamFetcher};
 use crate::{is_hf_commit, Archive, ArchiveError, SourceFile};
 
 #[derive(Clone)]
@@ -65,6 +65,16 @@ impl PullThrough {
         requested_revision: &str,
         files: &[String],
     ) -> Result<String, PullThroughError> {
+        self.ensure_with_progress(repo_id, requested_revision, files, &|_| {})
+    }
+
+    pub fn ensure_with_progress(
+        &self,
+        repo_id: &str,
+        requested_revision: &str,
+        files: &[String],
+        progress: &(dyn Fn(FetchProgress) + Send + Sync),
+    ) -> Result<String, PullThroughError> {
         if let Ok(commit) = self.archive.resolve_ref(repo_id, requested_revision) {
             if self.revision_is_ready(repo_id, &commit, files) {
                 return Ok(commit);
@@ -80,7 +90,7 @@ impl PullThrough {
         let files = files.to_vec();
         let this = self.clone();
         self.flights.run(key, move || {
-            this.fetch_and_publish(&repo_id, &requested_revision, &files)
+            this.fetch_and_publish(&repo_id, &requested_revision, &files, progress)
         })
     }
 
@@ -90,6 +100,16 @@ impl PullThrough {
         reference: &str,
         dry_run: bool,
     ) -> Result<RefreshResult, PullThroughError> {
+        self.refresh_with_progress(repo_id, reference, dry_run, &|_| {})
+    }
+
+    pub fn refresh_with_progress(
+        &self,
+        repo_id: &str,
+        reference: &str,
+        dry_run: bool,
+        progress: &(dyn Fn(FetchProgress) + Send + Sync),
+    ) -> Result<RefreshResult, PullThroughError> {
         let previous = self.archive.resolve_ref(repo_id, reference).ok();
         let staging = self
             .archive
@@ -97,12 +117,15 @@ impl PullThrough {
             .map_err(PullThroughError::from)?;
         let fetched = self
             .fetcher
-            .fetch(&FetchRequest {
-                repo_id: repo_id.into(),
-                revision: reference.into(),
-                files: Vec::new(),
-                staging: staging.clone(),
-            })
+            .fetch_with_progress(
+                &FetchRequest {
+                    repo_id: repo_id.into(),
+                    revision: reference.into(),
+                    files: Vec::new(),
+                    staging: staging.clone(),
+                },
+                progress,
+            )
             .map_err(|error| {
                 let _ = std::fs::remove_dir_all(&staging);
                 PullThroughError::from(error)
@@ -159,6 +182,7 @@ impl PullThrough {
         repo_id: &str,
         requested_revision: &str,
         files: &[String],
+        progress: &(dyn Fn(FetchProgress) + Send + Sync),
     ) -> Result<String, PullThroughError> {
         if let Ok(commit) = self.archive.resolve_ref(repo_id, requested_revision) {
             if self.revision_is_ready(repo_id, &commit, files) {
@@ -173,7 +197,7 @@ impl PullThrough {
             files: Vec::new(),
             staging: staging.clone(),
         };
-        let fetched = match self.fetcher.fetch(&request) {
+        let fetched = match self.fetcher.fetch_with_progress(&request, progress) {
             Ok(result) => result,
             Err(error) => {
                 let _ = std::fs::remove_dir_all(&staging);

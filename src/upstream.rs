@@ -1,3 +1,4 @@
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -18,6 +19,14 @@ pub struct FetchedRevision {
     pub commit: String,
     pub files: Vec<String>,
     pub staging: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct FetchProgress {
+    pub phase: String,
+    pub unit: String,
+    pub completed: u64,
+    pub total: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -47,6 +56,14 @@ impl std::error::Error for UpstreamError {}
 
 pub trait UpstreamFetcher: Send + Sync {
     fn fetch(&self, request: &FetchRequest) -> Result<FetchedRevision, UpstreamError>;
+
+    fn fetch_with_progress(
+        &self,
+        request: &FetchRequest,
+        _progress: &(dyn Fn(FetchProgress) + Send + Sync),
+    ) -> Result<FetchedRevision, UpstreamError> {
+        self.fetch(request)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +74,14 @@ pub struct OfficialHfFetcher {
 
 impl UpstreamFetcher for OfficialHfFetcher {
     fn fetch(&self, request: &FetchRequest) -> Result<FetchedRevision, UpstreamError> {
+        self.fetch_with_progress(request, &|_| {})
+    }
+
+    fn fetch_with_progress(
+        &self,
+        request: &FetchRequest,
+        progress: &(dyn Fn(FetchProgress) + Send + Sync),
+    ) -> Result<FetchedRevision, UpstreamError> {
         let mut command = Command::new(&self.python);
         command
             .arg(&self.helper)
@@ -71,17 +96,35 @@ impl UpstreamFetcher for OfficialHfFetcher {
         for file in &request.files {
             command.arg("--file").arg(file);
         }
-        let output = command.output().map_err(UpstreamError::Io)?;
-        if !output.status.success() {
-            return Err(match output.status.code() {
+        let mut child = command.spawn().map_err(UpstreamError::Io)?;
+        let stdout = child.stdout.take().ok_or(UpstreamError::InvalidOutput)?;
+        let mut result = None;
+        for line in BufReader::new(stdout).lines() {
+            let line = line.map_err(UpstreamError::Io)?;
+            let value: serde_json::Value =
+                serde_json::from_str(&line).map_err(|_| UpstreamError::InvalidOutput)?;
+            match value.get("type").and_then(|value| value.as_str()) {
+                Some("progress") => progress(
+                    serde_json::from_value(value).map_err(|_| UpstreamError::InvalidOutput)?,
+                ),
+                Some("result") | None => {
+                    result = Some(
+                        serde_json::from_value(value).map_err(|_| UpstreamError::InvalidOutput)?,
+                    );
+                }
+                _ => return Err(UpstreamError::InvalidOutput),
+            }
+        }
+        let status = child.wait().map_err(UpstreamError::Io)?;
+        if !status.success() {
+            return Err(match status.code() {
                 Some(10) => UpstreamError::Unavailable,
                 Some(11) => UpstreamError::NotFound,
                 Some(12) => UpstreamError::Unauthorized,
                 _ => UpstreamError::Failed,
             });
         }
-        let response: HelperOutput =
-            serde_json::from_slice(&output.stdout).map_err(|_| UpstreamError::InvalidOutput)?;
+        let response: HelperOutput = result.ok_or(UpstreamError::InvalidOutput)?;
         if !is_hf_commit(&response.commit) || response.files.is_empty() {
             return Err(UpstreamError::InvalidOutput);
         }
@@ -95,6 +138,8 @@ impl UpstreamFetcher for OfficialHfFetcher {
 
 #[derive(Debug, Deserialize)]
 struct HelperOutput {
+    #[serde(rename = "type")]
+    _kind: Option<String>,
     commit: String,
     files: Vec<String>,
 }
@@ -118,5 +163,16 @@ mod tests {
         assert!(!is_hf_commit(""));
         assert!(!is_hf_commit("aaaaaaaa"));
         assert!(!is_hf_commit(&"g".repeat(40)));
+    }
+
+    #[test]
+    fn helper_progress_contract_is_deserialized() {
+        let event: FetchProgress = serde_json::from_str(
+            r#"{"type":"progress","phase":"downloading","unit":"bytes","completed":4,"total":10}"#,
+        )
+        .unwrap();
+        assert_eq!(event.completed, 4);
+        assert_eq!(event.total, Some(10));
+        assert_eq!(event.unit, "bytes");
     }
 }

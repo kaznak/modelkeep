@@ -161,6 +161,18 @@ command means the connection reached ModelKeep but Serve did not attach the requ
 capability; first check that the capability Policy targets the Service Proxy's
 `tag:service`, rather than `svc:modelkeep-admin`.
 
+For user-owned source devices, Serve also adds `Tailscale-User-Login` and
+`Tailscale-User-Name`. ModelKeep shows that identity in the management UI and records
+it on newly submitted jobs for operator accountability. These identity fields are not
+authorization inputs: `io.modelkeep/cap/admin` remains required. Tagged source
+devices do not have a Tailscale user identity and are displayed as a Tailscale
+principal without an invented user name.
+
+The bearer-token form appears only when `MODELKEEP_ADMIN_TOKEN` is non-empty and a
+request is not already authorized through Tailscale. With the default QNAP
+Tailscale-only configuration, an unauthorized page reports a Tailscale authorization
+problem instead of asking for a token that is not configured.
+
 If the installed QNAP Tailscale version does not yet support Services and application
 capabilities, upgrade it. As a temporary fallback, set a strong
 `MODELKEEP_ADMIN_TOKEN`, disable `MODELKEEP_TRUST_TAILSCALE_HEADERS`, proxy port 8091

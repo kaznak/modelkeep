@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use sha2::{Digest, Sha256};
 
+use crate::upstream::FetchProgress;
 use crate::{
     pullthrough::PullThrough, validate_repository_id, validate_revision_ref, Archive, ArchiveError,
     RepositorySummary,
@@ -39,6 +40,17 @@ pub struct Config {
 }
 
 impl Config {
+    fn auth_methods(&self) -> Vec<&'static str> {
+        let mut methods = Vec::new();
+        if self.trust_tailscale_headers {
+            methods.push("tailscale");
+        }
+        if self.bearer_token.is_some() {
+            methods.push("bearer");
+        }
+        methods
+    }
+
     pub fn from_env() -> Result<Option<Self>, String> {
         let Some(address) = env::var("MODELKEEP_ADMIN_ADDRESS").ok() else {
             return Ok(None);
@@ -94,6 +106,15 @@ struct StatusBody {
     pullthrough_enabled: bool,
     repository_count: usize,
     logical_archive_bytes: u64,
+    principal: PrincipalView,
+    auth_methods: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PrincipalView {
+    auth_method: String,
+    login: Option<String>,
+    name: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -138,6 +159,14 @@ struct Job {
     resolved_commit: Option<String>,
     progress_bytes: Option<u64>,
     total_bytes: Option<u64>,
+    #[serde(default)]
+    progress_files: Option<u64>,
+    #[serde(default)]
+    total_files: Option<u64>,
+    #[serde(default)]
+    last_progress_at: Option<u64>,
+    #[serde(default)]
+    principal: Option<PrincipalView>,
     error_class: Option<String>,
     message: Option<String>,
     idempotency_hash: Option<String>,
@@ -156,6 +185,10 @@ struct JobView {
     resolved_commit: Option<String>,
     progress_bytes: Option<u64>,
     total_bytes: Option<u64>,
+    progress_files: Option<u64>,
+    total_files: Option<u64>,
+    last_progress_at: Option<u64>,
+    principal: Option<PrincipalView>,
     error_class: Option<String>,
     message: Option<String>,
     created_at: u64,
@@ -174,6 +207,10 @@ impl From<Job> for JobView {
             resolved_commit: job.resolved_commit,
             progress_bytes: job.progress_bytes,
             total_bytes: job.total_bytes,
+            progress_files: job.progress_files,
+            total_files: job.total_files,
+            last_progress_at: job.last_progress_at,
+            principal: job.principal,
             error_class: job.error_class,
             message: job.message,
             created_at: job.created_at,
@@ -263,6 +300,7 @@ impl JobManager {
         idempotency_key: Option<&str>,
         archive: Arc<Archive>,
         pullthrough: Option<Arc<PullThrough>>,
+        principal: PrincipalView,
     ) -> Result<(Job, bool), &'static str> {
         validate_job_request(&request)?;
         let idempotency_hash = idempotency_key.map(hash_idempotency_key).transpose()?;
@@ -287,6 +325,10 @@ impl JobManager {
             resolved_commit: None,
             progress_bytes: None,
             total_bytes: None,
+            progress_files: None,
+            total_files: None,
+            last_progress_at: None,
+            principal: Some(principal),
             error_class: None,
             message: None,
             idempotency_hash,
@@ -320,16 +362,22 @@ impl JobManager {
         if job.state == JobState::Cancelled {
             return;
         }
+        let progress_manager = self.clone();
+        let progress_job_id = id.to_string();
+        let progress = move |event: FetchProgress| {
+            progress_manager.record_progress(&progress_job_id, event);
+        };
         let result: Result<Option<String>, (&'static str, String)> = match job.kind {
             JobKind::Prefetch => pullthrough
                 .as_ref()
                 .ok_or_else(|| ("upstream_disabled", "pull-through is disabled".into()))
                 .and_then(|pullthrough| {
                     pullthrough
-                        .ensure(
+                        .ensure_with_progress(
                             job.repo_id.as_deref().unwrap(),
                             job.revision.as_deref().unwrap(),
                             &[],
+                            &progress,
                         )
                         .map(Some)
                         .map_err(classify_pullthrough_error)
@@ -339,10 +387,11 @@ impl JobManager {
                 .ok_or_else(|| ("upstream_disabled", "pull-through is disabled".into()))
                 .and_then(|pullthrough| {
                     pullthrough
-                        .refresh(
+                        .refresh_with_progress(
                             job.repo_id.as_deref().unwrap(),
                             job.revision.as_deref().unwrap(),
                             false,
+                            &progress,
                         )
                         .map(|result| Some(result.proposed))
                         .map_err(classify_pullthrough_error)
@@ -400,6 +449,48 @@ impl JobManager {
         drop(jobs);
         self.persist(&snapshot).map_err(|_| "storage")?;
         Ok(snapshot)
+    }
+
+    fn record_progress(&self, id: &str, event: FetchProgress) {
+        let snapshot = self.update(id, |job| {
+            job.phase = event.phase.clone();
+            match event.unit.as_str() {
+                "bytes" => {
+                    job.progress_bytes = Some(event.completed.max(job.progress_bytes.unwrap_or(0)));
+                    if let Some(total) = event.total {
+                        job.total_bytes = Some(
+                            total
+                                .max(job.progress_bytes.unwrap_or(0))
+                                .max(job.total_bytes.unwrap_or(0)),
+                        );
+                    }
+                }
+                "files" => {
+                    job.progress_files = Some(event.completed.max(job.progress_files.unwrap_or(0)));
+                    if let Some(total) = event.total {
+                        job.total_files = Some(
+                            total
+                                .max(job.progress_files.unwrap_or(0))
+                                .max(job.total_files.unwrap_or(0)),
+                        );
+                    }
+                }
+                _ => return,
+            }
+            job.last_progress_at = Some(unix_timestamp());
+        });
+        if let Some(job) = snapshot {
+            tracing::info!(
+                event = "admin_job_progress",
+                job_id = %id,
+                repo_id = job.repo_id.as_deref().unwrap_or(""),
+                progress_bytes = job.progress_bytes,
+                total_bytes = job.total_bytes,
+                progress_files = job.progress_files,
+                total_files = job.total_files,
+                "management job progress"
+            );
+        }
     }
 
     fn update(&self, id: &str, update: impl FnOnce(&mut Job)) -> Option<Job> {
@@ -500,7 +591,7 @@ async fn list_jobs(
     Query(query): Query<PageQuery>,
 ) -> Response {
     if !authorized(&state.config, &headers) {
-        return unauthorized();
+        return unauthorized(&state.config);
     }
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let mut jobs = state
@@ -525,7 +616,7 @@ async fn job(
     Path(id): Path<String>,
 ) -> Response {
     if !authorized(&state.config, &headers) {
-        return unauthorized();
+        return unauthorized(&state.config);
     }
     match state.jobs.get(&id) {
         Some(job) => Json(JobView::from(job)).into_response(),
@@ -542,9 +633,9 @@ async fn create_job(
     headers: HeaderMap,
     Json(request): Json<JobRequest>,
 ) -> Response {
-    if !authorized(&state.config, &headers) {
-        return unauthorized();
-    }
+    let Some(principal) = authenticate(&state.config, &headers) else {
+        return unauthorized(&state.config);
+    };
     if !csrf_authorized(&headers) {
         return (
             StatusCode::FORBIDDEN,
@@ -562,6 +653,7 @@ async fn create_job(
         idempotency_key,
         state.archive.clone(),
         state.pullthrough.clone(),
+        principal,
     ) {
         Ok((job, created)) => (
             if created {
@@ -595,7 +687,7 @@ async fn cancel_job(
     Path(id): Path<String>,
 ) -> Response {
     if !authorized(&state.config, &headers) {
-        return unauthorized();
+        return unauthorized(&state.config);
     }
     if !csrf_authorized(&headers) {
         return (
@@ -631,9 +723,9 @@ async fn cancel_job(
 }
 
 async fn status(state: AdminState, headers: HeaderMap, pullthrough_enabled: bool) -> Response {
-    if !authorized(&state.config, &headers) {
-        return unauthorized();
-    }
+    let Some(principal) = authenticate(&state.config, &headers) else {
+        return unauthorized(&state.config);
+    };
     match state.archive.list_repositories() {
         Ok(repositories) => Json(StatusBody {
             version: env!("CARGO_PKG_VERSION"),
@@ -644,6 +736,8 @@ async fn status(state: AdminState, headers: HeaderMap, pullthrough_enabled: bool
                 .iter()
                 .map(|repository| repository.logical_bytes)
                 .sum(),
+            principal,
+            auth_methods: state.config.auth_methods(),
         })
         .into_response(),
         Err(error) => archive_error(error),
@@ -656,7 +750,7 @@ async fn repositories(
     Query(query): Query<PageQuery>,
 ) -> Response {
     if !authorized(&state.config, &headers) {
-        return unauthorized();
+        return unauthorized(&state.config);
     }
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     match state.archive.list_repositories() {
@@ -689,7 +783,7 @@ async fn repository(
     Path((namespace, repository)): Path<(String, String)>,
 ) -> Response {
     if !authorized(&state.config, &headers) {
-        return unauthorized();
+        return unauthorized(&state.config);
     }
     match state
         .archive
@@ -706,6 +800,10 @@ async fn repository(
 }
 
 fn authorized(config: &Config, headers: &HeaderMap) -> bool {
+    authenticate(config, headers).is_some()
+}
+
+fn authenticate(config: &Config, headers: &HeaderMap) -> Option<PrincipalView> {
     let bearer_authorized = config.bearer_token.as_ref().is_some_and(|expected| {
         headers
             .get(header::AUTHORIZATION)
@@ -721,7 +819,27 @@ fn authorized(config: &Config, headers: &HeaderMap) -> bool {
             .and_then(|value| value.get(ADMIN_CAPABILITY).cloned())
             .and_then(|value| value.as_array().cloned())
             .is_some_and(|capabilities| !capabilities.is_empty());
-    bearer_authorized || tailscale_authorized
+    if tailscale_authorized {
+        return Some(PrincipalView {
+            auth_method: "tailscale".into(),
+            login: trusted_identity_header(headers, "tailscale-user-login"),
+            name: trusted_identity_header(headers, "tailscale-user-name"),
+        });
+    }
+    bearer_authorized.then(|| PrincipalView {
+        auth_method: "bearer".into(),
+        login: None,
+        name: None,
+    })
+}
+
+fn trusted_identity_header(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 512)
+        .map(str::to_owned)
 }
 
 fn csrf_authorized(headers: &HeaderMap) -> bool {
@@ -806,15 +924,24 @@ fn constant_time_eq(expected: &[u8], provided: &[u8]) -> bool {
     difference == 0
 }
 
-fn unauthorized() -> Response {
-    (
+fn unauthorized(config: &Config) -> Response {
+    let mut response = (
         StatusCode::UNAUTHORIZED,
-        [(header::WWW_AUTHENTICATE, "Bearer")],
         Json(ErrorBody {
             error: "unauthorized",
         }),
     )
-        .into_response()
+        .into_response();
+    if config.bearer_token.is_some() {
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, "Bearer".parse().unwrap());
+    }
+    response.headers_mut().insert(
+        "x-modelkeep-auth-methods",
+        config.auth_methods().join(",").parse().unwrap(),
+    );
+    response
 }
 
 fn archive_error(error: ArchiveError) -> Response {
@@ -1015,6 +1142,10 @@ mod tests {
             resolved_commit: None,
             progress_bytes: None,
             total_bytes: None,
+            progress_files: None,
+            total_files: None,
+            last_progress_at: None,
+            principal: None,
             error_class: None,
             message: None,
             idempotency_hash: None,
@@ -1041,5 +1172,14 @@ mod tests {
         assert!(!authorized(&config, &headers));
         config.trust_tailscale_headers = true;
         assert!(authorized(&config, &headers));
+        headers.insert(
+            "tailscale-user-login",
+            "operator@example.com".parse().unwrap(),
+        );
+        headers.insert("tailscale-user-name", "Example Operator".parse().unwrap());
+        let principal = authenticate(&config, &headers).unwrap();
+        assert_eq!(principal.auth_method, "tailscale");
+        assert_eq!(principal.login.as_deref(), Some("operator@example.com"));
+        assert_eq!(principal.name.as_deref(), Some("Example Operator"));
     }
 }

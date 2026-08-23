@@ -1,3 +1,5 @@
+import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +18,21 @@ class MovingRefApi:
 
 
 class HfFetchTests(unittest.TestCase):
+    def test_progress_reporter_emits_machine_readable_bounded_progress(self):
+        stream = io.StringIO()
+        reporter = hf_fetch.ProgressReporter(stream=stream, minimum_interval=0)
+        progress_type = reporter.tqdm_class()
+        progress = progress_type(total=10, unit="B")
+        progress.update(4)
+        progress.close()
+
+        events = [json.loads(line) for line in stream.getvalue().splitlines()]
+        self.assertTrue(events)
+        self.assertTrue(all(event["type"] == "progress" for event in events))
+        self.assertEqual(events[-1]["unit"], "bytes")
+        self.assertEqual(events[-1]["completed"], 4)
+        self.assertEqual(events[-1]["total"], 10)
+
     def test_download_is_pinned_to_commit_resolved_before_ref_moves(self):
         api = MovingRefApi()
         download_calls = []

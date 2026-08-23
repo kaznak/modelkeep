@@ -49,7 +49,7 @@ const INDEX: &str = r#"<!doctype html>
 <body>
   <header><div><p class="eyebrow">Archive control plane</p><h1>ModelKeep</h1></div><p id="connection" role="status">Connecting…</p></header>
   <main>
-    <section id="auth" class="panel auth" hidden>
+    <section id="auth" class="panel authentication" hidden>
       <div><h2>Authentication required</h2><p>Enter the management token. It is kept only for this browser tab.</p></div>
       <form id="auth-form"><label for="token">Bearer token</label><div class="inline"><input id="token" type="password" autocomplete="current-password" required><button>Connect</button></div></form>
     </section>
@@ -94,6 +94,7 @@ const SCRIPT: &str = r#"'use strict';
 const $ = (id) => document.getElementById(id);
 let token = sessionStorage.getItem('modelkeep-admin-token') || '';
 let timer;
+const progressSamples = new Map();
 
 function headers(write = false) {
   const result = {Accept: 'application/json'};
@@ -109,9 +110,12 @@ function headers(write = false) {
 async function api(path, options = {}) {
   const response = await fetch(path, {...options, headers: {...headers(Boolean(options.body)), ...(options.headers || {})}});
   if (response.status === 401) {
-    $('auth').hidden = false;
-    $('connection').textContent = 'Authentication required';
-    throw new Error('Authentication required');
+    const methods = (response.headers.get('x-modelkeep-auth-methods') || '').split(',');
+    const bearerAvailable = methods.includes('bearer');
+    $('auth').hidden = !bearerAvailable;
+    $('connection').textContent = bearerAvailable ? 'Authentication required' : 'Tailscale authorization required';
+    if (token) { token = ''; sessionStorage.removeItem('modelkeep-admin-token'); }
+    throw new Error(bearerAvailable ? 'Authentication required' : 'Tailscale authorization required');
   }
   const value = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(value.error || `Request failed (${response.status})`);
@@ -166,16 +170,33 @@ function renderJobs(page) {
     const row = node('article', 'job'); const top = node('div', 'job-top');
     top.append(node('strong', '', job.kind), node('span', `badge ${job.state}`, job.state)); row.append(top);
     row.append(node('p', 'job-target', job.repo_id ? `${job.repo_id}@${job.revision}` : 'entire archive'));
-    const progress = job.total_bytes == null ? `${job.phase} · total unknown` : `${bytes(job.progress_bytes || 0)} / ${bytes(job.total_bytes)}`;
-    row.append(node('small', '', progress)); if (job.message) row.append(node('p', 'error', `${job.error_class}: ${job.message}`)); return row;
+    if (job.principal) row.append(node('small', '', `Started by ${job.principal.login || job.principal.auth_method}`));
+    const parts = [job.phase];
+    if (job.total_bytes == null) parts.push(`${bytes(job.progress_bytes)} · total unknown`); else parts.push(`${bytes(job.progress_bytes || 0)} / ${bytes(job.total_bytes)}`);
+    if (job.progress_files != null) parts.push(job.total_files == null ? `${job.progress_files} files` : `${job.progress_files} / ${job.total_files} files`);
+    if (job.progress_bytes != null) {
+      const now = Date.now() / 1000; const previous = progressSamples.get(job.id);
+      if (previous && job.progress_bytes >= previous.bytes && now > previous.at) parts.push(`${bytes((job.progress_bytes - previous.bytes) / (now - previous.at))}/s`);
+      progressSamples.set(job.id, {bytes: job.progress_bytes, at: now});
+    }
+    if (job.last_progress_at) {
+      const idle = Math.max(0, Math.floor(Date.now() / 1000) - job.last_progress_at); parts.push(`${idle}s since progress`);
+      if (job.state === 'running' && idle >= 120) row.classList.add('stalled');
+    }
+    row.append(node('small', '', parts.join(' · ')));
+    if (job.total_bytes > 0) { const bar = node('progress', 'job-progress'); bar.max = job.total_bytes; bar.value = Math.min(job.progress_bytes || 0, job.total_bytes); row.append(bar); }
+    else if (job.state === 'running') { row.append(node('progress', 'job-progress')); }
+    if (job.message) row.append(node('p', 'error', `${job.error_class}: ${job.message}`)); return row;
   }));
 }
 
 async function load() {
   try {
     const [status, repositories, jobs] = await Promise.all([api('/api/admin/v1/status'), api('/api/admin/v1/repositories?limit=50'), api('/api/admin/v1/jobs?limit=50')]);
-    renderOverview(status); renderRepositories(repositories); renderJobs(jobs); $('connection').textContent = `Connected · v${status.version}`;
-  } catch (error) { if (error.message !== 'Authentication required') $('connection').textContent = error.message; }
+    renderOverview(status); renderRepositories(repositories); renderJobs(jobs);
+    const identity = status.principal.name || status.principal.login || status.principal.auth_method;
+    $('connection').textContent = `Connected as ${identity} · v${status.version}`;
+  } catch (error) { if (!error.message.includes('authorization required') && error.message !== 'Authentication required') $('connection').textContent = error.message; }
 }
 
 $('auth-form').addEventListener('submit', (event) => { event.preventDefault(); token = $('token').value; sessionStorage.setItem('modelkeep-admin-token', token); load(); });
@@ -209,5 +230,8 @@ mod tests {
             .contains("frame-ancestors 'none'"));
         assert!(!SCRIPT.contains("localStorage"));
         assert!(SCRIPT.contains("X-ModelKeep-CSRF"));
+        assert!(INDEX.contains("class=\"panel authentication\" hidden"));
+        assert!(SCRIPT.contains("x-modelkeep-auth-methods"));
+        assert!(SCRIPT.contains("Connected as"));
     }
 }
