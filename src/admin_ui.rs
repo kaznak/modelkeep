@@ -168,6 +168,7 @@ function renderJobs(page) {
   if (!page.items.length) { $('jobs').replaceChildren(node('p', 'empty', 'No management jobs yet.')); return; }
   $('jobs').replaceChildren(...page.items.map((job) => {
     const row = node('article', 'job'); const top = node('div', 'job-top');
+    const active = job.state === 'queued' || job.state === 'running';
     top.append(node('strong', '', job.kind), node('span', `badge ${job.state}`, job.state)); row.append(top);
     row.append(node('p', 'job-target', job.repo_id ? `${job.repo_id}@${job.revision}` : 'entire archive'));
     if (job.principal) row.append(node('small', '', `Started by ${job.principal.login || job.principal.auth_method}`));
@@ -184,8 +185,8 @@ function renderJobs(page) {
       if (job.state === 'running' && idle >= 120) row.classList.add('stalled');
     }
     row.append(node('small', '', parts.join(' · ')));
-    if (job.total_bytes > 0) { const bar = node('progress', 'job-progress'); bar.max = job.total_bytes; bar.value = Math.min(job.progress_bytes || 0, job.total_bytes); row.append(bar); }
-    else if (job.state === 'running') { row.append(node('progress', 'job-progress')); }
+    if (active && job.total_bytes > 0) { const bar = node('progress', 'job-progress'); bar.max = job.total_bytes; bar.value = Math.min(job.progress_bytes || 0, job.total_bytes); row.append(bar); }
+    else if (active) { row.append(node('progress', 'job-progress')); }
     if (job.message) row.append(node('p', 'error', `${job.error_class}: ${job.message}`)); return row;
   }));
 }
@@ -233,6 +234,8 @@ mod tests {
         assert!(INDEX.contains("class=\"panel authentication\" hidden"));
         assert!(SCRIPT.contains("x-modelkeep-auth-methods"));
         assert!(SCRIPT.contains("Connected as"));
+        assert!(SCRIPT.contains("const active = job.state === 'queued' || job.state === 'running'"));
+        assert!(SCRIPT.contains("if (active && job.total_bytes > 0)"));
         assert!(SCRIPT.contains("const job = await api('/api/admin/v1/jobs'"));
         assert!(SCRIPT.contains("$('repo-id').value = ''; $('form-message').textContent"));
     }
