@@ -526,6 +526,7 @@ fetcher を将来 Rust native 化できれば closure を縮小する。
 Compose の基本方針:
 
 ```yaml
+# compose.init.yaml: 新規archive shareごとに一度だけ別Applicationとして実行
 services:
   modelkeep-init:
     container_name: modelkeep-init
@@ -536,17 +537,17 @@ services:
       - /share/Services/modelkeep:/data
     cap_drop: [ALL]
     cap_add: [CHOWN]
+```
 
+```yaml
+# compose.yaml: 通常運用Application
+services:
   modelkeep:
     container_name: modelkeep
     image: ghcr.io/kaznak/modelkeep:<version>
     restart: unless-stopped
     read_only: true
     user: "10001:10001"
-    depends_on:
-      modelkeep-init:
-        condition: service_completed_successfully
-
     ports:
       - "127.0.0.1:8090:8090"
 

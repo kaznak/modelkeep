@@ -1,25 +1,11 @@
+# Before first use with a new archive share, run compose.init.yaml as a separate
+# one-shot QNAP Application and remove it after exit code 0.
 # Ready to use on QNAP after changing the archive share below when necessary.
 # Tailscale runs on the QNAP host, not in this container. After startup, run:
 #   tailscale serve --service=svc:modelkeep --bg http://127.0.0.1:8090
 #   tailscale serve --service=svc:modelkeep-admin --accept-app-caps=io.modelkeep/cap/admin --bg http://127.0.0.1:8091
 #   tailscale serve status
 services:
-  modelkeep-init:
-    container_name: modelkeep-init
-    image: ghcr.io/kaznak/modelkeep:v0.4.0
-    restart: "no"
-    read_only: true
-    user: "0:0"
-    entrypoint: ["/bin/modelkeep", "init-ownership", "/data"]
-    volumes:
-      - /share/Services/modelkeep:/data
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-    security_opt:
-      - no-new-privileges:true
-
   modelkeep:
     container_name: modelkeep
     # Keep this literal for QNAP Container Station, which does not expand Compose
@@ -28,9 +14,6 @@ services:
     restart: unless-stopped
     read_only: true
     user: "10001:10001"
-    depends_on:
-      modelkeep-init:
-        condition: service_completed_successfully
     ports:
       # Tailscale Serve runs on the QNAP host and is the only supported ingress.
       # Do not change this to 8090:8090: that would also expose ModelKeep on the LAN.

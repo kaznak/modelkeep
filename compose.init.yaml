@@ -1,0 +1,18 @@
+# Run this once as a separate QNAP Container Station Application before
+# deploying compose.yaml. Remove the initialization Application after it exits 0.
+services:
+  modelkeep-init:
+    container_name: modelkeep-init
+    image: ghcr.io/kaznak/modelkeep:v0.4.0
+    restart: "no"
+    read_only: true
+    user: "0:0"
+    entrypoint: ["/bin/modelkeep", "init-ownership", "/data"]
+    volumes:
+      - /share/Services/modelkeep:/data
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+    security_opt:
+      - no-new-privileges:true

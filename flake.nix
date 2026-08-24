@@ -207,19 +207,27 @@
             test "$(yq -r '.services.modelkeep.environment.MODELKEEP_ADMIN_ADDRESS' ${./compose.yaml})" = "0.0.0.0:8091"
             test "$(yq -r '.services.modelkeep.environment.MODELKEEP_TRUST_TAILSCALE_HEADERS' ${./compose.yaml})" = "true"
             image="$(yq -r '.services.modelkeep.image' ${./compose.yaml})"
-            init_image="$(yq -r '.services."modelkeep-init".image' ${./compose.yaml})"
+            init_image="$(yq -r '.services."modelkeep-init".image' ${./compose.init.yaml})"
             test "$image" = "ghcr.io/kaznak/modelkeep:v0.4.0"
             test "$init_image" = "$image"
-            test "$(yq -r '.services."modelkeep-init".container_name' ${./compose.yaml})" = "modelkeep-init"
+            test "$(yq -r '.services | keys | join(" ")' ${./compose.yaml})" = "modelkeep"
+            test "$(yq -r '.services | keys | join(" ")' ${./compose.init.yaml})" = "modelkeep-init"
+            test "$(yq -r '.services."modelkeep-init".container_name' ${./compose.init.yaml})" = "modelkeep-init"
             test "$(yq -r '.services.modelkeep.container_name' ${./compose.yaml})" = "modelkeep"
-            test "$(yq -r '.services."modelkeep-init".user' ${./compose.yaml})" = "0:0"
-            test "$(yq -r '.services."modelkeep-init".entrypoint | join(" ")' ${./compose.yaml})" = "/bin/modelkeep init-ownership /data"
-            test "$(yq -r '.services."modelkeep-init".cap_add[0]' ${./compose.yaml})" = "CHOWN"
-            test "$(yq -r '.services.modelkeep.depends_on."modelkeep-init".condition' ${./compose.yaml})" = "service_completed_successfully"
-            test "$(yq -r '.services."modelkeep-init".volumes[0]' ${./compose.yaml})" = "/share/Services/modelkeep:/data"
+            test "$(yq -r '.services."modelkeep-init".user' ${./compose.init.yaml})" = "0:0"
+            test "$(yq -r '.services."modelkeep-init".entrypoint | join(" ")' ${./compose.init.yaml})" = "/bin/modelkeep init-ownership /data"
+            test "$(yq -r '.services."modelkeep-init".read_only' ${./compose.init.yaml})" = "true"
+            test "$(yq -r '.services."modelkeep-init".cap_drop[0]' ${./compose.init.yaml})" = "ALL"
+            test "$(yq -r '.services."modelkeep-init".cap_add[0]' ${./compose.init.yaml})" = "CHOWN"
+            test "$(yq -r '.services."modelkeep-init".ports // "none"' ${./compose.init.yaml})" = "none"
+            test "$(yq -r '.services."modelkeep-init".volumes[0]' ${./compose.init.yaml})" = "/share/Services/modelkeep:/data"
             test "$(yq -r '.services.modelkeep.volumes[0]' ${./compose.yaml})" = "/share/Services/modelkeep:/data"
-            if rg --fixed-strings '$' ${./compose.yaml}; then
-              echo "compose.yaml must not require variable interpolation" >&2
+            test "$(yq -r '.services.modelkeep.user' ${./compose.yaml})" = "10001:10001"
+            test "$(yq -r '.services.modelkeep.read_only' ${./compose.yaml})" = "true"
+            test "$(yq -r '.services.modelkeep.cap_drop[0]' ${./compose.yaml})" = "ALL"
+            test "$(yq -r '.services.modelkeep.cap_add // "none"' ${./compose.yaml})" = "none"
+            if rg --fixed-strings '$' ${./compose.yaml} ${./compose.init.yaml}; then
+              echo "Compose files must not require variable interpolation" >&2
               exit 1
             fi
             touch $out

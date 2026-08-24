@@ -44,7 +44,9 @@ ref or file can trigger an upstream fetch when the official fetch helper is conf
 
 ## QNAP deployment
 
-[`compose.yaml`](compose.yaml) contains the Container Station deployment definition.
+[`compose.init.yaml`](compose.init.yaml) contains the one-time archive permission
+initializer and [`compose.yaml`](compose.yaml) contains the normal Container Station
+service definition.
 The GitHub Actions workflow builds both architectures from the Nix flake and publishes
 a multi-architecture image to GHCR when a `v*` tag is pushed:
 
@@ -56,6 +58,9 @@ git push origin v0.4.0
 On QNAP:
 
 ```sh
+# Run once for a new archive share, then remove this Compose Application.
+docker compose -f compose.init.yaml up
+
 docker compose pull
 docker compose up -d
 curl --fail http://127.0.0.1:8090/healthz
@@ -70,9 +75,12 @@ tailscale serve status
 normal deployment needs neither image environment variables nor a GHCR login. QNAP
 Container Station does not expand Compose default-value expressions when creating an
 Application, so edit the literal `image:` value for a mirror or another release.
-Change `/share/Services/modelkeep` in `compose.yaml` if the QNAP archive share uses another
-path. A short-lived `modelkeep-init` sets the mount-root owner to `10001:10001`, so a
-new directory needs no SSH permission setup. The application container runs as
+Change `/share/Services/modelkeep` in both Compose files if the QNAP archive share
+uses another path. Run `compose.init.yaml` as a separate, temporary Container Station
+Application for each new archive directory; a short-lived `modelkeep-init` sets the
+mount-root owner to `10001:10001`, so no SSH permission setup is needed. Remove that
+Application after it exits successfully, then deploy `compose.yaml`. The normal
+Application contains only the ModelKeep container, which runs as
 UID/GID `10001:10001`, uses a read-only root filesystem,
 drops Linux capabilities, writes durable state only under `/data`, and publishes its
 HTTP port only on QNAP host loopback. Configure the host's official Tailscale app to

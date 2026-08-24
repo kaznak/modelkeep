@@ -1,6 +1,6 @@
 # ADR-0014: Bootstrap QNAP bind-mount ownership with a constrained init service
 
-- Status: Accepted
+- Status: Superseded by ADR-0016
 - Date: 2026-08-21
 
 ## Context

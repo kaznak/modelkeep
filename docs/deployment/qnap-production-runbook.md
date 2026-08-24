@@ -28,23 +28,24 @@ does not certify unrecorded QNAP firmware, ACL, snapshot, or filesystem behavior
 ## First deployment
 
 1. Apply [qnap-permissions.md](qnap-permissions.md).
-2. Use the Compose image `ghcr.io/kaznak/modelkeep:v0.4.0`, or edit the literal
-   `image:` field to a different released or `sha-...` image tag, and record
-   `docker image inspect` output. Do not use Compose variable-default expressions in
-   a QNAP Container Station Application.
-3. Run `docker compose config`; confirm both services mount only
-   `/share/Services/modelkeep` at `/data`.
-4. Run `docker compose up -d`; confirm the `modelkeep-init` container stops with exit
-   code zero and the `modelkeep` container becomes healthy. A stopped initializer is
-   the expected steady state, not a service failure. Container Station may summarize
-   the Compose Application as "Other" because it includes this completed service;
-   use the two per-container states to distinguish success from failure.
+2. Use the same literal image and archive path in `compose.init.yaml` and
+   `compose.yaml`. The default image is `ghcr.io/kaznak/modelkeep:v0.4.0`; edit both
+   files together for a different released or `sha-...` tag and record `docker image
+   inspect` output. Do not use Compose variable-default expressions in a QNAP
+   Container Station Application.
+3. Create a temporary Container Station Application from `compose.init.yaml`. Start
+   it and confirm `modelkeep-init` exits with code zero and logs
+   `ownership_initialization_completed`. Do not continue after a non-zero exit.
+4. Remove the completed initialization Application. Then create the normal
+   Application from `compose.yaml`, start it, and confirm its sole `modelkeep`
+   container becomes healthy.
 5. Configure Tailscale Serve as described in
    [qnap-tailscale-serve.md](qnap-tailscale-serve.md). Confirm loopback HTTP and
    tailnet HTTPS work, and direct LAN port 8090 does not.
-6. Check `docker compose ps`, readiness, and structured logs. At the default
-   `RUST_LOG=info`, expect ownership initialization, startup, archive recovery, and
-   `server_ready` events. Successful health probes are intentionally quiet.
+6. Check `docker compose ps`, readiness, and structured logs. The initialization
+   Application logs the ownership event; at the normal service's default
+   `RUST_LOG=info`, expect startup, archive recovery, and `server_ready` events.
+   Successful health probes are intentionally quiet.
 7. Import a small model, verify it, and complete the restore drill below.
 
 Keep `HF_TOKEN` in the deployment environment or QNAP secret facility, never in
@@ -56,16 +57,17 @@ debug events. Restore `RUST_LOG=info` afterward to avoid a log entry for every
 healthcheck. A failed readiness check remains visible as a warning at the default
 level. Invalid `RUST_LOG` syntax is reported and falls back to `info`.
 
-The Compose file fixes the container names to `modelkeep` and `modelkeep-init` so
-they remain concise in Container Station. Those names permit one supported
-ModelKeep deployment per Docker host. To run a second independent deployment, first
-choose distinct `container_name` values, ports, and archive shares.
+The two Compose files fix their container names to `modelkeep-init` and `modelkeep`.
+The temporary initialization Application is removed before normal operation, leaving
+only `modelkeep` visible. Those names permit one supported ModelKeep deployment per
+Docker host. To run a second independent deployment, first choose distinct
+`container_name` values, ports, and archive shares in both files.
 
-When startup is ambiguous in the GUI, inspect the initializer's state and logs. Exit
-code `0` plus an `ownership_initialization_completed` event means initialization
-succeeded. A non-zero exit code or `ownership_initialization_failed` event indicates
-a mount or ACL problem. Do not keep the initializer running: it intentionally exits
-so the root identity and `CHOWN` capability are absent from the long-running service.
+The initialization Application is intentionally one-shot. Exit code `0` plus an
+`ownership_initialization_completed` event means it can be removed. A non-zero exit
+or `ownership_initialization_failed` event indicates a mount or ACL problem. It is
+not rerun for an ordinary image upgrade that reuses the same archive, but it must be
+run before ModelKeep uses a newly created or restored archive directory.
 
 ## Backup and restore drill
 

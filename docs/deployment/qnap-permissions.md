@@ -4,20 +4,23 @@ The Compose deployment runs ModelKeep as UID/GID `10001:10001` and mounts the du
 
 ## GUI-first setup
 
-Paste `compose.yaml` into a QNAP Container Station Application and start it. The
-short-lived `modelkeep-init` service changes ownership of the mounted
-`/share/Services/modelkeep` directory itself to `10001:10001`, then exits. Container
-Station starts the non-root ModelKeep service only after that succeeds. The expected
-steady state is the `modelkeep-init` container stopped with exit code zero and the
-`modelkeep` container running and healthy. Container Station may label the overall
-Application "Other" because the initializer has completed. No SSH setup is required
-for a new empty directory.
+For a new archive directory, paste `compose.init.yaml` into a temporary QNAP
+Container Station Application and start it. The sole `modelkeep-init` service changes
+ownership of the mounted `/share/Services/modelkeep` directory itself to
+`10001:10001`, then exits. Confirm exit code zero and the
+`ownership_initialization_completed` log event, then remove this Application. No SSH
+setup is required for a new empty directory.
+
+Next, paste `compose.yaml` into the normal Container Station Application and start
+it. This Application contains only `modelkeep`, starts directly as non-root, and
+should remain running and healthy. Ordinary image upgrades that reuse the same
+archive do not require the initialization Application.
 
 The ownership change is deliberately non-recursive. If an existing archive already
-contains children with incompatible ownership, the init service fails to conceal
-that state; stop the Application and review it separately before changing durable
-data. Do not make the share world-writable and do not change the long-running service
-to root.
+contains children with incompatible ownership, the initializer fails to conceal that
+state; remove the temporary Application and review the archive separately before
+changing durable data. Do not make the share world-writable and do not change the
+long-running service to root.
 
 If a QNAP shared-folder ACL prevents even the init service from accessing the bind
 mount, use the QNAP shared-folder permission GUI to grant the Application's storage
@@ -27,17 +30,20 @@ The archive directory must be writable for `models/`, `tmp/`, revision publicati
 
 ## Preflight
 
-Using the public image already pinned by `compose.yaml` (or after editing its literal
-image value when necessary), run the same image and volume configuration used for
-deployment before starting a large import or fetch:
+Use the same public image and volume path in `compose.init.yaml` and `compose.yaml`.
+If either literal value is edited, edit it in both files before starting a large
+import or fetch.
 
-In Container Station, confirm `modelkeep-init` completed successfully and `modelkeep`
-is healthy. From the QNAP host UI terminal or another supported command facility, the
-equivalent checks are:
+In Container Station, first confirm the temporary `modelkeep-init` Application
+completed successfully. Remove it, start the normal Application, and confirm
+`modelkeep` is healthy. From the QNAP host UI terminal or another supported command
+facility, the equivalent sequence is:
 
 ```sh
-docker compose ps -a
+docker compose -f compose.init.yaml up
 docker inspect modelkeep-init --format '{{.State.Status}} {{.State.ExitCode}}'
+docker compose -f compose.init.yaml down
+docker compose up -d
 curl --fail http://127.0.0.1:8090/readyz
 ```
 
@@ -52,9 +58,10 @@ volumes:
   - /share/Services/modelkeep:/data
 ```
 
-Only the completed init service uses `user: "0:0"` and `cap_add: [CHOWN]`; it has no
-ports and does not remain running.
+Only the separate initialization Application uses `user: "0:0"` and
+`cap_add: [CHOWN]`; it has no ports and is removed before the service Application is
+created.
 
 The fixed container names `modelkeep` and `modelkeep-init` are intended for one
-deployment per QNAP host. Rename them together with the port and archive share before
-creating any second independent deployment.
+deployment per QNAP host. Rename them in their respective files together with the
+port and archive share before creating any second independent deployment.
