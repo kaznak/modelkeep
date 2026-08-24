@@ -14,7 +14,10 @@ between phases as described below.
 ## Prerequisites
 
 - Clone the exact ModelKeep revision being accepted and install Nix on the client.
-- Deploy an immutable image tag and record its `sha256:` digest.
+- For a new archive share, complete and remove the one-shot `compose.init.yaml`
+  Application before deploying the normal `compose.yaml` Application.
+- Deploy the same immutable image tag in both Compose files and record its `sha256:`
+  digest.
 - Configure and approve the download and administration Tailscale Services.
 - Choose a small public model and an immutable 40-character commit that is not yet
   in ModelKeep. Do not use a mutable ref such as `main`.

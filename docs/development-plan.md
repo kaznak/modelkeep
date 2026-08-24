@@ -564,6 +564,10 @@ services:
       - no-new-privileges:true
 ```
 
+新規archive shareでは初期化用Applicationの終了コード`0`を確認して削除した後、
+通常運用Applicationを作成する。同じarchiveを使う通常のimage更新では初期化を
+再実行しない。
+
 要件:
 
 - non-root

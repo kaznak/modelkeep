@@ -71,8 +71,8 @@ tailscale serve --service=svc:modelkeep-admin --accept-app-caps=io.modelkeep/cap
 tailscale serve status
 ```
 
-`compose.yaml` defaults to the public `ghcr.io/kaznak/modelkeep:v0.4.0` image, so the
-normal deployment needs neither image environment variables nor a GHCR login. QNAP
+Both Compose files default to the public `ghcr.io/kaznak/modelkeep:v0.4.0` image, so
+the deployment needs neither image environment variables nor a GHCR login. QNAP
 Container Station does not expand Compose default-value expressions when creating an
 Application, so edit the literal `image:` value for a mirror or another release.
 Change `/share/Services/modelkeep` in both Compose files if the QNAP archive share

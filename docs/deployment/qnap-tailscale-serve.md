@@ -133,8 +133,11 @@ tailnet policy rather than replacing it.
 ## 3. Start ModelKeep
 
 The Compose mappings are deliberately bound to loopback. Port 8090 is the download
-endpoint and port 8091 is the authenticated management API/UI. Start ModelKeep and
-check both local backends before configuring ingress:
+endpoint and port 8091 is the authenticated management API/UI. For a new archive
+share, first run `compose.init.yaml` as the separate one-shot Container Station
+Application, confirm exit code zero, and remove that Application as described in
+[QNAP archive permissions](qnap-permissions.md). Then deploy the normal
+`compose.yaml` Application and check both local backends before configuring ingress:
 
 ```sh
 docker compose up -d
