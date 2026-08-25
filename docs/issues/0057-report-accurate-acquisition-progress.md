@@ -40,6 +40,9 @@ and atomic publication can also take material time for a large revision. The job
 currently provides insufficient phase detail to distinguish that work from a stalled
 download. Although job records expose creation and update timestamps, the UI does not
 show when execution actually began or how long the acquisition has been running.
+File progress is also often absent while an Xet-backed acquisition is active and
+appears only after download completion, because the current helper reports file
+counts only when the underlying client happens to emit a non-byte `tqdm` event.
 
 ## Scope
 
@@ -48,6 +51,9 @@ show when execution actually began or how long the acquisition has been running.
   transfer progress.
 - Aggregate parallel file/shard progress without double counting, regressing, or
   treating the largest individual progress bar as the revision total.
+- Determine the number of archive-eligible files for the pinned revision before
+  payload transfer where supported, and report completed-file progress independently
+  of byte progress throughout the download.
 - Report total bytes only when the value has revision-level meaning. Display an
   explicitly unknown total instead of manufacturing a percentage when the supported
   client or transport cannot provide one reliably.
@@ -74,6 +80,10 @@ show when execution actually began or how long the acquisition has been running.
   completion.
 - Transfer rate is calculated from revision-level byte deltas only; liveness remains
   visible when a valid event contains no increase in cumulative bytes.
+- Active acquisitions display `n / m files` from the time the target file set is
+  known. A file counts as complete only once its materialized output is complete; a
+  retry, reset progress bar, or concurrent worker must not count it twice. Helper
+  metadata under `.cache` is not included in either number.
 - The API distinguishes job creation time from execution start time. The UI displays
   an unambiguous start date/time in the browser's local timezone and a live elapsed
   duration for running jobs; completed, failed, and cancelled jobs retain their
@@ -97,6 +107,7 @@ nix flake check
 
 Add helper contract and management API/UI tests for sequential files, parallel files,
 late or missing totals, repeated/reset per-file counters, liveness-only events,
+file completion before terminal download return, helper-metadata exclusion,
 creation-versus-start timing, elapsed-time rendering, and post-download phases. Run
 the supported real Hugging Face client integration suite.
 Before closing the issue, record one QNAP prefetch of a representative multi-shard
