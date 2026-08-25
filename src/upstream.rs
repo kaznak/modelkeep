@@ -23,10 +23,27 @@ pub struct FetchedRevision {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct FetchProgress {
+    #[serde(default)]
+    pub version: u32,
     pub phase: String,
-    pub unit: String,
-    pub completed: u64,
+    #[serde(default)]
+    pub unit: Option<String>,
+    #[serde(default)]
+    pub completed: Option<u64>,
+    #[serde(default)]
     pub total: Option<u64>,
+}
+
+impl FetchProgress {
+    pub fn phase(phase: &str) -> Self {
+        Self {
+            version: 1,
+            phase: phase.into(),
+            unit: None,
+            completed: None,
+            total: None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -104,9 +121,14 @@ impl UpstreamFetcher for OfficialHfFetcher {
             let value: serde_json::Value =
                 serde_json::from_str(&line).map_err(|_| UpstreamError::InvalidOutput)?;
             match value.get("type").and_then(|value| value.as_str()) {
-                Some("progress") => progress(
-                    serde_json::from_value(value).map_err(|_| UpstreamError::InvalidOutput)?,
-                ),
+                Some("progress") => {
+                    let event: FetchProgress =
+                        serde_json::from_value(value).map_err(|_| UpstreamError::InvalidOutput)?;
+                    if event.version > 1 {
+                        return Err(UpstreamError::InvalidOutput);
+                    }
+                    progress(event);
+                }
                 Some("result") | None => {
                     result = Some(
                         serde_json::from_value(value).map_err(|_| UpstreamError::InvalidOutput)?,
@@ -168,11 +190,20 @@ mod tests {
     #[test]
     fn helper_progress_contract_is_deserialized() {
         let event: FetchProgress = serde_json::from_str(
-            r#"{"type":"progress","phase":"downloading","unit":"bytes","completed":4,"total":10}"#,
+            r#"{"type":"progress","version":1,"phase":"downloading","unit":"bytes","completed":4,"total":10}"#,
         )
         .unwrap();
-        assert_eq!(event.completed, 4);
         assert_eq!(event.total, Some(10));
-        assert_eq!(event.unit, "bytes");
+        assert_eq!(event.completed, Some(4));
+        assert_eq!(event.unit.as_deref(), Some("bytes"));
+    }
+
+    #[test]
+    fn helper_phase_contract_allows_progress_without_a_counter() {
+        let event: FetchProgress = serde_json::from_str(
+            r#"{"type":"progress","version":1,"phase":"inventorying_snapshot"}"#,
+        )
+        .unwrap();
+        assert_eq!(event, FetchProgress::phase("inventorying_snapshot"));
     }
 }

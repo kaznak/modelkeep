@@ -2,6 +2,7 @@
 """Official huggingface_hub based upstream acquisition helper for ModelKeep."""
 
 import argparse
+import fnmatch
 import json
 import re
 import sys
@@ -22,22 +23,81 @@ class ProgressReporter:
         self.stream = stream or sys.stdout
         self.minimum_interval = minimum_interval
         self.lock = threading.Lock()
-        self.last_emit = 0.0
+        self.last_emit = {}
+        self.output = None
+        self.expected = {}
+        self.completed_files = -1
+        self.completed_bytes = -1
+        self.download_finalized = False
 
     def emit(self, event, force=False):
         now = time.monotonic()
+        key = (event["phase"], event.get("unit"))
         with self.lock:
-            if not force and now - self.last_emit < self.minimum_interval:
+            if not force and now - self.last_emit.get(key, 0.0) < self.minimum_interval:
                 return
-            self.last_emit = now
-            print(json.dumps({"type": "progress", **event}, separators=(",", ":")), file=self.stream, flush=True)
+            self.last_emit[key] = now
+            print(json.dumps({"type": "progress", "version": 1, **event}, separators=(",", ":")), file=self.stream, flush=True)
+
+    def phase(self, phase):
+        self.emit({"phase": phase}, force=True)
+
+    def set_expected(self, output, expected):
+        self.output = Path(output)
+        self.expected = {path: size for path, size in expected}
+        if not self.expected:
+            self.phase("downloading")
+            return
+        total = sum(self.expected.values()) if all(size is not None for size in self.expected.values()) else None
+        byte_event = {"phase": "downloading", "unit": "bytes", "completed": 0}
+        if total is not None:
+            byte_event["total"] = total
+        self.emit(byte_event, force=True)
+        self._report_files(force=True)
+
+    def _report_files(self, force=False, finalized=False):
+        if self.output is None or self.download_finalized:
+            return
+        completed = 0
+        completed_bytes = 0
+        for relative, size in self.expected.items():
+            path = self.output / relative
+            try:
+                metadata = path.stat()
+            except OSError:
+                continue
+            if path.is_file() and ((size is not None and metadata.st_size == size) or (size is None and finalized)):
+                completed += 1
+                completed_bytes += metadata.st_size
+        changed = completed != self.completed_files
+        bytes_changed = completed_bytes != self.completed_bytes
+        self.completed_files = completed
+        self.completed_bytes = completed_bytes
+        byte_event = {
+            "phase": "downloading",
+            "unit": "bytes",
+            "completed": completed_bytes,
+        }
+        if self.expected and all(size is not None for size in self.expected.values()):
+            byte_event["total"] = sum(self.expected.values())
+        self.emit(byte_event, force=force or bytes_changed)
+        self.emit(
+            {
+                "phase": "downloading",
+                "unit": "files",
+                "completed": completed,
+                "total": len(self.expected),
+            },
+            force=force or changed,
+        )
+        if finalized:
+            self.download_finalized = True
 
     def tqdm_class(self):
         reporter = self
 
         class ReportingTqdm(tqdm):
             def __init__(self, *args, **kwargs):
-                self._modelkeep_unit = kwargs.get("unit", "")
                 super().__init__(*args, **kwargs)
                 self._report()
 
@@ -54,14 +114,7 @@ class ProgressReporter:
                 super().close()
 
             def _report(self, force=False):
-                event = {
-                    "phase": "downloading",
-                    "unit": "bytes" if self._modelkeep_unit == "B" else "files",
-                    "completed": int(self.n),
-                }
-                if self.total is not None:
-                    event["total"] = int(self.total)
-                reporter.emit(event, force=force)
+                reporter._report_files()
 
         return ReportingTqdm
 
@@ -80,16 +133,39 @@ def safe_relative_files(root: Path):
     return sorted(result)
 
 
+def expected_files(info, patterns=None):
+    result = []
+    for sibling in getattr(info, "siblings", None) or []:
+        path = getattr(sibling, "rfilename", None)
+        if not isinstance(path, str) or not path or ".cache" in Path(path).parts:
+            continue
+        if patterns and not any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns):
+            continue
+        size = getattr(sibling, "size", None)
+        result.append((path, size if isinstance(size, int) and size >= 0 else None))
+    return sorted(result)
+
+
 def acquire(repo_id, requested_revision, output, files=None, api=None, download=None, progress=None):
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     api = api or HfApi()
     download = download or snapshot_download
 
-    info = api.repo_info(repo_id, revision=requested_revision, repo_type="model")
+    if progress is not None:
+        progress.phase("resolving_revision")
+    info = api.repo_info(
+        repo_id,
+        revision=requested_revision,
+        repo_type="model",
+        files_metadata=True,
+    )
     commit = info.sha
     if not isinstance(commit, str) or not COMMIT_PATTERN.fullmatch(commit):
         raise ValueError("upstream returned malformed commit identity")
+    expected = expected_files(info, files)
+    if progress is not None:
+        progress.set_expected(output, expected)
 
     download_kwargs = dict(
         repo_id=repo_id,
@@ -105,6 +181,11 @@ def acquire(repo_id, requested_revision, output, files=None, api=None, download=
     if files:
         requested = set(files)
         archived_files = [path for path in archived_files if path in requested]
+    if progress is not None:
+        if not expected:
+            progress.set_expected(output, [(path, None) for path in archived_files])
+        progress._report_files(force=True, finalized=True)
+        progress.phase("inventorying_snapshot")
     return {"commit": commit, "files": archived_files}
 
 

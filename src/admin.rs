@@ -167,6 +167,10 @@ struct Job {
     #[serde(default)]
     last_progress_at: Option<u64>,
     #[serde(default)]
+    started_at: Option<u64>,
+    #[serde(default)]
+    finished_at: Option<u64>,
+    #[serde(default)]
     principal: Option<PrincipalView>,
     error_class: Option<String>,
     message: Option<String>,
@@ -191,6 +195,8 @@ struct JobView {
     progress_files: Option<u64>,
     total_files: Option<u64>,
     last_progress_at: Option<u64>,
+    started_at: Option<u64>,
+    finished_at: Option<u64>,
     principal: Option<PrincipalView>,
     error_class: Option<String>,
     message: Option<String>,
@@ -213,6 +219,8 @@ impl From<Job> for JobView {
             progress_files: job.progress_files,
             total_files: job.total_files,
             last_progress_at: job.last_progress_at,
+            started_at: job.started_at,
+            finished_at: job.finished_at,
             principal: job.principal,
             error_class: job.error_class,
             message: job.message,
@@ -269,7 +277,9 @@ impl JobManager {
                 job.phase = "interrupted".into();
                 job.error_class = Some("interrupted".into());
                 job.message = Some("job interrupted by process restart".into());
-                job.updated_at = unix_timestamp();
+                let now = unix_timestamp();
+                job.finished_at = Some(now);
+                job.updated_at = now;
                 manager.persist(&job)?;
             }
             manager
@@ -347,6 +357,8 @@ impl JobManager {
                 progress_files: None,
                 total_files: None,
                 last_progress_at: None,
+                started_at: None,
+                finished_at: None,
                 principal: Some(principal.clone()),
                 error_class: None,
                 message: None,
@@ -378,6 +390,7 @@ impl JobManager {
                 return;
             }
             job.state = JobState::Running;
+            job.started_at = Some(unix_timestamp());
             job.phase = match job.kind {
                 JobKind::Prefetch | JobKind::Refresh => "acquiring_snapshot",
                 JobKind::Verify => "verifying_revision",
@@ -451,6 +464,7 @@ impl JobManager {
                     job.state = JobState::Completed;
                     job.phase = "completed".into();
                     job.resolved_commit = commit;
+                    job.finished_at = Some(unix_timestamp());
                 });
             }
             Err((class, message)) => {
@@ -459,6 +473,7 @@ impl JobManager {
                     job.phase = "failed".into();
                     job.error_class = Some(class.into());
                     job.message = Some(message);
+                    job.finished_at = Some(unix_timestamp());
                 });
             }
         }
@@ -472,7 +487,9 @@ impl JobManager {
         }
         job.state = JobState::Cancelled;
         job.phase = "cancelled".into();
-        job.updated_at = unix_timestamp();
+        let now = unix_timestamp();
+        job.finished_at = Some(now);
+        job.updated_at = now;
         let snapshot = job.clone();
         drop(jobs);
         self.persist(&snapshot).map_err(|_| "storage")?;
@@ -482,28 +499,26 @@ impl JobManager {
     fn record_progress(&self, id: &str, event: FetchProgress) {
         let snapshot = self.update(id, |job| {
             job.phase = event.phase.clone();
-            match event.unit.as_str() {
-                "bytes" => {
-                    job.progress_bytes = Some(event.completed.max(job.progress_bytes.unwrap_or(0)));
-                    if let Some(total) = event.total {
-                        job.total_bytes = Some(
-                            total
-                                .max(job.progress_bytes.unwrap_or(0))
-                                .max(job.total_bytes.unwrap_or(0)),
-                        );
+            match (event.unit.as_deref(), event.completed) {
+                (Some("bytes"), Some(completed)) => {
+                    if job.total_bytes.is_none() {
+                        job.total_bytes = event.total;
                     }
+                    let bounded = job
+                        .total_bytes
+                        .map_or(completed, |total| completed.min(total));
+                    job.progress_bytes = Some(bounded.max(job.progress_bytes.unwrap_or(0)));
                 }
-                "files" => {
-                    job.progress_files = Some(event.completed.max(job.progress_files.unwrap_or(0)));
-                    if let Some(total) = event.total {
-                        job.total_files = Some(
-                            total
-                                .max(job.progress_files.unwrap_or(0))
-                                .max(job.total_files.unwrap_or(0)),
-                        );
+                (Some("files"), Some(completed)) => {
+                    if job.total_files.is_none() {
+                        job.total_files = event.total;
                     }
+                    let bounded = job
+                        .total_files
+                        .map_or(completed, |total| completed.min(total));
+                    job.progress_files = Some(bounded.max(job.progress_files.unwrap_or(0)));
                 }
-                _ => return,
+                _ => {}
             }
             job.last_progress_at = Some(unix_timestamp());
         });
@@ -1125,6 +1140,8 @@ mod tests {
             progress_files: None,
             total_files: None,
             last_progress_at: None,
+            started_at: Some(created_at),
+            finished_at: Some(created_at),
             principal: None,
             error_class: None,
             message: None,
@@ -1133,6 +1150,67 @@ mod tests {
             created_at,
             updated_at: created_at,
         }
+    }
+
+    #[test]
+    fn revision_progress_keeps_initial_totals_and_accepts_phase_only_events() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        let manager = JobManager::open(&archive).unwrap();
+        let mut job = stored_job("progress-test", 1);
+        job.state = JobState::Running;
+        job.phase = "downloading".into();
+        job.progress_bytes = None;
+        job.total_bytes = None;
+        job.progress_files = None;
+        job.total_files = None;
+        job.finished_at = None;
+        manager
+            .inner
+            .jobs
+            .lock()
+            .unwrap()
+            .insert(job.id.clone(), job);
+
+        manager.record_progress(
+            "progress-test",
+            FetchProgress {
+                version: 1,
+                phase: "downloading".into(),
+                unit: Some("bytes".into()),
+                completed: Some(40),
+                total: Some(100),
+            },
+        );
+        manager.record_progress(
+            "progress-test",
+            FetchProgress {
+                version: 1,
+                phase: "downloading".into(),
+                unit: Some("bytes".into()),
+                completed: Some(75),
+                total: Some(200),
+            },
+        );
+        manager.record_progress(
+            "progress-test",
+            FetchProgress {
+                version: 1,
+                phase: "downloading".into(),
+                unit: Some("files".into()),
+                completed: Some(2),
+                total: Some(7),
+            },
+        );
+        manager.record_progress("progress-test", FetchProgress::phase("validating_revision"));
+
+        let job = manager.get("progress-test").unwrap();
+        assert_eq!(job.phase, "validating_revision");
+        assert_eq!(job.progress_bytes, Some(75));
+        assert_eq!(job.total_bytes, Some(100));
+        assert_eq!(job.progress_files, Some(2));
+        assert_eq!(job.total_files, Some(7));
+        assert!(job.last_progress_at.is_some());
     }
 
     fn prefetch_request() -> Request<Body> {
@@ -1422,6 +1500,9 @@ mod tests {
         }
         let completed = completed.expect("prefetch job did not complete");
         assert_eq!(completed["resolved_commit"], "c".repeat(40));
+        assert!(completed["started_at"].as_u64().is_some());
+        assert!(completed["finished_at"].as_u64().is_some());
+        assert!(completed["finished_at"].as_u64() >= completed["started_at"].as_u64());
         assert!(archive
             .is_complete_revision("org/model", &"c".repeat(40))
             .unwrap());
@@ -1445,6 +1526,8 @@ mod tests {
             progress_files: None,
             total_files: None,
             last_progress_at: None,
+            started_at: Some(1),
+            finished_at: None,
             principal: None,
             error_class: None,
             message: None,

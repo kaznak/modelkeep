@@ -651,6 +651,14 @@ impl Archive {
         &self,
         request: SourcePublishRequest,
     ) -> ArchiveResult<PathBuf> {
+        self.publish_revision_from_directory_with_progress(request, &|_| {})
+    }
+
+    pub fn publish_revision_from_directory_with_progress(
+        &self,
+        request: SourcePublishRequest,
+        progress: &(dyn Fn(&str) + Send + Sync),
+    ) -> ArchiveResult<PathBuf> {
         let (namespace, name) = validate_repo_id(&request.repo_id)?;
         validate_component(&request.requested_revision)?;
         validate_revision(&request.commit)?;
@@ -682,8 +690,9 @@ impl Archive {
         } else {
             self.create_staging("revision")?
         };
+        progress("validating_revision");
         let result = if reuse_staging {
-            Self::write_source_manifest(&staging, &source_root, &request)
+            Self::write_source_manifest(&staging, &source_root, &request, progress)
         } else {
             self.write_source_revision(&staging, &source_root, &request)
         };
@@ -691,6 +700,7 @@ impl Archive {
             let _ = fs::remove_dir_all(&staging);
             return Err(error);
         }
+        progress("publishing_revision");
         remove_staging_lease(&staging)?;
         if let Err(error) = fs::rename(&staging, &published) {
             let _ = fs::remove_dir_all(&staging);
@@ -773,6 +783,7 @@ impl Archive {
         staging: &Path,
         source_root: &Path,
         request: &SourcePublishRequest,
+        progress: &(dyn Fn(&str) + Send + Sync),
     ) -> ArchiveResult<()> {
         let mut entries = Vec::with_capacity(request.files.len());
         let mut archived_paths = BTreeSet::new();
@@ -820,6 +831,7 @@ impl Archive {
             &request.commit,
             &entries,
         )?;
+        progress("syncing_revision");
         file.sync_all()?;
         sync_directory(staging)?;
         Ok(())

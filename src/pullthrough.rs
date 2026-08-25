@@ -165,15 +165,16 @@ impl PullThrough {
                     source: staging.join(path),
                 })
                 .collect();
-            match self
-                .archive
-                .publish_revision_from_directory(crate::SourcePublishRequest {
+            match self.archive.publish_revision_from_directory_with_progress(
+                crate::SourcePublishRequest {
                     repo_id: repo_id.into(),
                     requested_revision: reference.into(),
                     commit: fetched.commit.clone(),
                     source_root: staging.clone(),
                     files,
-                }) {
+                },
+                &|phase| progress(FetchProgress::phase(phase)),
+            ) {
                 Ok(_) => {}
                 Err(ArchiveError::AlreadyPublished(_))
                     if self.revision_is_ready(repo_id, &fetched.commit, &[]) => {}
@@ -235,15 +236,16 @@ impl PullThrough {
                 source: fetched.staging.join(path),
             })
             .collect();
-        let publish = self
-            .archive
-            .publish_revision_from_directory(crate::SourcePublishRequest {
+        let publish = self.archive.publish_revision_from_directory_with_progress(
+            crate::SourcePublishRequest {
                 repo_id: repo_id.to_string(),
                 requested_revision: requested_revision.to_string(),
                 commit: fetched.commit.clone(),
                 source_root: fetched.staging.clone(),
                 files: source_files,
-            });
+            },
+            &|phase| progress(FetchProgress::phase(phase)),
+        );
         let _ = std::fs::remove_dir_all(&staging);
         match publish {
             Ok(_) => {}

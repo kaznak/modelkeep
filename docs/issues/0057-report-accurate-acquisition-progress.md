@@ -1,5 +1,5 @@
 ---
-status: open
+status: in_progress
 priority: P1
 related_adrs:
   - ADR-0005
@@ -9,7 +9,7 @@ updated: 2026-08-25
 ---
 # Issue 0057: Report accurate revision-level acquisition progress
 
-- Status: Open
+- Status: In Progress
 - Priority: P1
 - Related ADR: ADR-0005, ADR-0015
 
@@ -122,3 +122,20 @@ own stable aggregation identifiers rather than undocumented `tqdm` construction
 details. Pre-enumerating file sizes may add an upstream metadata request or latency;
 if a reliable total cannot be obtained without weakening compatibility, truthful
 unknown-total progress is acceptable.
+
+## Implementation status
+
+Implemented locally on 2026-08-25:
+
+- versioned revision-level progress events based on pinned repository file metadata;
+- monotonic completed bytes derived from completely materialized files rather than
+  unscoped transport progress bars;
+- active `n / m files` reporting excluding helper `.cache` metadata;
+- persisted execution start/finish timestamps and UI start/elapsed display;
+- resolving, downloading, inventory, validation, sync, and publication phases;
+- fixture, management API/UI, real Hugging Face metadata, and small public repository
+  observations.
+
+The QNAP multi-shard acceptance observation remains before closure. Do not interrupt
+the currently running v0.4.0 Kimi-K3 acquisition merely to perform that validation;
+use a later acquisition after deploying the implementation.

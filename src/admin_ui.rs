@@ -136,6 +136,16 @@ function bytes(value) {
   while (number >= 1024 && unit < units.length - 1) { number /= 1024; unit += 1; }
   return `${number.toFixed(unit ? 1 : 0)} ${units[unit]}`;
 }
+function dateTime(value) {
+  return value == null ? 'not started' : new Date(value * 1000).toLocaleString();
+}
+function duration(seconds) {
+  seconds = Math.max(0, Math.floor(seconds));
+  const days = Math.floor(seconds / 86400); seconds %= 86400;
+  const hours = Math.floor(seconds / 3600); seconds %= 3600;
+  const minutes = Math.floor(seconds / 60); seconds %= 60;
+  return [days && `${days}d`, (days || hours) && `${hours}h`, (days || hours || minutes) && `${minutes}m`, `${seconds}s`].filter(Boolean).join(' ');
+}
 
 function renderOverview(status) {
   const values = [['Service', status.ready ? 'Ready' : 'Not ready'], ['Repositories', status.repository_count], ['Archive size', bytes(status.logical_archive_bytes)], ['Pull-through', status.pullthrough_enabled ? 'Enabled' : 'Disabled']];
@@ -172,6 +182,12 @@ function renderJobs(page) {
     top.append(node('strong', '', job.kind), node('span', `badge ${job.state}`, job.state)); row.append(top);
     row.append(node('p', 'job-target', job.repo_id ? `${job.repo_id}@${job.revision}` : 'entire archive'));
     if (job.principal) row.append(node('small', 'job-meta', `Started by ${job.principal.login || job.principal.auth_method}`));
+    if (job.started_at != null) {
+      const end = job.finished_at == null ? Date.now() / 1000 : job.finished_at;
+      row.append(node('small', 'job-meta', `Started ${dateTime(job.started_at)} · elapsed ${duration(end - job.started_at)}`));
+    } else {
+      row.append(node('small', 'job-meta', `Queued ${dateTime(job.created_at)} · not started`));
+    }
     const parts = [job.phase];
     if (job.total_bytes == null) parts.push(`${bytes(job.progress_bytes)} · total unknown`); else parts.push(`${bytes(job.progress_bytes || 0)} / ${bytes(job.total_bytes)}`);
     if (job.progress_files != null) parts.push(job.total_files == null ? `${job.progress_files} files` : `${job.progress_files} / ${job.total_files} files`);
@@ -234,6 +250,8 @@ mod tests {
         assert!(INDEX.contains("class=\"panel authentication\" hidden"));
         assert!(SCRIPT.contains("x-modelkeep-auth-methods"));
         assert!(SCRIPT.contains("Connected as"));
+        assert!(SCRIPT.contains("function dateTime(value)"));
+        assert!(SCRIPT.contains("elapsed ${duration(end - job.started_at)}"));
         assert!(SCRIPT.contains("const active = job.state === 'queued' || job.state === 'running'"));
         assert!(SCRIPT.contains("if (active && job.total_bytes > 0)"));
         assert!(SCRIPT.contains("node('small', 'job-meta'"));
