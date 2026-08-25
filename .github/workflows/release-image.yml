@@ -9,6 +9,7 @@ on:
       - "flake.nix"
       - "flake.lock"
       - "compose.yaml"
+      - "compose.init.yaml"
       - "src/**"
       - "upstream/**"
       - "tests/**"
@@ -26,6 +27,7 @@ on:
       - "flake.nix"
       - "flake.lock"
       - "compose.yaml"
+      - "compose.init.yaml"
       - "src/**"
       - "upstream/**"
       - "tests/**"
@@ -85,7 +87,7 @@ jobs:
           VERSION: ${{ startsWith(github.ref_name, 'v') && github.ref_name || format('sha-{0}', github.sha) }}
         run: |
           IMAGE="${REGISTRY}/${IMAGE_NAME,,}"
-          docker tag modelkeep:0.4.0 "${IMAGE}:${VERSION}-${{ matrix.arch }}"
+          docker tag modelkeep:0.4.1 "${IMAGE}:${VERSION}-${{ matrix.arch }}"
           docker push "${IMAGE}:${VERSION}-${{ matrix.arch }}"
 
   manifest:

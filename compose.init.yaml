@@ -3,7 +3,7 @@
 services:
   modelkeep-init:
     container_name: modelkeep-init
-    image: ghcr.io/kaznak/modelkeep:v0.4.0
+    image: ghcr.io/kaznak/modelkeep:v0.4.1
     restart: "no"
     read_only: true
     user: "0:0"

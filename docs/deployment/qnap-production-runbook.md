@@ -29,7 +29,7 @@ does not certify unrecorded QNAP firmware, ACL, snapshot, or filesystem behavior
 
 1. Apply [qnap-permissions.md](qnap-permissions.md).
 2. Use the same literal image and archive path in `compose.init.yaml` and
-   `compose.yaml`. The default image is `ghcr.io/kaznak/modelkeep:v0.4.0`; edit both
+   `compose.yaml`. The default image is `ghcr.io/kaznak/modelkeep:v0.4.1`; edit both
    files together for a different released or `sha-...` tag and record `docker image
    inspect` output. Do not use Compose variable-default expressions in a QNAP
    Container Station Application.

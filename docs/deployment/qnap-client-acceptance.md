@@ -48,7 +48,7 @@ nix run .#qnap-client-acceptance -- init qnap-acceptance.json \
   --archive-share-and-acl '/share/Services/modelkeep; documented ACL' \
   --snapshot-mechanism-and-retention 'snapshot mechanism and retention' \
   --external-backup-target 'target and encryption owner' \
-  --image-tag ghcr.io/kaznak/modelkeep:v0.4.0 \
+  --image-tag ghcr.io/kaznak/modelkeep:v0.4.1 \
   --image-digest sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 ```
 

@@ -51,8 +51,8 @@ The GitHub Actions workflow builds both architectures from the Nix flake and pub
 a multi-architecture image to GHCR when a `v*` tag is pushed:
 
 ```sh
-git tag v0.4.0
-git push origin v0.4.0
+git tag v0.4.1
+git push origin v0.4.1
 ```
 
 On QNAP:
@@ -71,7 +71,7 @@ tailscale serve --service=svc:modelkeep-admin --accept-app-caps=io.modelkeep/cap
 tailscale serve status
 ```
 
-Both Compose files default to the public `ghcr.io/kaznak/modelkeep:v0.4.0` image, so
+Both Compose files default to the public `ghcr.io/kaznak/modelkeep:v0.4.1` image, so
 the deployment needs neither image environment variables nor a GHCR login. QNAP
 Container Station does not expand Compose default-value expressions when creating an
 Application, so edit the literal `image:` value for a mirror or another release.
