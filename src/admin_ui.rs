@@ -191,14 +191,14 @@ function renderJobs(page) {
     const parts = [job.phase];
     if (job.total_bytes == null) parts.push(`${bytes(job.progress_bytes)} · total unknown`); else parts.push(`${bytes(job.progress_bytes || 0)} / ${bytes(job.total_bytes)}`);
     if (job.progress_files != null) parts.push(job.total_files == null ? `${job.progress_files} files` : `${job.progress_files} / ${job.total_files} files`);
-    if (job.progress_bytes != null) {
+    if (job.state === 'running' && job.progress_bytes != null) {
       const now = Date.now() / 1000; const previous = progressSamples.get(job.id);
       if (previous && job.progress_bytes >= previous.bytes && now > previous.at) parts.push(`${bytes((job.progress_bytes - previous.bytes) / (now - previous.at))}/s`);
       progressSamples.set(job.id, {bytes: job.progress_bytes, at: now});
     }
-    if (job.last_progress_at) {
+    if (job.state === 'running' && job.last_progress_at) {
       const idle = Math.max(0, Math.floor(Date.now() / 1000) - job.last_progress_at); parts.push(`${idle}s since progress`);
-      if (job.state === 'running' && idle >= 120) row.classList.add('stalled');
+      if (idle >= 120) row.classList.add('stalled');
     }
     row.append(node('small', 'job-meta', parts.join(' · ')));
     if (active && job.total_bytes > 0) { const bar = node('progress', 'job-progress'); bar.max = job.total_bytes; bar.value = Math.min(job.progress_bytes || 0, job.total_bytes); row.append(bar); }
@@ -253,6 +253,8 @@ mod tests {
         assert!(SCRIPT.contains("function dateTime(value)"));
         assert!(SCRIPT.contains("elapsed ${duration(end - job.started_at)}"));
         assert!(SCRIPT.contains("const active = job.state === 'queued' || job.state === 'running'"));
+        assert!(SCRIPT.contains("job.state === 'running' && job.last_progress_at"));
+        assert!(SCRIPT.contains("job.state === 'running' && job.progress_bytes != null"));
         assert!(SCRIPT.contains("if (active && job.total_bytes > 0)"));
         assert!(SCRIPT.contains("node('small', 'job-meta'"));
         assert!(STYLE.contains(".job-meta{display:block}"));
