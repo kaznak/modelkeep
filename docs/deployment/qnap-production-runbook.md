@@ -71,9 +71,35 @@ run before ModelKeep uses a newly created or restored archive directory.
 
 ## Backup and restore drill
 
-Back up the entire `/data` boundary: models, manifests, refs, and tmp. Prefer a QNAP
-point-in-time snapshot; otherwise stop the container during file-copy backup. Keep a
-second backup outside the NAS failure domain.
+Back up the durable archive state under `/data`: published model files, their
+manifests, and refs. Prefer a QNAP point-in-time snapshot; otherwise stop the
+container during file-copy backup. Keep a second backup outside the NAS failure
+domain.
+
+`/data/tmp` contains incomplete acquisitions and is not required for archive
+recovery. Exclude it from content-addressed or deduplicating backups such as restic;
+otherwise a long-running acquisition can upload large amounts of temporary model
+data that no completed backup needs. For example, when restic sees the archive at
+`/data`:
+
+```sh
+restic backup /data --exclude='/data/tmp/**'
+```
+
+Adjust the excluded path when restic sees the archive through a different host or
+container mount. Do not exclude published revision directories,
+`.modelkeep-manifest.json` files, or refs. Run restic against a read-only QNAP
+point-in-time snapshot where possible. A live filesystem scan is not itself a
+point-in-time snapshot and may span a revision publication and ref update. If QNAP
+snapshots are unavailable, stop ModelKeep while taking the backup.
+
+Interrupting restic does not require deleting ModelKeep's active `/data/tmp`
+contents. Re-run the backup with the exclusion in place; uploaded data that is not
+referenced by any completed restic snapshot can be reclaimed later with `restic
+prune` during a low-I/O maintenance window. If a completed restic snapshot includes
+`/data/tmp`, keep it until its normal retention expiry unless the entire snapshot is
+known to be disposable; restic cannot remove only one path from an existing
+snapshot.
 
 Restore into a new empty share, never over production. Start the same pinned image
 without `HF_TOKEN` or fetch-helper variables, run `modelkeep verify`, clear a test
