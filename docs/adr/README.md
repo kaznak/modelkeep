@@ -23,3 +23,6 @@ Initial records:
 - ADR-0014 — constrained QNAP bind-mount ownership bootstrap (superseded by ADR-0016)
 - ADR-0015 — separate and explicitly authorized management control plane
 - ADR-0016 — separate QNAP ownership initialization and service Applications
+- ADR-0017 — resume identified fetch staging after lease expiry
+- ADR-0018 — reconstructible indexes for paged management job history
+- ADR-0019 — separate model and dataset archive namespaces

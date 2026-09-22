@@ -1,17 +1,18 @@
 ---
-status: open
+status: in_progress
 priority: P3
 related_adrs:
   - ADR-0001
   - ADR-0005
+  - ADR-0019
 created: 2026-08-21
-updated: 2026-08-21
+updated: 2026-09-23
 ---
 # Issue 0029: Add dataset repository support
 
-- Status: Open
+- Status: In Progress
 - Priority: P3
-- Related ADR: ADR-0001, ADR-0005
+- Related ADR: ADR-0001, ADR-0005, ADR-0019
 
 ## Objective
 
