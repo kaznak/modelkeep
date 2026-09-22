@@ -1,5 +1,6 @@
 use std::{
-    collections::BTreeMap,
+    cmp::Reverse,
+    collections::{BTreeMap, BinaryHeap},
     env,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
@@ -27,7 +28,7 @@ use sha2::{Digest, Sha256};
 use crate::upstream::FetchProgress;
 use crate::{
     pullthrough::PullThrough, validate_repository_id, validate_revision_ref, Archive, ArchiveError,
-    RepositorySummary,
+    ArchiveResult, RepositorySummary,
 };
 
 const ADMIN_CAPABILITY: &str = "io.modelkeep/cap/admin";
@@ -38,6 +39,83 @@ pub struct Config {
     pub address: SocketAddr,
     bearer_token: Option<String>,
     trust_tailscale_headers: bool,
+}
+
+fn validate_job_id(id: &str) -> ArchiveResult<()> {
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(ArchiveError::InvalidPath(id.into()));
+    }
+    Ok(())
+}
+
+fn validate_digest(value: &str) -> ArchiveResult<()> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ArchiveError::IntegrityMismatch(
+            "invalid job index digest".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn hex_encode(value: &str) -> String {
+    value
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn hex_decode(value: &str) -> Option<String> {
+    if !value.len().is_multiple_of(2) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let bytes = (0..value.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&value[index..index + 2], 16).ok())
+        .collect::<Option<Vec<_>>>()?;
+    String::from_utf8(bytes).ok()
+}
+
+fn history_key(job: &Job) -> String {
+    format!("{:020}-{}", job.created_at, hex_encode(&job.id))
+}
+
+fn job_id_from_history_key(key: &str) -> Option<String> {
+    let (timestamp, encoded) = key.split_once('-')?;
+    if timestamp.len() != 20 || !timestamp.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let id = hex_decode(encoded)?;
+    validate_job_id(&id).ok()?;
+    Some(id)
+}
+
+fn write_new_json(path: &std::path::Path, value: &impl Serialize) -> ArchiveResult<()> {
+    let temporary = path.with_extension(format!("{}.tmp", new_job_id(unix_timestamp())));
+    let bytes = serde_json::to_vec(value)
+        .map_err(|error| ArchiveError::IntegrityMismatch(error.to_string()))?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    match fs::hard_link(&temporary, path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(error.into());
+        }
+    }
+    fs::remove_file(temporary)?;
+    File::open(path.parent().unwrap())?.sync_all()?;
+    Ok(())
 }
 
 impl Config {
@@ -254,28 +332,63 @@ struct JobManager {
 
 struct JobManagerInner {
     directory: PathBuf,
-    jobs: Mutex<BTreeMap<String, Job>>,
+    index_directory: PathBuf,
+    active_directory: PathBuf,
+    idempotency_directory: PathBuf,
+    active_jobs: Mutex<BTreeMap<String, Job>>,
+    #[cfg(test)]
+    read_count: AtomicU64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct IdempotencyEntry {
+    job_id: String,
+    request_hash: String,
 }
 
 impl JobManager {
     fn open(archive: &Archive) -> Result<Self, ArchiveError> {
         let directory = archive.root.join("state").join("jobs");
         fs::create_dir_all(&directory)?;
+        let index_directory = directory.join("by-created");
+        let active_directory = directory.join("active");
+        let idempotency_directory = directory.join("idempotency");
+        fs::create_dir_all(&index_directory)?;
+        fs::create_dir_all(&active_directory)?;
+        fs::create_dir_all(&idempotency_directory)?;
         let manager = Self {
             inner: Arc::new(JobManagerInner {
                 directory,
-                jobs: Mutex::new(BTreeMap::new()),
+                index_directory,
+                active_directory,
+                idempotency_directory,
+                active_jobs: Mutex::new(BTreeMap::new()),
+                #[cfg(test)]
+                read_count: AtomicU64::new(0),
             }),
         };
-        for entry in fs::read_dir(&manager.inner.directory)? {
+        manager.migrate_indexes_once()?;
+        for entry in fs::read_dir(&manager.inner.active_directory)? {
             let entry = entry?;
-            if !entry.file_type()?.is_file()
-                || entry.path().extension().and_then(|value| value.to_str()) != Some("json")
-            {
+            if !entry.file_type()?.is_file() {
                 continue;
             }
-            let mut job: Job = serde_json::from_slice(&fs::read(entry.path())?)
-                .map_err(|error| ArchiveError::IntegrityMismatch(error.to_string()))?;
+            let id = entry.file_name().to_string_lossy().into_owned();
+            if validate_job_id(&id).is_err() {
+                tracing::warn!(event = "admin_active_job_skipped", job_id = %id, "skipped invalid active job marker");
+                continue;
+            }
+            let mut job = match manager.read_job(&id) {
+                Ok(job) => job,
+                Err(ArchiveError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    fs::remove_file(entry.path())?;
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(event = "admin_active_job_skipped", job_id = %id, error = %error, "skipped unreadable active management job");
+                    continue;
+                }
+            };
             if matches!(job.state, JobState::Queued | JobState::Running) {
                 job.state = JobState::Failed;
                 job.phase = "interrupted".into();
@@ -285,37 +398,90 @@ impl JobManager {
                 job.finished_at = Some(now);
                 job.updated_at = now;
                 manager.persist(&job)?;
+            } else {
+                manager.set_active_marker(&job)?;
             }
-            manager
-                .inner
-                .jobs
-                .lock()
-                .unwrap()
-                .insert(job.id.clone(), job);
         }
         Ok(manager)
     }
 
-    fn list(&self) -> Vec<Job> {
-        let mut jobs = self
-            .inner
-            .jobs
-            .lock()
-            .unwrap()
-            .values()
-            .cloned()
+    fn list_page(&self, limit: usize, cursor: Option<&str>) -> ArchiveResult<JobPage> {
+        let cursor_key = match cursor {
+            Some(id) => match self.read_job(id) {
+                Ok(job) => Some(history_key(&job)),
+                Err(ArchiveError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(JobPage {
+                        items: Vec::new(),
+                        next_cursor: None,
+                    });
+                }
+                Err(error) => return Err(error),
+            },
+            None => None,
+        };
+        let capacity = limit + 1;
+        let mut selected = BinaryHeap::<Reverse<String>>::new();
+        for entry in fs::read_dir(&self.inner.index_directory)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let key = entry.file_name().to_string_lossy().into_owned();
+            let Some(id) = job_id_from_history_key(&key) else {
+                continue;
+            };
+            if cursor_key.as_ref().is_some_and(|cursor| key >= *cursor)
+                || !self.job_path(&id)?.is_file()
+            {
+                continue;
+            }
+            if selected.len() < capacity {
+                selected.push(Reverse(key));
+            } else if selected.peek().is_some_and(|smallest| key > smallest.0) {
+                selected.pop();
+                selected.push(Reverse(key));
+            }
+        }
+        let mut keys = selected
+            .into_iter()
+            .map(|value| value.0)
             .collect::<Vec<_>>();
-        jobs.sort_by(|left, right| {
-            right
-                .created_at
-                .cmp(&left.created_at)
-                .then_with(|| right.id.cmp(&left.id))
-        });
-        jobs
+        keys.sort_unstable_by(|left, right| right.cmp(left));
+        let mut jobs = keys
+            .iter()
+            .map(|key| {
+                let id = job_id_from_history_key(key).ok_or_else(|| {
+                    ArchiveError::IntegrityMismatch("invalid job history index".into())
+                })?;
+                let job = self.read_job(&id)?;
+                if history_key(&job) != *key {
+                    return Err(ArchiveError::IntegrityMismatch(
+                        "job history index mismatch".into(),
+                    ));
+                }
+                Ok(job)
+            })
+            .collect::<ArchiveResult<Vec<_>>>()?;
+        let next_cursor = (jobs.len() > limit).then(|| jobs[limit - 1].id.clone());
+        jobs.truncate(limit);
+        Ok(JobPage {
+            items: jobs.into_iter().map(JobView::from).collect(),
+            next_cursor,
+        })
     }
 
-    fn get(&self, id: &str) -> Option<Job> {
-        self.inner.jobs.lock().unwrap().get(id).cloned()
+    fn get(&self, id: &str) -> ArchiveResult<Option<Job>> {
+        validate_job_id(id)?;
+        if let Some(job) = self.inner.active_jobs.lock().unwrap().get(id).cloned() {
+            return Ok(Some(job));
+        }
+        match self.read_job(id) {
+            Ok(job) => Ok(Some(job)),
+            Err(ArchiveError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn submit(
@@ -331,18 +497,26 @@ impl JobManager {
         let idempotency_request_hash = idempotency_hash
             .as_ref()
             .map(|_| hash_idempotency_request(&request, &principal));
-        let mut jobs = self.inner.jobs.lock().unwrap();
+        let mut jobs = self.inner.active_jobs.lock().unwrap();
         if let Some(hash) = &idempotency_hash {
-            if let Some(existing) = jobs
-                .values()
-                .find(|job| job.idempotency_hash.as_ref() == Some(hash))
-                .cloned()
-            {
-                return if existing.idempotency_request_hash == idempotency_request_hash {
-                    Ok((existing, false))
-                } else {
-                    Err("idempotency_conflict")
-                };
+            match self.read_idempotency(hash) {
+                Ok(Some(entry)) => match self.read_job(&entry.job_id) {
+                    Ok(existing) => {
+                        return if Some(entry.request_hash) == idempotency_request_hash {
+                            Ok((existing, false))
+                        } else {
+                            Err("idempotency_conflict")
+                        };
+                    }
+                    Err(ArchiveError::Io(error))
+                        if error.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        self.remove_idempotency(hash).map_err(|_| "storage")?;
+                    }
+                    Err(_) => return Err("storage"),
+                },
+                Ok(None) => {}
+                Err(_) => return Err("storage"),
             }
         }
         if let Some(existing) = jobs
@@ -507,11 +681,12 @@ impl JobManager {
     }
 
     fn cancel(&self, id: &str) -> Result<Job, &'static str> {
-        let mut jobs = self.inner.jobs.lock().unwrap();
+        let mut jobs = self.inner.active_jobs.lock().unwrap();
         let job = jobs.get_mut(id).ok_or("not_found")?;
         if job.state != JobState::Queued {
             return Err("not_cancellable");
         }
+        let previous = job.clone();
         job.state = JobState::Cancelled;
         job.phase = "cancelled".into();
         let now = unix_timestamp();
@@ -519,7 +694,15 @@ impl JobManager {
         job.updated_at = now;
         let snapshot = job.clone();
         drop(jobs);
-        self.persist(&snapshot).map_err(|_| "storage")?;
+        if self.persist(&snapshot).is_err() {
+            self.inner
+                .active_jobs
+                .lock()
+                .unwrap()
+                .insert(id.into(), previous);
+            return Err("storage");
+        }
+        self.inner.active_jobs.lock().unwrap().remove(id);
         Ok(snapshot)
     }
 
@@ -567,16 +750,199 @@ impl JobManager {
     }
 
     fn update(&self, id: &str, update: impl FnOnce(&mut Job)) -> Option<Job> {
-        let mut jobs = self.inner.jobs.lock().unwrap();
+        let mut jobs = self.inner.active_jobs.lock().unwrap();
         let job = jobs.get_mut(id)?;
+        let previous = job.clone();
         update(job);
         job.updated_at = unix_timestamp();
         let snapshot = job.clone();
         drop(jobs);
-        if let Err(error) = self.persist(&snapshot) {
-            tracing::error!(event = "admin_job_persist_failed", job_id = %id, error = %error, "failed to persist management job");
+        let persisted = match self.persist(&snapshot) {
+            Ok(()) => true,
+            Err(error) => {
+                if let Ok(mut jobs) = self.inner.active_jobs.lock() {
+                    jobs.insert(id.to_string(), previous.clone());
+                }
+                tracing::error!(event = "admin_job_persist_failed", job_id = %id, error = %error, "failed to persist management job");
+                false
+            }
+        };
+        if persisted && !matches!(snapshot.state, JobState::Queued | JobState::Running) {
+            self.inner.active_jobs.lock().unwrap().remove(id);
         }
-        Some(snapshot)
+        Some(if persisted { snapshot } else { previous })
+    }
+
+    fn migrate_indexes_once(&self) -> ArchiveResult<()> {
+        let sentinel = self.inner.directory.join(".index-v1");
+        if sentinel.is_file() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(&self.inner.directory)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file()
+                || entry.path().extension().and_then(|value| value.to_str()) != Some("json")
+            {
+                continue;
+            }
+            let job: Job = match serde_json::from_slice(&fs::read(entry.path())?) {
+                Ok(job) => job,
+                Err(error) => {
+                    tracing::warn!(
+                        event = "admin_job_index_skipped",
+                        path = %entry.path().display(),
+                        error = %error,
+                        "skipped malformed management job during index migration"
+                    );
+                    continue;
+                }
+            };
+            let file_id = entry
+                .path()
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_string();
+            if validate_job_id(&job.id).is_err() || job.id != file_id {
+                tracing::warn!(
+                    event = "admin_job_index_skipped",
+                    path = %entry.path().display(),
+                    "skipped management job with invalid identity during index migration"
+                );
+                continue;
+            }
+            self.ensure_history_index(&job)?;
+            self.ensure_idempotency_index(&job)?;
+            self.set_active_marker(&job)?;
+        }
+        let temporary = self
+            .inner
+            .directory
+            .join(format!(".index-v1-{}.tmp", new_job_id(unix_timestamp())));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(b"1\n")?;
+        file.sync_all()?;
+        fs::rename(&temporary, &sentinel)?;
+        File::open(&self.inner.directory)?.sync_all()?;
+        Ok(())
+    }
+
+    fn job_path(&self, id: &str) -> ArchiveResult<PathBuf> {
+        validate_job_id(id)?;
+        Ok(self.inner.directory.join(format!("{id}.json")))
+    }
+
+    fn read_job(&self, id: &str) -> ArchiveResult<Job> {
+        #[cfg(test)]
+        self.inner.read_count.fetch_add(1, Ordering::Relaxed);
+        let path = self.job_path(id)?;
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_file() {
+            return Err(ArchiveError::IntegrityMismatch(
+                "job record is not a regular file".into(),
+            ));
+        }
+        let job: Job = serde_json::from_slice(&fs::read(path)?)
+            .map_err(|error| ArchiveError::IntegrityMismatch(error.to_string()))?;
+        if job.id != id {
+            return Err(ArchiveError::IntegrityMismatch(
+                "job record identity mismatch".into(),
+            ));
+        }
+        Ok(job)
+    }
+
+    fn ensure_history_index(&self, job: &Job) -> ArchiveResult<()> {
+        let path = self.inner.index_directory.join(history_key(job));
+        match OpenOptions::new().write(true).create_new(true).open(path) {
+            Ok(file) => file.sync_all()?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        File::open(&self.inner.index_directory)?.sync_all()?;
+        Ok(())
+    }
+
+    fn ensure_idempotency_index(&self, job: &Job) -> ArchiveResult<()> {
+        let (Some(hash), Some(request_hash)) = (
+            job.idempotency_hash.as_deref(),
+            job.idempotency_request_hash.as_deref(),
+        ) else {
+            return Ok(());
+        };
+        let path = self
+            .inner
+            .idempotency_directory
+            .join(format!("{hash}.json"));
+        validate_digest(hash)?;
+        if path.is_file() {
+            let existing: IdempotencyEntry = serde_json::from_slice(&fs::read(&path)?)
+                .map_err(|error| ArchiveError::IntegrityMismatch(error.to_string()))?;
+            if existing.job_id != job.id && !self.job_path(&existing.job_id)?.is_file() {
+                fs::remove_file(&path)?;
+            } else if existing.job_id != job.id || existing.request_hash != request_hash {
+                return Err(ArchiveError::IntegrityMismatch(
+                    "idempotency index conflict".into(),
+                ));
+            } else {
+                return Ok(());
+            }
+        }
+        let entry = IdempotencyEntry {
+            job_id: job.id.clone(),
+            request_hash: request_hash.into(),
+        };
+        write_new_json(&path, &entry)
+    }
+
+    fn read_idempotency(&self, hash: &str) -> ArchiveResult<Option<IdempotencyEntry>> {
+        validate_digest(hash)?;
+        let path = self
+            .inner
+            .idempotency_directory
+            .join(format!("{hash}.json"));
+        match fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|error| ArchiveError::IntegrityMismatch(error.to_string())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn remove_idempotency(&self, hash: &str) -> ArchiveResult<()> {
+        validate_digest(hash)?;
+        match fs::remove_file(
+            self.inner
+                .idempotency_directory
+                .join(format!("{hash}.json")),
+        ) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn set_active_marker(&self, job: &Job) -> ArchiveResult<()> {
+        let path = self.inner.active_directory.join(&job.id);
+        if matches!(job.state, JobState::Queued | JobState::Running) {
+            match OpenOptions::new().write(true).create_new(true).open(path) {
+                Ok(file) => file.sync_all()?,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        File::open(&self.inner.active_directory)?.sync_all()?;
+        Ok(())
     }
 
     fn persist(&self, job: &Job) -> Result<(), ArchiveError> {
@@ -593,6 +959,15 @@ impl JobManager {
         file.sync_all()?;
         fs::rename(&temporary, final_path)?;
         File::open(&self.inner.directory)?.sync_all()?;
+        if let Err(error) = self.ensure_history_index(job) {
+            tracing::error!(event = "admin_job_index_update_failed", job_id = %job.id, index = "by_created", error = %error, "job authority persisted but index update failed");
+        }
+        if let Err(error) = self.ensure_idempotency_index(job) {
+            tracing::error!(event = "admin_job_index_update_failed", job_id = %job.id, index = "idempotency", error = %error, "job authority persisted but index update failed");
+        }
+        if let Err(error) = self.set_active_marker(job) {
+            tracing::error!(event = "admin_job_index_update_failed", job_id = %job.id, index = "active", error = %error, "job authority persisted but index update failed");
+        }
         Ok(())
     }
 
@@ -614,6 +989,9 @@ impl JobManager {
             File::open(&self.inner.directory)?.sync_all()?;
             return Ok(false);
         }
+        self.ensure_history_index(job)?;
+        self.ensure_idempotency_index(job)?;
+        self.set_active_marker(job)?;
         let result = self.persist(job);
         let remove_result = fs::remove_file(&reservation);
         File::open(&self.inner.directory)?.sync_all()?;
@@ -693,25 +1071,17 @@ async fn list_jobs(
         return unauthorized(&state.config);
     }
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
-    let all_jobs = state.jobs.list();
-    let start = query.cursor.as_ref().map_or(0, |cursor| {
-        all_jobs
-            .iter()
-            .position(|job| &job.id == cursor)
-            .map_or(all_jobs.len(), |index| index + 1)
-    });
-    let mut jobs = all_jobs
-        .into_iter()
-        .skip(start)
-        .take(limit + 1)
-        .collect::<Vec<_>>();
-    let next_cursor = (jobs.len() > limit).then(|| jobs[limit - 1].id.clone());
-    jobs.truncate(limit);
-    Json(JobPage {
-        items: jobs.into_iter().map(JobView::from).collect(),
-        next_cursor,
-    })
-    .into_response()
+    match state.jobs.list_page(limit, query.cursor.as_deref()) {
+        Ok(page) => Json(page).into_response(),
+        Err(ArchiveError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: "invalid_cursor",
+            }),
+        )
+            .into_response(),
+        Err(error) => archive_error(error),
+    }
 }
 
 async fn job(
@@ -723,12 +1093,20 @@ async fn job(
         return unauthorized(&state.config);
     }
     match state.jobs.get(&id) {
-        Some(job) => Json(JobView::from(job)).into_response(),
-        None => (
+        Ok(Some(job)) => Json(JobView::from(job)).into_response(),
+        Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(ErrorBody { error: "not_found" }),
         )
             .into_response(),
+        Err(ArchiveError::InvalidPath(_)) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: "invalid_request",
+            }),
+        )
+            .into_response(),
+        Err(error) => archive_error(error),
     }
 }
 
@@ -1250,7 +1628,7 @@ mod tests {
         job.finished_at = None;
         manager
             .inner
-            .jobs
+            .active_jobs
             .lock()
             .unwrap()
             .insert(job.id.clone(), job);
@@ -1288,7 +1666,7 @@ mod tests {
         manager.record_progress("progress-test", FetchProgress::phase("resuming_snapshot"));
         manager.record_progress("progress-test", FetchProgress::phase("validating_revision"));
 
-        let job = manager.get("progress-test").unwrap();
+        let job = manager.get("progress-test").unwrap().unwrap();
         assert_eq!(job.phase, "validating_revision");
         assert_eq!(job.progress_bytes, Some(75));
         assert_eq!(job.total_bytes, Some(100));
@@ -1463,7 +1841,7 @@ mod tests {
         });
         manager
             .inner
-            .jobs
+            .active_jobs
             .lock()
             .unwrap()
             .insert(existing.id.clone(), existing.clone());
@@ -1489,7 +1867,7 @@ mod tests {
         assert!(!created);
         assert_eq!(reused.id, existing.id);
         assert_eq!(reused.principal, existing.principal);
-        assert_eq!(manager.list().len(), 1);
+        assert_eq!(manager.inner.active_jobs.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1512,12 +1890,16 @@ mod tests {
         different.id = "different-refresh".into();
         different.kind = JobKind::Refresh;
         different.state = JobState::Running;
-        let mut jobs = manager.inner.jobs.lock().unwrap();
         for job in [terminal, failed, cancelled] {
-            jobs.insert(job.id.clone(), job);
+            manager.persist(&job).unwrap();
         }
-        jobs.insert(different.id.clone(), different);
-        drop(jobs);
+        manager.persist(&different).unwrap();
+        manager
+            .inner
+            .active_jobs
+            .lock()
+            .unwrap()
+            .insert(different.id.clone(), different);
 
         let (submitted, created) = manager
             .submit(
@@ -1586,20 +1968,23 @@ mod tests {
         let job_id = results[0].0.id.clone();
         assert!(results.iter().all(|(job, _)| job.id == job_id));
         assert_eq!(results.iter().filter(|(_, created)| *created).count(), 1);
-        assert_eq!(manager.list().len(), 1);
+        assert_eq!(manager.inner.active_jobs.lock().unwrap().len(), 1);
 
         fetcher.release();
         for _ in 0..100 {
             if manager
                 .get(&job_id)
-                .is_some_and(|job| job.state == JobState::Completed)
+                .is_ok_and(|job| job.is_some_and(|job| job.state == JobState::Completed))
             {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert_eq!(fetcher.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(manager.get(&job_id).unwrap().state, JobState::Completed);
+        assert_eq!(
+            manager.get(&job_id).unwrap().unwrap().state,
+            JobState::Completed
+        );
     }
 
     #[tokio::test]
@@ -1631,6 +2016,7 @@ mod tests {
         assert_eq!(first["next_cursor"], "job-b");
 
         let second = app
+            .clone()
             .oneshot(request(
                 "/api/admin/v1/jobs?limit=2&cursor=job-b",
                 Some("secret"),
@@ -1642,6 +2028,72 @@ mod tests {
                 .unwrap();
         assert_eq!(second["items"].as_array().unwrap().len(), 1);
         assert_eq!(second["items"][0]["id"], "job-a");
+
+        let unknown = app
+            .oneshot(request(
+                "/api/admin/v1/jobs?limit=2&cursor=missing-job",
+                Some("secret"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::OK);
+        let unknown: serde_json::Value =
+            serde_json::from_slice(&to_bytes(unknown.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(unknown["items"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn startup_keeps_terminal_history_on_disk_and_page_decoding_is_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        let manager = JobManager::open(&archive).unwrap();
+        for index in 0..10_000u64 {
+            let job = stored_job(&format!("history-{index:05}"), index);
+            fs::write(
+                manager.inner.directory.join(format!("{}.json", job.id)),
+                serde_json::to_vec(&job).unwrap(),
+            )
+            .unwrap();
+            fs::write(manager.inner.index_directory.join(history_key(&job)), b"").unwrap();
+        }
+        drop(manager);
+
+        let reopened = JobManager::open(&archive).unwrap();
+        assert_eq!(reopened.inner.read_count.load(Ordering::Relaxed), 0);
+        assert!(reopened.inner.active_jobs.lock().unwrap().is_empty());
+        let page = reopened.list_page(25, None).unwrap();
+        assert_eq!(page.items.len(), 25);
+        assert!(page.next_cursor.is_some());
+        assert_eq!(reopened.inner.read_count.load(Ordering::Relaxed), 26);
+        assert_eq!(page.items[0].id, "history-09999");
+    }
+
+    #[test]
+    fn terminal_job_direct_lookup_reads_one_validated_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        let manager = JobManager::open(&archive).unwrap();
+        manager.persist_new(&stored_job("lookup-job", 1)).unwrap();
+        manager.inner.read_count.store(0, Ordering::Relaxed);
+        assert_eq!(manager.get("lookup-job").unwrap().unwrap().id, "lookup-job");
+        assert_eq!(manager.inner.read_count.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            manager.get("../escape"),
+            Err(ArchiveError::InvalidPath(_))
+        ));
+
+        let mut mismatched = stored_job("other-job", 1);
+        mismatched.id = "other-job".into();
+        fs::write(
+            manager.inner.directory.join("lookup-job.json"),
+            serde_json::to_vec(&mismatched).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            manager.get("lookup-job"),
+            Err(ArchiveError::IntegrityMismatch(_))
+        ));
     }
 
     #[tokio::test]
@@ -1684,6 +2136,37 @@ mod tests {
         assert!(matches!(different_principal, Err("idempotency_conflict")));
     }
 
+    #[tokio::test]
+    async fn idempotency_index_survives_restart_without_loading_terminal_job() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Arc::new(Archive::new(directory.path()).unwrap());
+        let manager = JobManager::open(&archive).unwrap();
+        let request = JobRequest {
+            kind: JobKind::Audit,
+            repo_id: None,
+            revision: None,
+        };
+        let principal = PrincipalView {
+            auth_method: "bearer".into(),
+            login: None,
+            name: None,
+        };
+        let key_hash = hash_idempotency_key("restart-key").unwrap();
+        let mut existing = stored_job("idempotent-history", 1);
+        existing.idempotency_hash = Some(key_hash);
+        existing.idempotency_request_hash = Some(hash_idempotency_request(&request, &principal));
+        manager.persist_new(&existing).unwrap();
+        drop(manager);
+
+        let reopened = JobManager::open(&archive).unwrap();
+        assert!(reopened.inner.active_jobs.lock().unwrap().is_empty());
+        let (job, created) = reopened
+            .submit(request, Some("restart-key"), archive, None, principal)
+            .unwrap();
+        assert!(!created);
+        assert_eq!(job.id, "idempotent-history");
+    }
+
     #[test]
     fn legacy_job_records_without_request_hash_remain_readable() {
         let directory = tempfile::tempdir().unwrap();
@@ -1702,7 +2185,7 @@ mod tests {
         drop(manager);
 
         let reopened = JobManager::open(&archive).unwrap();
-        assert!(reopened.get("legacy").is_some());
+        assert!(reopened.get("legacy").unwrap().is_some());
     }
 
     #[tokio::test]
@@ -1782,9 +2265,78 @@ mod tests {
         drop(manager);
 
         let reopened = JobManager::open(&archive).unwrap();
-        let interrupted = reopened.get("restart-test").unwrap();
+        let interrupted = reopened.get("restart-test").unwrap().unwrap();
         assert_eq!(interrupted.state, JobState::Failed);
         assert_eq!(interrupted.error_class.as_deref(), Some("interrupted"));
+    }
+
+    #[test]
+    fn legacy_job_directory_is_indexed_once_and_active_job_is_recovered() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        let jobs = directory.path().join("state/jobs");
+        fs::create_dir_all(&jobs).unwrap();
+        let terminal = stored_job("legacy-terminal", 1);
+        fs::write(
+            jobs.join("legacy-terminal.json"),
+            serde_json::to_vec(&terminal).unwrap(),
+        )
+        .unwrap();
+        let mut active = stored_job("legacy-active", 2);
+        active.state = JobState::Running;
+        active.phase = "auditing_archive".into();
+        active.finished_at = None;
+        fs::write(
+            jobs.join("legacy-active.json"),
+            serde_json::to_vec(&active).unwrap(),
+        )
+        .unwrap();
+        fs::write(jobs.join("malformed.json"), b"not-json").unwrap();
+
+        let manager = JobManager::open(&archive).unwrap();
+        assert!(jobs.join(".index-v1").is_file());
+        assert_eq!(manager.list_page(10, None).unwrap().items.len(), 2);
+        let recovered = manager.get("legacy-active").unwrap().unwrap();
+        assert_eq!(recovered.state, JobState::Failed);
+        assert_eq!(recovered.error_class.as_deref(), Some("interrupted"));
+        assert!(manager.inner.active_jobs.lock().unwrap().is_empty());
+        assert!(matches!(
+            manager.get("malformed"),
+            Err(ArchiveError::IntegrityMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn malformed_active_record_does_not_block_other_restart_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        let manager = JobManager::open(&archive).unwrap();
+        let mut healthy = stored_job("healthy-active", 1);
+        healthy.state = JobState::Running;
+        healthy.finished_at = None;
+        manager.persist(&healthy).unwrap();
+        fs::write(
+            manager.inner.directory.join("broken-active.json"),
+            b"broken",
+        )
+        .unwrap();
+        fs::write(manager.inner.active_directory.join("broken-active"), b"").unwrap();
+        drop(manager);
+
+        let reopened = JobManager::open(&archive).unwrap();
+        assert_eq!(
+            reopened.get("healthy-active").unwrap().unwrap().state,
+            JobState::Failed
+        );
+        assert!(reopened
+            .inner
+            .active_directory
+            .join("broken-active")
+            .is_file());
+        assert!(matches!(
+            reopened.get("broken-active"),
+            Err(ArchiveError::IntegrityMismatch(_))
+        ));
     }
 
     #[test]

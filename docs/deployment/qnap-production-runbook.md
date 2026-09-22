@@ -122,6 +122,21 @@ non-zero status identify revisions that failed verification. A killed container,
 missing JSON output, or any other incomplete run is not a successful audit; schedule
 a replacement run. The audit is read-only and never repairs or deletes data.
 
+## Management job history maintenance
+
+Management job history is stored as one JSON record per job under
+`/data/state/jobs`. ModelKeep keeps terminal history on disk and reads it by page; it
+does not automatically delete these records. The `by-created` and `idempotency`
+subdirectories are reconstructible indexes, while `active` identifies jobs that need
+restart recovery.
+
+If job-history disk or inode use eventually matters, stop the ModelKeep container,
+inspect the selected top-level `<job-id>.json` records, and remove only confirmed
+terminal-job records. Do not remove queued or running jobs, do not edit the `active`
+directory while the service is running, and never apply the operation to `models` or
+`tmp`. A later maintenance command may automate this workflow, but automatic history
+retention is intentionally not part of the current service.
+
 ## Upgrade, rollback, and incidents
 
 Before upgrade, snapshot storage and test the new pinned image against a restored

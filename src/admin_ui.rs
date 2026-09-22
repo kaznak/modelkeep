@@ -83,6 +83,7 @@ const INDEX: &str = r#"<!doctype html>
       <div class="panel jobs-panel">
         <div class="section-heading"><div><p class="eyebrow">Persistent operations</p><h2>Recent jobs</h2></div><span>latest 50</span></div>
         <div id="jobs" class="list" aria-live="polite"><p class="empty">No jobs loaded.</p></div>
+        <button id="more-jobs" class="secondary" hidden>Load older jobs</button>
       </div>
     </section>
   </main>
@@ -94,6 +95,8 @@ const SCRIPT: &str = r#"'use strict';
 const $ = (id) => document.getElementById(id);
 let token = sessionStorage.getItem('modelkeep-admin-token') || '';
 let timer;
+let jobsCursor = null;
+let jobsExpanded = false;
 const progressSamples = new Map();
 
 function headers(write = false) {
@@ -174,9 +177,9 @@ async function loadRepository(repoId) {
   } catch (error) { $('repository-detail').replaceChildren(node('p', 'error', error.message)); }
 }
 
-function renderJobs(page) {
-  if (!page.items.length) { $('jobs').replaceChildren(node('p', 'empty', 'No management jobs yet.')); return; }
-  $('jobs').replaceChildren(...page.items.map((job) => {
+function renderJobs(page, append = false) {
+  if (!page.items.length && !append) { $('jobs').replaceChildren(node('p', 'empty', 'No management jobs yet.')); }
+  const rows = page.items.map((job) => {
     const row = node('article', 'job'); const top = node('div', 'job-top');
     const active = job.state === 'queued' || job.state === 'running';
     top.append(node('strong', '', job.kind), node('span', `badge ${job.state}`, job.state)); row.append(top);
@@ -205,20 +208,29 @@ function renderJobs(page) {
     if (active && job.total_bytes > 0) { const bar = node('progress', 'job-progress'); bar.max = job.total_bytes; bar.value = Math.min(job.progress_bytes || 0, job.total_bytes); row.append(bar); }
     else if (active) { row.append(node('progress', 'job-progress')); }
     if (job.message) row.append(node('p', 'error', `${job.error_class}: ${job.message}`)); return row;
-  }));
+  });
+  if (append) $('jobs').append(...rows); else if (rows.length) $('jobs').replaceChildren(...rows);
+  jobsCursor = page.next_cursor || null; $('more-jobs').hidden = jobsCursor == null;
 }
 
 async function load() {
   try {
     const [status, repositories, jobs] = await Promise.all([api('/api/admin/v1/status'), api('/api/admin/v1/repositories?limit=50'), api('/api/admin/v1/jobs?limit=50')]);
-    renderOverview(status); renderRepositories(repositories); renderJobs(jobs);
+    renderOverview(status); renderRepositories(repositories); if (!jobsExpanded) renderJobs(jobs);
     const identity = status.principal.name || status.principal.login || status.principal.auth_method;
     $('connection').textContent = `Connected as ${identity} · v${status.version}`;
   } catch (error) { if (!error.message.includes('authorization required') && error.message !== 'Authentication required') $('connection').textContent = error.message; }
 }
 
 $('auth-form').addEventListener('submit', (event) => { event.preventDefault(); token = $('token').value; sessionStorage.setItem('modelkeep-admin-token', token); load(); });
-$('refresh').addEventListener('click', load);
+$('refresh').addEventListener('click', () => { jobsExpanded = false; load(); });
+$('more-jobs').addEventListener('click', async () => {
+  if (!jobsCursor) return;
+  const button = $('more-jobs'); button.disabled = true;
+  try { jobsExpanded = true; renderJobs(await api(`/api/admin/v1/jobs?limit=50&cursor=${encodeURIComponent(jobsCursor)}`), true); }
+  catch (error) { $('connection').textContent = error.message; }
+  finally { button.disabled = false; }
+});
 $('kind').addEventListener('change', () => { const audit = $('kind').value === 'audit'; $('target-fields').hidden = audit; $('repo-id').required = !audit; $('revision').required = !audit; });
 $('job-form').addEventListener('submit', async (event) => {
   event.preventDefault(); const kind = $('kind').value; const body = {kind};
@@ -260,6 +272,8 @@ mod tests {
         assert!(SCRIPT.contains("node('small', 'job-meta'"));
         assert!(STYLE.contains(".job-meta{display:block}"));
         assert!(SCRIPT.contains("const job = await api('/api/admin/v1/jobs'"));
+        assert!(INDEX.contains("id=\"more-jobs\""));
+        assert!(SCRIPT.contains("cursor=${encodeURIComponent(jobsCursor)}"));
         assert!(SCRIPT.contains("$('repo-id').value = ''; $('form-message').textContent"));
     }
 }

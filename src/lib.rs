@@ -584,7 +584,13 @@ impl Archive {
             {
                 continue;
             }
-            let expires_at = read_lease_expiry(&old)?;
+            let expires_at = match read_lease_expiry(&old) {
+                Ok(expires_at) => expires_at,
+                Err(ArchiveError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             if expires_at > now {
                 return Err(ArchiveError::AlreadyPublished(old));
             }
