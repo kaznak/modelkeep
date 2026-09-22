@@ -25,13 +25,13 @@
 | 12: integrity | ~~[Issue 0020: full archive audit](https://github.com/kaznak/modelkeep/commit/ef2da9c8a9471bc4ca3b900b6a15472759195480)~~ |
 | 13: authentication/gated models | [Issue 0028](issues/0028-define-private-gated-credential-policy.md)、[Issue 0021](issues/0021-add-tailnet-identity-aware-authorization.md) |
 | 14: Rust server/security | ~~[safe archive resolution](https://github.com/kaznak/modelkeep/commit/220a62b94371cd6a21e623c52a9a5da86b2d30c0)~~、~~[Issue 0015](https://github.com/kaznak/modelkeep/commit/1b024cc23d148df3640c0290f99f0d25fd5eb4ea)~~ |
-| 15: Nix/OCI | ~~[aarch64対応OCI CI](https://github.com/kaznak/modelkeep/commit/ad1b222abe5777b08aa9fad67e56b34b76afb38c)~~、~~[Issues 0012–0013: reproducible environment](https://github.com/kaznak/modelkeep/commit/2718a3a4dd54b1daade42d9abfe556192fc333af)~~、[Issue 0023](issues/0023-test-multiple-hf-client-versions.md) |
+| 15: Nix/OCI | ~~[aarch64対応OCI CI](https://github.com/kaznak/modelkeep/commit/ad1b222abe5777b08aa9fad67e56b34b76afb38c)~~、~~[Issues 0012–0013: reproducible environment](https://github.com/kaznak/modelkeep/commit/2718a3a4dd54b1daade42d9abfe556192fc333af)~~、~~[Issue 0023: supported HF client version matrix](https://github.com/kaznak/modelkeep/commit/6d6f77bb65174ed292552959b4b57879161dda99)~~ |
 | 16: QNAP | ~~[Issue 0011: permissions](https://github.com/kaznak/modelkeep/commit/2b8de5e1bdcb191958c2546160ac3949756e30ff)~~、~~[Issue 0019: production runbook](https://github.com/kaznak/modelkeep/commit/e95e1dc62c2187165f2b156406009dad55c1db65)~~、~~[Issue 0005: Tailscale boundary](https://github.com/kaznak/modelkeep/commit/a13d437915dda66392bdc3367137eb1607992e59)~~、~~[Issue 0044: QNAP container identification](https://github.com/kaznak/modelkeep/commit/4953eab)~~、~~[Issue 0060: local acceptance site config](https://github.com/kaznak/modelkeep/commit/94c376e)~~、[Issue 0026](issues/0026-complete-qnap-gx10-acceptance-testing.md) |
 | 17: GX10 cache import | ~~[cache importer実装](https://github.com/kaznak/modelkeep/commit/d017a2d1c9cdd63b830d6426d41ce7e6c61a5ff7)~~、[Issue 0025](issues/0025-validate-large-hf-cache-migration.md) |
 | 18: CLI/管理 | ~~[list/show](https://github.com/kaznak/modelkeep/commit/fc34136b181acab80e2b19e674306726e25af214)~~、~~[explicit remove](https://github.com/kaznak/modelkeep/commit/e8aa9cce7aaccf1d9f5b8e701d317b0d678b343b)~~、~~[Issue 0016: refresh](https://github.com/kaznak/modelkeep/commit/ccd518b9fd39db55401bc0c34c9ed3630680eddc)~~、~~[Issue 0020: audit](https://github.com/kaznak/modelkeep/commit/ef2da9c8a9471bc4ca3b900b6a15472759195480)~~、~~[Issues 0049–0051: job progress and authenticated operator UI](https://github.com/kaznak/modelkeep/commit/0e7cce9)~~、~~[Issue 0054: durable job identity and idempotency](https://github.com/kaznak/modelkeep/commit/fdcaf1f)~~、~~[Issue 0055: paged management job history](https://github.com/kaznak/modelkeep/commit/af864d3376bb5b9bd3edce23bb8930a8a641ba49)~~、~~[Issue 0057: accurate acquisition progress](https://github.com/kaznak/modelkeep/commit/b06b2758ecdd852f87115956a8360ed2da921a56)~~、~~[Issue 0059: active job deduplication](https://github.com/kaznak/modelkeep/commit/4601308)~~ |
-| 19: observability | ~~[JSON operational logging基盤](https://github.com/kaznak/modelkeep/commit/8a4d9b2c048d6d72856f54967ad8b05cbb9b4e28)~~、~~[Issue 0043: startup lifecycle logging](https://github.com/kaznak/modelkeep/commit/35c6c28)（[CLI stdout分離](https://github.com/kaznak/modelkeep/commit/d85018f)）~~、[Issue 0027](issues/0027-complete-structured-operational-events.md)、[Issue 0004](issues/0004-add-storage-observability.md)、~~[Issue 0052: admin polling write probes](https://github.com/kaznak/modelkeep/commit/f94e24b)~~ |
+| 19: observability | ~~[JSON operational logging基盤](https://github.com/kaznak/modelkeep/commit/8a4d9b2c048d6d72856f54967ad8b05cbb9b4e28)~~、~~[Issue 0043: startup lifecycle logging](https://github.com/kaznak/modelkeep/commit/35c6c28)（[CLI stdout分離](https://github.com/kaznak/modelkeep/commit/d85018f)）~~、~~[Issue 0027: structured operational events](https://github.com/kaznak/modelkeep/commit/461d59ec5ed69934c7ffd94c99a3afea8e8247fa)~~、~~[Issue 0004: storage capacity observability](https://github.com/kaznak/modelkeep/commit/e0c0a2b3347835ca8834b2f0db77c3f8534ceca5)~~、~~[Issue 0052: admin polling write probes](https://github.com/kaznak/modelkeep/commit/f94e24b)~~ |
 | 20–21: observation/testing | ~~[Issue 0015](https://github.com/kaznak/modelkeep/commit/1b024cc23d148df3640c0290f99f0d25fd5eb4ea)~~、[Issue 0022](issues/0022-complete-protocol-observation-matrix.md)、~~[Issue 0024: black-box crash and upgrade safety](https://github.com/kaznak/modelkeep/commit/ad5f20f)~~、[Issue 0025](issues/0025-validate-large-hf-cache-migration.md) |
-| 22: CI | ~~[native amd64/arm64 image jobs](https://github.com/kaznak/modelkeep/commit/b0a5f24e3d50e50b05b3c6c6ce178b0ed69c39f0)~~、[Issue 0023](issues/0023-test-multiple-hf-client-versions.md) |
+| 22: CI | ~~[native amd64/arm64 image jobs](https://github.com/kaznak/modelkeep/commit/b0a5f24e3d50e50b05b3c6c6ce178b0ed69c39f0)~~、~~[Issue 0023: supported HF client version matrix](https://github.com/kaznak/modelkeep/commit/6d6f77bb65174ed292552959b4b57879161dda99)~~ |
 | 23–24: phases/MVP acceptance | 下記のphase/MVP対応表、[Issue 0026](issues/0026-complete-qnap-gx10-acceptance-testing.md) |
 | 25: 将来拡張 | 下記の各候補Issue |
 | 26: 実装優先タスク | 下記のリンク付き一覧 |
@@ -650,20 +650,20 @@ modelkeep remove <repo> --revision <commit>
 
 最低限記録するイベント:
 
-- request — [Issue 0027](issues/0027-complete-structured-operational-events.md)
-- local hit — [Issue 0027](issues/0027-complete-structured-operational-events.md)
-- upstream miss — [Issue 0027](issues/0027-complete-structured-operational-events.md)
-- fetch start/finish/failure — [Issue 0027](issues/0027-complete-structured-operational-events.md)
-- verify failure — [Issue 0027](issues/0027-complete-structured-operational-events.md)
-- archive publish — [Issue 0027](issues/0027-complete-structured-operational-events.md)
-- disk full — [Issue 0004](issues/0004-add-storage-observability.md)、[Issue 0027](issues/0027-complete-structured-operational-events.md)
-- recovery of incomplete download — [Issue 0027](issues/0027-complete-structured-operational-events.md)
+- request — ~~[Issue 0027](https://github.com/kaznak/modelkeep/commit/461d59ec5ed69934c7ffd94c99a3afea8e8247fa)~~
+- local hit — ~~[Issue 0027](https://github.com/kaznak/modelkeep/commit/461d59ec5ed69934c7ffd94c99a3afea8e8247fa)~~
+- upstream miss — ~~[Issue 0027](https://github.com/kaznak/modelkeep/commit/461d59ec5ed69934c7ffd94c99a3afea8e8247fa)~~
+- fetch start/finish/failure — ~~[Issue 0027](https://github.com/kaznak/modelkeep/commit/461d59ec5ed69934c7ffd94c99a3afea8e8247fa)~~
+- verify failure — ~~[Issue 0027](https://github.com/kaznak/modelkeep/commit/461d59ec5ed69934c7ffd94c99a3afea8e8247fa)~~
+- archive publish — ~~[Issue 0027](https://github.com/kaznak/modelkeep/commit/461d59ec5ed69934c7ffd94c99a3afea8e8247fa)~~
+- disk full — ~~[Issue 0004](https://github.com/kaznak/modelkeep/commit/e0c0a2b3347835ca8834b2f0db77c3f8534ceca5)~~、~~[Issue 0027](https://github.com/kaznak/modelkeep/commit/461d59ec5ed69934c7ffd94c99a3afea8e8247fa)~~
+- recovery of incomplete download — ~~[Issue 0027](https://github.com/kaznak/modelkeep/commit/461d59ec5ed69934c7ffd94c99a3afea8e8247fa)~~
 
 Prometheus metrics は MVP 後でもよいが、追加しやすい構造にする。
 
 候補 metrics:
 
-以下のmetrics候補は[Issue 0004](issues/0004-add-storage-observability.md)で追跡する。
+以下のmetrics候補は~~[Issue 0004](https://github.com/kaznak/modelkeep/commit/e0c0a2b3347835ca8834b2f0db77c3f8534ceca5)~~で追跡した。
 
 ```text
 modelkeep_requests_total
@@ -786,7 +786,7 @@ CI matrix には最低限以下を含める。
 - ~~Rust unit/integration tests — [reproducible checks](https://github.com/kaznak/modelkeep/commit/2718a3a4dd54b1daade42d9abfe556192fc333af)~~
 - ~~`aarch64-linux` Nix build — [native arm64 CI](https://github.com/kaznak/modelkeep/commit/b0a5f24e3d50e50b05b3c6c6ce178b0ed69c39f0)~~
 - ~~OCI image build — [multi-architecture image workflow](https://github.com/kaznak/modelkeep/commit/ad1b222abe5777b08aa9fad67e56b34b76afb38c)~~
-- 複数`huggingface_hub` versionに対するcompatibility test — [Issue 0023](issues/0023-test-multiple-hf-client-versions.md)
+- 複数`huggingface_hub` versionに対するcompatibility test — ~~[Issue 0023](https://github.com/kaznak/modelkeep/commit/6d6f77bb65174ed292552959b4b57879161dda99)~~
 
 Hugging Face client の更新によって HTTP behavior が変わった場合、CI で検出する。
 
@@ -847,8 +847,8 @@ upstream を使う online test と、fixture/archive だけを使う determinist
 ### Phase 6 — Operations
 
 - ~~list/show/verify/audit — [Issue 0020](https://github.com/kaznak/modelkeep/commit/ef2da9c8a9471bc4ca3b900b6a15472759195480)~~
-- metrics — [Issue 0004](issues/0004-add-storage-observability.md)
-- disk capacity alerting — [Issue 0004](issues/0004-add-storage-observability.md)
+- metrics — ~~[Issue 0004](https://github.com/kaznak/modelkeep/commit/e0c0a2b3347835ca8834b2f0db77c3f8534ceca5)~~
+- disk capacity alerting — ~~[Issue 0004](https://github.com/kaznak/modelkeep/commit/e0c0a2b3347835ca8834b2f0db77c3f8534ceca5)~~
 - ~~upgrade procedure documentation — [Issue 0019](https://github.com/kaznak/modelkeep/commit/e95e1dc62c2187165f2b156406009dad55c1db65)~~
 - ~~cross-version executable validation — [Issue 0024](https://github.com/kaznak/modelkeep/commit/ad5f20f)~~
 - ~~backup/restore documentation — [Issue 0019](https://github.com/kaznak/modelkeep/commit/e95e1dc62c2187165f2b156406009dad55c1db65)~~
