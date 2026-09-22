@@ -13,10 +13,38 @@
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forAllSystems = function: nixpkgs.lib.genAttrs systems (system:
         function (import nixpkgs { inherit system; }));
+      supportedHfClientsFor = pkgs:
+        let
+          currentFromNixpkgs = pkgs.python3Packages."huggingface-hub";
+          current = assert currentFromNixpkgs.version == "1.27.0";
+            currentFromNixpkgs;
+          legacy = current.overridePythonAttrs (_: {
+            version = "0.36.0";
+            src = pkgs.fetchPypi {
+              pname = "huggingface_hub";
+              version = "0.36.0";
+              hash = "sha256-R7Pw4lOcOb9c3gFdY7cuxJuv9ntpMcPZfz+EUy4rjSU=";
+            };
+            dependencies = with pkgs.python3Packages; [
+              filelock
+              fsspec
+              hf-xet
+              packaging
+              pyyaml
+              requests
+              tqdm
+              typing-extensions
+            ];
+          });
+        in {
+          "0-36" = legacy;
+          "1-27" = current;
+        };
+      pythonForHfClient = pkgs: hfClient:
+        pkgs.python3.withPackages (_: [ hfClient ]);
       pythonFor = pkgs:
-        pkgs.python3.withPackages (pythonPackages: [
-          pythonPackages."huggingface-hub"
-        ]);
+        pythonForHfClient pkgs
+          (builtins.getAttr "1-27" (supportedHfClientsFor pkgs));
       rustToolsFor = pkgs: [
         pkgs.cargo
         pkgs.clippy
@@ -98,6 +126,7 @@
         let
           source = nixpkgs.lib.cleanSource ./.;
           python = pythonFor pkgs;
+          supportedHfClients = supportedHfClientsFor pkgs;
           oldModelkeep = pkgs.rustPlatform.buildRustPackage {
             pname = "modelkeep-upgrade-fixture";
             version = "0.2.1";
@@ -105,6 +134,25 @@
             cargoLock.lockFile = "${modelkeepV021}/Cargo.lock";
             doCheck = false;
           };
+          hfClientIntegration = version: hfClient:
+            let versionedPython = pythonForHfClient pkgs hfClient;
+            in pkgs.runCommand "modelkeep-hf-client-integration-${version}" {
+              nativeBuildInputs = [
+                versionedPython
+                pkgs.cacert
+                self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep
+              ];
+              SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+            } ''
+              export HOME="$TMPDIR"
+              export HF_HOME="$TMPDIR/huggingface"
+              export HF_HUB_DISABLE_PROGRESS_BARS=1
+              python3 ${./tests/hf_client_integration.py} \
+                ${self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep}/bin/modelkeep \
+                ${./tests/fixtures/hf_fetch_fixture.py} \
+                ${hfClient.version}
+              touch $out
+            '';
         in {
           format = pkgs.runCommand "modelkeep-format" {
             nativeBuildInputs = [ pkgs.cargo pkgs.rustfmt ];
@@ -143,21 +191,11 @@
             touch $out
           '';
 
-          hf-client-integration = pkgs.runCommand "modelkeep-hf-client-integration" {
-            nativeBuildInputs = [
-              python
-              pkgs.cacert
-              self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep
-            ];
-            SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
-          } ''
-            export HOME="$TMPDIR"
-            export HF_HOME="$TMPDIR/huggingface"
-            python3 ${./tests/hf_client_integration.py} \
-              ${self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep}/bin/modelkeep \
-              ${./tests/fixtures/hf_fetch_fixture.py}
-            touch $out
-          '';
+          hf-client-integration-0-36 =
+            hfClientIntegration "0-36" supportedHfClients."0-36";
+
+          hf-client-integration-1-27 =
+            hfClientIntegration "1-27" supportedHfClients."1-27";
 
           archive-restore-drill = pkgs.runCommand "modelkeep-archive-restore-drill" {
             nativeBuildInputs = [ python self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep ];

@@ -1,14 +1,14 @@
 ---
-status: open
+status: in-progress
 priority: P1
 related_adrs:
   - ADR-0005
 created: 2026-08-21
-updated: 2026-08-21
+updated: 2026-09-23
 ---
 # Issue 0023: Test multiple supported Hugging Face client versions
 
-- Status: Open
+- Status: In Progress
 - Priority: P1
 - Related ADR: ADR-0005
 
