@@ -185,8 +185,52 @@ struct StatusBody {
     pullthrough_enabled: bool,
     repository_count: usize,
     logical_archive_bytes: u64,
+    archive_filesystem_path: String,
+    archive_filesystem_total_bytes: u64,
+    archive_filesystem_available_bytes: u64,
+    archive_filesystem_available_percent: u8,
+    archive_filesystem_low_space: bool,
     principal: PrincipalView,
     auth_methods: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FilesystemCapacity {
+    total_bytes: u64,
+    available_bytes: u64,
+    available_percent: u8,
+    low_space: bool,
+}
+
+fn filesystem_capacity(path: &std::path::Path) -> std::io::Result<FilesystemCapacity> {
+    let status = rustix::fs::statvfs(path)?;
+    Ok(filesystem_capacity_from_blocks(
+        status.f_blocks,
+        status.f_bavail,
+        status.f_frsize,
+    ))
+}
+
+fn filesystem_capacity_from_blocks(
+    total_blocks: u64,
+    available_blocks: u64,
+    fragment_size: u64,
+) -> FilesystemCapacity {
+    let total_bytes = total_blocks.saturating_mul(fragment_size);
+    let available_bytes = available_blocks.saturating_mul(fragment_size);
+    let available_percent = if total_bytes == 0 {
+        0
+    } else {
+        ((u128::from(available_bytes) * 100) / u128::from(total_bytes)).min(100) as u8
+    };
+    let low_space =
+        total_bytes == 0 || u128::from(available_bytes) * 100 <= u128::from(total_bytes) * 10;
+    FilesystemCapacity {
+        total_bytes,
+        available_bytes,
+        available_percent,
+        low_space,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1215,8 +1259,11 @@ async fn status(state: AdminState, headers: HeaderMap, pullthrough_enabled: bool
     let Some(principal) = authenticate(&state.config, &headers) else {
         return unauthorized(&state.config);
     };
-    match state.archive.list_repositories() {
-        Ok(repositories) => Json(StatusBody {
+    match (
+        state.archive.list_repositories(),
+        filesystem_capacity(&state.archive.root),
+    ) {
+        (Ok(repositories), Ok(capacity)) => Json(StatusBody {
             version: env!("CARGO_PKG_VERSION"),
             // Startup and `/readyz` perform the active write probe. Management UI
             // polling only reports its last result so it cannot create continuous
@@ -1228,11 +1275,17 @@ async fn status(state: AdminState, headers: HeaderMap, pullthrough_enabled: bool
                 .iter()
                 .map(|repository| repository.logical_bytes)
                 .sum(),
+            archive_filesystem_path: state.archive.root.display().to_string(),
+            archive_filesystem_total_bytes: capacity.total_bytes,
+            archive_filesystem_available_bytes: capacity.available_bytes,
+            archive_filesystem_available_percent: capacity.available_percent,
+            archive_filesystem_low_space: capacity.low_space,
             principal,
             auth_methods: state.config.auth_methods(),
         })
         .into_response(),
-        Err(error) => archive_error(error),
+        (Err(error), _) => archive_error(error),
+        (_, Err(error)) => archive_error(error.into()),
     }
 }
 
@@ -1748,8 +1801,43 @@ mod tests {
             let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
             let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(value["ready"], true);
+            assert_eq!(
+                value["archive_filesystem_path"],
+                directory.path().display().to_string()
+            );
+            assert!(value["archive_filesystem_total_bytes"].as_u64().unwrap() > 0);
+            assert!(
+                value["archive_filesystem_available_bytes"]
+                    .as_u64()
+                    .unwrap()
+                    <= value["archive_filesystem_total_bytes"].as_u64().unwrap()
+            );
+            assert!(
+                value["archive_filesystem_available_percent"]
+                    .as_u64()
+                    .unwrap()
+                    <= 100
+            );
+            assert!(value["archive_filesystem_low_space"].is_boolean());
             assert!(!directory.path().join("tmp").exists());
         }
+    }
+
+    #[test]
+    fn filesystem_capacity_warns_at_ten_percent_available() {
+        let warning = filesystem_capacity_from_blocks(100, 10, 4096);
+        assert_eq!(warning.total_bytes, 409_600);
+        assert_eq!(warning.available_bytes, 40_960);
+        assert_eq!(warning.available_percent, 10);
+        assert!(warning.low_space);
+
+        let healthy = filesystem_capacity_from_blocks(100, 11, 4096);
+        assert_eq!(healthy.available_percent, 11);
+        assert!(!healthy.low_space);
+
+        let just_above_threshold = filesystem_capacity_from_blocks(10_000, 1_001, 4096);
+        assert_eq!(just_above_threshold.available_percent, 10);
+        assert!(!just_above_threshold.low_space);
     }
 
     #[tokio::test]

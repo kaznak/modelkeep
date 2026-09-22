@@ -161,6 +161,9 @@ The `GET /healthz` endpoint is a lightweight process liveness check. `GET /ready
 The management status field `ready` reports the most recent startup or `/readyz`
 probe result. Reading management status never performs its own archive write probe,
 so normal UI polling does not create continuous QNAP filesystem flushes.
+The authenticated management status and UI also report the measured archive path,
+filesystem total and user-available bytes, and a low-space warning at 10% available.
+Capacity pressure is observational only and never triggers archive deletion.
 
 ## Durable archive
 

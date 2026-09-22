@@ -143,6 +143,9 @@ modelkeep verify /data Qwen/ExampleModel <commit>
 healthcheck に `modelkeep ready` を使用し、archive path が利用可能かつ書込み可能かを
 `/readyz` で確認します。管理APIの `ready` は起動時または直近の `/readyz` probe結果を
 返します。管理画面のpolling自体はarchiveへの書込みprobeを実行しません。
+認証済みの管理APIと画面には、測定対象のarchive path、filesystemの総容量と一般ユーザーが
+利用可能な容量、および空き容量10%以下の警告も表示します。容量不足がarchiveの自動削除を
+引き起こすことはありません。
 
 ## Durable archive
 

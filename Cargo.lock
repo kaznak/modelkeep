@@ -363,6 +363,7 @@ name = "modelkeep"
 version = "0.4.3"
 dependencies = [
  "axum",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

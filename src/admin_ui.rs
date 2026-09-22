@@ -151,7 +151,9 @@ function duration(seconds) {
 }
 
 function renderOverview(status) {
-  const values = [['Service', status.ready ? 'Ready' : 'Not ready'], ['Repositories', status.repository_count], ['Archive size', bytes(status.logical_archive_bytes)], ['Pull-through', status.pullthrough_enabled ? 'Enabled' : 'Disabled']];
+  const capacity = `${bytes(status.archive_filesystem_available_bytes)} free of ${bytes(status.archive_filesystem_total_bytes)} (${status.archive_filesystem_available_percent}%)`;
+  const storage = status.archive_filesystem_low_space ? `Low space · ${capacity}` : capacity;
+  const values = [['Service', status.ready ? 'Ready' : 'Not ready'], ['Repositories', status.repository_count], ['Archive size', bytes(status.logical_archive_bytes)], ['Storage', storage], ['Measured path', status.archive_filesystem_path], ['Pull-through', status.pullthrough_enabled ? 'Enabled' : 'Disabled']];
   $('overview').replaceChildren(...values.map(([label, value]) => { const card = node('article', 'metric'); card.append(node('span', '', label), node('strong', '', value)); return card; }));
 }
 
@@ -274,6 +276,9 @@ mod tests {
         assert!(SCRIPT.contains("const job = await api('/api/admin/v1/jobs'"));
         assert!(INDEX.contains("id=\"more-jobs\""));
         assert!(SCRIPT.contains("cursor=${encodeURIComponent(jobsCursor)}"));
+        assert!(SCRIPT.contains("archive_filesystem_available_bytes"));
+        assert!(SCRIPT.contains("archive_filesystem_low_space ? `Low space"));
+        assert!(SCRIPT.contains("archive_filesystem_path"));
         assert!(SCRIPT.contains("$('repo-id').value = ''; $('form-message').textContent"));
     }
 }
