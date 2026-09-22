@@ -17,6 +17,8 @@ protocol observations are deliberately separate from this compatibility gate.
 The latest dated upstream matrix and its reproducible, credential-free procedure
 are recorded in
 [`observations/hugging-face-protocol-2026-09-22.md`](observations/hugging-face-protocol-2026-09-22.md).
+Its sanitized [machine-readable record](observations/hugging-face-protocol-2026-09-22.json)
+is validated offline by `nix flake check`.
 The deterministic suite mirrors its public, safetensors, sharded, immutable
 revision, `HEAD`, Range, redirect, and Xet-boundary behaviors without contacting
 Hugging Face.
