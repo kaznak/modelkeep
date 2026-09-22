@@ -1548,6 +1548,7 @@ mod tests {
     };
     use axum::{body::to_bytes, body::Body, http::Request};
     use std::io::Write;
+    use std::sync::OnceLock;
     use tower::ServiceExt;
     use tracing_subscriber::EnvFilter;
 
@@ -1579,15 +1580,22 @@ mod tests {
         }
     }
 
-    fn capture_logs() -> (LogWriter, tracing::subscriber::DefaultGuard) {
-        let writer = LogWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .json()
-            .with_env_filter(EnvFilter::new("info"))
-            .with_writer(writer.clone())
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        (writer, guard)
+    fn capture_global_logs() -> LogWriter {
+        static WRITER: OnceLock<LogWriter> = OnceLock::new();
+        let writer = WRITER
+            .get_or_init(|| {
+                let writer = LogWriter::default();
+                let subscriber = tracing_subscriber::fmt()
+                    .json()
+                    .with_env_filter(EnvFilter::new("info"))
+                    .with_writer(writer.clone())
+                    .finish();
+                tracing::subscriber::set_global_default(subscriber).unwrap();
+                writer
+            })
+            .clone();
+        writer.0.lock().unwrap().clear();
+        writer
     }
 
     struct FixtureFetcher;
@@ -1643,7 +1651,7 @@ mod tests {
 
     #[test]
     fn invalid_helper_output_is_safe_in_management_state_and_failure_event() {
-        let (writer, _guard) = capture_logs();
+        let writer = capture_global_logs();
         let directory = tempfile::tempdir().unwrap();
         let archive = Arc::new(Archive::new(directory.path()).unwrap());
         let manager = JobManager::open(&archive).unwrap();
