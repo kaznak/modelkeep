@@ -327,7 +327,7 @@ mod tests {
         let helper = directory.path().join("helper.sh");
         fs::write(&helper, format!("#!/bin/sh\n{script}\n")).unwrap();
         OfficialHfFetcher {
-            python: "/bin/sh".into(),
+            python: "sh".into(),
             helper,
         }
         .fetch(&FetchRequest {
@@ -498,7 +498,7 @@ mod tests {
         .unwrap();
         let started = Instant::now();
         let error = OfficialHfFetcher {
-            python: "/bin/sh".into(),
+            python: "sh".into(),
             helper,
         }
         .fetch(&FetchRequest {

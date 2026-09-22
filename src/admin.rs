@@ -1675,7 +1675,7 @@ mod tests {
         let pullthrough = Arc::new(PullThrough::new(
             (*archive).clone(),
             Arc::new(OfficialHfFetcher {
-                python: "/bin/sh".into(),
+                python: "sh".into(),
                 helper,
             }),
         ));
