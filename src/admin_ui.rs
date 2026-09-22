@@ -189,6 +189,7 @@ function renderJobs(page) {
       row.append(node('small', 'job-meta', `Queued ${dateTime(job.created_at)} · not started`));
     }
     const parts = [job.phase];
+    if (job.resumed) parts.push('resumed partial download');
     if (job.total_bytes == null) parts.push(`${bytes(job.progress_bytes)} · total unknown`); else parts.push(`${bytes(job.progress_bytes || 0)} / ${bytes(job.total_bytes)}`);
     if (job.progress_files != null) parts.push(job.total_files == null ? `${job.progress_files} files` : `${job.progress_files} / ${job.total_files} files`);
     if (job.state === 'running' && job.progress_bytes != null) {

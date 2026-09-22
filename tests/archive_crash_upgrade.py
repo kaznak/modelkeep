@@ -125,7 +125,7 @@ def expire_staging_leases(archive):
     return staging
 
 
-def crash_recovery_check(current, crash_helper, root):
+def crash_recovery_check(current, crash_helper, resume_helper, root):
     archive = root / "crash-archive"
     cache = create_cache(root / "stable", "org/stable", STABLE_COMMIT, b"stable")
     import_cache(current, cache, archive)
@@ -144,7 +144,7 @@ def crash_recovery_check(current, crash_helper, root):
     requester = threading.Thread(target=request_missing_revision)
     requester.start()
     for _ in range(200):
-        if list((archive / "tmp").glob("fetch-*/partial.bin")):
+        if list((archive / "tmp").glob(".fetch-active-*/partial.bin")):
             break
         time.sleep(0.025)
     else:
@@ -167,8 +167,11 @@ def crash_recovery_check(current, crash_helper, root):
             assert response.read() == b"stable"
 
     staging = expire_staging_leases(archive)
-    with server(current, archive) as offline:
-        assert response_status(f"{offline}/readyz") == 200
+    with server(current, archive, resume_helper) as resumed:
+        with urllib.request.urlopen(
+            f"{resumed}/org/crash/resolve/main/partial.bin", timeout=10
+        ) as response:
+            assert response.read() == b"incomplete-model-payload-resumed"
     assert all(not path.exists() for path in staging)
     subprocess.run(
         [str(current), "verify", str(archive), "org/stable", STABLE_COMMIT],
@@ -204,12 +207,12 @@ def upgrade_check(old, current, root):
 
 
 def main():
-    if len(sys.argv) != 4:
-        raise SystemExit("usage: archive_crash_upgrade.py CURRENT OLD CRASH_HELPER")
-    current, old, crash_helper = map(Path, sys.argv[1:])
+    if len(sys.argv) != 5:
+        raise SystemExit("usage: archive_crash_upgrade.py CURRENT OLD CRASH_HELPER RESUME_HELPER")
+    current, old, crash_helper, resume_helper = map(Path, sys.argv[1:])
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
-        crash_recovery_check(current, crash_helper, root)
+        crash_recovery_check(current, crash_helper, resume_helper, root)
         upgrade_check(old, current, root)
 
 

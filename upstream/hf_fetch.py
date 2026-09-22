@@ -129,6 +129,8 @@ def safe_relative_files(root: Path):
             raise ValueError("unsafe upstream path")
         if ".cache" in relative.parts:
             continue
+        if relative.parts[0].startswith(".modelkeep-"):
+            continue
         result.append(relative.as_posix())
     return sorted(result)
 
@@ -163,6 +165,10 @@ def acquire(repo_id, requested_revision, output, files=None, api=None, download=
     commit = info.sha
     if not isinstance(commit, str) or not COMMIT_PATTERN.fullmatch(commit):
         raise ValueError("upstream returned malformed commit identity")
+    print(
+        json.dumps({"type": "resolved", "version": 1, "commit": commit}, separators=(",", ":")),
+        flush=True,
+    )
     expected = expected_files(info, files)
     if progress is not None:
         progress.set_expected(output, expected)

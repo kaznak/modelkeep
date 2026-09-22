@@ -28,7 +28,24 @@ pub mod upstream;
 
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const STAGING_LEASE_FILE: &str = ".modelkeep-staging-lease";
-const STAGING_LEASE_SECONDS: u64 = 3600;
+pub(crate) const FETCH_STAGING_FILE: &str = ".modelkeep-fetch.json";
+const STAGING_LEASE_SECONDS: u64 = 120;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FetchStagingMetadata {
+    version: u32,
+    pub(crate) repo_id: String,
+    pub(crate) requested_revision: String,
+    pub(crate) files: Vec<String>,
+    pub(crate) resolved_commit: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FetchStaging {
+    pub(crate) path: PathBuf,
+    pub(crate) resumed: bool,
+    pub(crate) resolved_commit: Option<String>,
+}
 
 #[derive(Debug)]
 pub enum ArchiveError {
@@ -298,6 +315,25 @@ impl Archive {
             if expires_at > unix_timestamp() {
                 continue;
             }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("fetch-abandoned-") {
+                if read_fetch_staging_metadata(&path)
+                    .is_ok_and(|metadata| metadata.resolved_commit.is_some())
+                {
+                    continue;
+                }
+            } else if name.starts_with(".fetch-active-")
+                && read_fetch_staging_metadata(&path)
+                    .is_ok_and(|metadata| metadata.resolved_commit.is_some())
+            {
+                let abandoned = self
+                    .root
+                    .join("tmp")
+                    .join(format!("fetch-abandoned-{}", operation_id()));
+                fs::rename(&path, abandoned)?;
+                sync_directory(&self.root.join("tmp"))?;
+                continue;
+            }
             fs::remove_dir_all(path)?;
             recovered += 1;
         }
@@ -515,6 +551,116 @@ impl Archive {
         self.create_staging("fetch")
     }
 
+    pub(crate) fn acquire_fetch_staging(
+        &self,
+        repo_id: &str,
+        requested_revision: &str,
+        files: &[String],
+    ) -> ArchiveResult<FetchStaging> {
+        validate_repo_id(repo_id)?;
+        validate_component(requested_revision)?;
+        for file in files {
+            validate_relative_file_path(file)?;
+        }
+        let now = unix_timestamp();
+        for entry in fs::read_dir(self.root.join("tmp"))? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir()
+                || !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("fetch-abandoned-")
+            {
+                continue;
+            }
+            let old = entry.path();
+            let Ok(metadata) = read_fetch_staging_metadata(&old) else {
+                continue;
+            };
+            if metadata.repo_id != repo_id
+                || metadata.requested_revision != requested_revision
+                || metadata.files != files
+                || metadata.resolved_commit.is_none()
+            {
+                continue;
+            }
+            let expires_at = read_lease_expiry(&old)?;
+            if expires_at > now {
+                return Err(ArchiveError::AlreadyPublished(old));
+            }
+            let operation = operation_id();
+            let claimed = self
+                .root
+                .join("tmp")
+                .join(format!(".fetch-active-{operation}"));
+            match fs::rename(&old, &claimed) {
+                Ok(()) => {
+                    write_staging_lease(&claimed, &operation)?;
+                    sync_directory(&self.root.join("tmp"))?;
+                    spawn_lease_heartbeat(claimed.clone());
+                    return Ok(FetchStaging {
+                        path: claimed,
+                        resumed: true,
+                        resolved_commit: metadata.resolved_commit,
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        for entry in fs::read_dir(self.root.join("tmp"))? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir()
+                || !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".fetch-active-")
+            {
+                continue;
+            }
+            let path = entry.path();
+            if read_fetch_staging_metadata(&path).is_ok_and(|metadata| {
+                metadata.repo_id == repo_id
+                    && metadata.requested_revision == requested_revision
+                    && metadata.files == files
+            }) {
+                return Err(ArchiveError::AlreadyPublished(path));
+            }
+        }
+        let path = self.create_staging(".fetch-active")?;
+        write_fetch_staging_metadata(
+            &path,
+            &FetchStagingMetadata {
+                version: 1,
+                repo_id: repo_id.into(),
+                requested_revision: requested_revision.into(),
+                files: files.to_vec(),
+                resolved_commit: None,
+            },
+        )?;
+        Ok(FetchStaging {
+            path,
+            resumed: false,
+            resolved_commit: None,
+        })
+    }
+
+    pub(crate) fn preserve_fetch_staging(&self, staging: &Path) -> ArchiveResult<()> {
+        let metadata = read_fetch_staging_metadata(staging)?;
+        if metadata.resolved_commit.is_none() {
+            fs::remove_dir_all(staging)?;
+            return Ok(());
+        }
+        let abandoned = self
+            .root
+            .join("tmp")
+            .join(format!("fetch-abandoned-{}", operation_id()));
+        fs::rename(staging, &abandoned)?;
+        write_staging_lease_with_expiry(&abandoned, "abandoned", 0)?;
+        sync_directory(&self.root.join("tmp"))?;
+        Ok(())
+    }
+
     pub fn revision_path(&self, repo_id: &str, commit: &str) -> ArchiveResult<PathBuf> {
         let (namespace, name) = validate_repo_id(repo_id)?;
         validate_revision(commit)?;
@@ -719,18 +865,7 @@ impl Archive {
             let staging = self.root.join("tmp").join(format!("{prefix}-{operation}"));
             match fs::create_dir(&staging) {
                 Ok(()) => {
-                    let mut lease = OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(staging.join(STAGING_LEASE_FILE))?;
-                    writeln!(lease, "nonce={operation}")?;
-                    writeln!(lease, "pid={}", process::id())?;
-                    writeln!(
-                        lease,
-                        "expires_at={}",
-                        unix_timestamp() + STAGING_LEASE_SECONDS
-                    )?;
-                    lease.sync_all()?;
+                    write_staging_lease(&staging, &operation)?;
                     sync_directory(&staging)?;
                     spawn_lease_heartbeat(staging.clone());
                     return Ok(staging);
@@ -890,6 +1025,102 @@ impl Archive {
         sync_directory(staging)?;
         Ok(())
     }
+}
+
+pub(crate) fn record_fetch_resolved_commit(
+    staging: &Path,
+    request_repo_id: &str,
+    request_revision: &str,
+    files: &[String],
+    commit: &str,
+) -> ArchiveResult<()> {
+    validate_revision(commit)?;
+    let mut metadata = read_fetch_staging_metadata(staging)?;
+    if metadata.repo_id != request_repo_id
+        || metadata.requested_revision != request_revision
+        || metadata.files != files
+    {
+        return Err(ArchiveError::IntegrityMismatch(
+            "fetch staging identity changed".into(),
+        ));
+    }
+    if metadata
+        .resolved_commit
+        .as_deref()
+        .is_some_and(|resolved| resolved != commit)
+    {
+        return Err(ArchiveError::IntegrityMismatch(
+            "resolved fetch commit changed".into(),
+        ));
+    }
+    metadata.resolved_commit = Some(commit.into());
+    write_fetch_staging_metadata(staging, &metadata)
+}
+
+fn read_fetch_staging_metadata(staging: &Path) -> ArchiveResult<FetchStagingMetadata> {
+    let metadata: FetchStagingMetadata =
+        serde_json::from_slice(&fs::read(staging.join(FETCH_STAGING_FILE))?)
+            .map_err(|error| ArchiveError::IntegrityMismatch(error.to_string()))?;
+    if metadata.version != 1
+        || metadata
+            .resolved_commit
+            .as_deref()
+            .is_some_and(|value| !is_hf_commit(value))
+    {
+        return Err(ArchiveError::IntegrityMismatch(
+            "invalid fetch staging metadata".into(),
+        ));
+    }
+    validate_repo_id(&metadata.repo_id)?;
+    validate_component(&metadata.requested_revision)?;
+    for file in &metadata.files {
+        validate_relative_file_path(file)?;
+    }
+    Ok(metadata)
+}
+
+fn write_fetch_staging_metadata(
+    staging: &Path,
+    metadata: &FetchStagingMetadata,
+) -> ArchiveResult<()> {
+    let temporary = staging.join(format!(".modelkeep-fetch-{}.part", operation_id()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    serde_json::to_writer(&mut file, metadata)
+        .map_err(|error| ArchiveError::IntegrityMismatch(error.to_string()))?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    fs::rename(temporary, staging.join(FETCH_STAGING_FILE))?;
+    sync_directory(staging)?;
+    Ok(())
+}
+
+fn read_lease_expiry(staging: &Path) -> ArchiveResult<u64> {
+    fs::read_to_string(staging.join(STAGING_LEASE_FILE))?
+        .lines()
+        .find_map(|line| line.strip_prefix("expires_at=")?.parse().ok())
+        .ok_or_else(|| ArchiveError::IntegrityMismatch("staging lease has no expiry".into()))
+}
+
+fn write_staging_lease(staging: &Path, nonce: &str) -> ArchiveResult<()> {
+    write_staging_lease_with_expiry(staging, nonce, unix_timestamp() + STAGING_LEASE_SECONDS)
+}
+
+fn write_staging_lease_with_expiry(
+    staging: &Path,
+    nonce: &str,
+    expires_at: u64,
+) -> ArchiveResult<()> {
+    let temporary = staging.join(".modelkeep-staging-lease.part");
+    let mut lease = File::create(&temporary)?;
+    writeln!(lease, "nonce={nonce}")?;
+    writeln!(lease, "pid={}", process::id())?;
+    writeln!(lease, "expires_at={}", expires_at)?;
+    lease.sync_all()?;
+    fs::rename(temporary, staging.join(STAGING_LEASE_FILE))?;
+    Ok(())
 }
 
 fn remove_unlisted_staging_entries(
@@ -1516,6 +1747,113 @@ mod tests {
         assert_eq!(archive.recover_incomplete().unwrap(), 1);
         assert!(!staging.exists());
         assert!(!directory.path().join("models/org/model/revisions").exists());
+    }
+
+    #[test]
+    fn resumes_matching_expired_fetch_staging_exclusively() {
+        let (archive, _directory) = archive();
+        let original = archive
+            .acquire_fetch_staging("org/model", "main", &[])
+            .unwrap();
+        fs::write(original.path.join("partial.bin"), b"partial").unwrap();
+        record_fetch_resolved_commit(&original.path, "org/model", "main", &[], &"a".repeat(40))
+            .unwrap();
+        fs::write(
+            original.path.join(STAGING_LEASE_FILE),
+            "nonce=expired\npid=1\nexpires_at=0\n",
+        )
+        .unwrap();
+
+        assert_eq!(archive.recover_incomplete().unwrap(), 0);
+        let resumed = archive
+            .acquire_fetch_staging("org/model", "main", &[])
+            .unwrap();
+        assert!(resumed.resumed);
+        assert_eq!(resumed.resolved_commit, Some("a".repeat(40)));
+        assert_eq!(
+            fs::read(resumed.path.join("partial.bin")).unwrap(),
+            b"partial"
+        );
+        assert!(!original.path.exists());
+        assert!(matches!(
+            archive.acquire_fetch_staging("org/model", "main", &[]),
+            Err(ArchiveError::AlreadyPublished(_))
+        ));
+    }
+
+    #[test]
+    fn recovery_discards_fetch_staging_without_a_resolved_commit() {
+        let (archive, _directory) = archive();
+        let staging = archive
+            .acquire_fetch_staging("org/model", "main", &[])
+            .unwrap();
+        fs::write(
+            staging.path.join(STAGING_LEASE_FILE),
+            "nonce=expired\npid=1\nexpires_at=0\n",
+        )
+        .unwrap();
+        assert_eq!(archive.recover_incomplete().unwrap(), 1);
+        assert!(!staging.path.exists());
+    }
+
+    #[test]
+    fn resolved_fetch_commit_cannot_change() {
+        let (archive, _directory) = archive();
+        let staging = archive
+            .acquire_fetch_staging("org/model", "main", &[])
+            .unwrap();
+        record_fetch_resolved_commit(&staging.path, "org/model", "main", &[], &"a".repeat(40))
+            .unwrap();
+        assert!(matches!(
+            record_fetch_resolved_commit(&staging.path, "org/model", "main", &[], &"b".repeat(40)),
+            Err(ArchiveError::IntegrityMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn concurrent_retries_claim_one_abandoned_fetch() {
+        let (archive, _directory) = archive();
+        let staging = archive
+            .acquire_fetch_staging("org/model", "main", &[])
+            .unwrap();
+        record_fetch_resolved_commit(&staging.path, "org/model", "main", &[], &"a".repeat(40))
+            .unwrap();
+        fs::write(
+            staging.path.join(STAGING_LEASE_FILE),
+            "nonce=expired\npid=1\nexpires_at=0\n",
+        )
+        .unwrap();
+        archive.recover_incomplete().unwrap();
+
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let archive = archive.clone();
+            let barrier = barrier.clone();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                archive.acquire_fetch_staging("org/model", "main", &[])
+            }));
+        }
+        barrier.wait();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result.as_ref().is_ok_and(|staging| staging.resumed))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(ArchiveError::AlreadyPublished(_))))
+                .count(),
+            1
+        );
     }
     #[test]
     fn reuses_fetch_staging_for_publication() {

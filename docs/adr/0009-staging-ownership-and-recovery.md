@@ -1,6 +1,6 @@
 # ADR-0009: Lease-protected staging ownership and recovery
 
-- Status: Accepted
+- Status: Superseded by ADR-0017
 - Date: 2026-08-21
 
 ## Context

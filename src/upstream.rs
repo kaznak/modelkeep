@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
-use crate::is_hf_commit;
+use crate::{is_hf_commit, record_fetch_resolved_commit};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchRequest {
@@ -12,6 +12,7 @@ pub struct FetchRequest {
     pub revision: String,
     pub files: Vec<String>,
     pub staging: PathBuf,
+    pub resume_commit: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,7 +111,7 @@ impl UpstreamFetcher for OfficialHfFetcher {
             .arg("--repo-id")
             .arg(&request.repo_id)
             .arg("--revision")
-            .arg(&request.revision)
+            .arg(request.resume_commit.as_ref().unwrap_or(&request.revision))
             .arg("--output")
             .arg(&request.staging)
             .stdout(Stdio::piped())
@@ -139,6 +140,26 @@ impl UpstreamFetcher for OfficialHfFetcher {
                     }
                     progress(event);
                 }
+                Some("resolved") => {
+                    let commit = value.get("commit").and_then(|value| value.as_str()).ok_or(
+                        UpstreamError::InvalidOutput("helper emitted a malformed resolved event"),
+                    )?;
+                    if !is_hf_commit(commit) {
+                        return Err(UpstreamError::InvalidOutput(
+                            "helper resolved a malformed commit identity",
+                        ));
+                    }
+                    record_fetch_resolved_commit(
+                        &request.staging,
+                        &request.repo_id,
+                        &request.revision,
+                        &request.files,
+                        commit,
+                    )
+                    .map_err(|_| {
+                        UpstreamError::InvalidOutput("fetch staging metadata update failed")
+                    })?;
+                }
                 Some("result") | None => {
                     result = Some(serde_json::from_value(value).map_err(|_| {
                         UpstreamError::InvalidOutput("helper emitted a malformed result event")
@@ -166,6 +187,15 @@ impl UpstreamFetcher for OfficialHfFetcher {
         if !is_hf_commit(&response.commit) {
             return Err(UpstreamError::InvalidOutput(
                 "helper returned a malformed commit identity",
+            ));
+        }
+        if request
+            .resume_commit
+            .as_deref()
+            .is_some_and(|commit| commit != response.commit)
+        {
+            return Err(UpstreamError::InvalidOutput(
+                "helper result did not match the resumed commit",
             ));
         }
         if response.files.is_empty() {

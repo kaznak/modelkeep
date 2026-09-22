@@ -26,7 +26,7 @@
       cargoValidation = pkgs: name: command:
         pkgs.rustPlatform.buildRustPackage {
           pname = "modelkeep-${name}";
-          version = "0.4.2";
+          version = "0.4.3";
           src = nixpkgs.lib.cleanSource ./.;
           cargoLock.lockFile = ./Cargo.lock;
           nativeBuildInputs = rustToolsFor pkgs;
@@ -53,7 +53,7 @@
         in {
         modelkeep = pkgs.rustPlatform.buildRustPackage {
           pname = "modelkeep";
-          version = "0.4.2";
+          version = "0.4.3";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
           meta.mainProgram = "modelkeep";
@@ -61,7 +61,7 @@
 
         modelkeep-image = pkgs.dockerTools.buildLayeredImage {
           name = "modelkeep";
-          tag = "0.4.2";
+          tag = "0.4.3";
           contents = [ self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep hfFetcher python pkgs.cacert pkgs.coreutils ];
           config = {
             Entrypoint = [ "${self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep}/bin/modelkeep" "serve" ];
@@ -177,7 +177,8 @@
             python3 ${./tests/archive_crash_upgrade.py} \
               ${self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep}/bin/modelkeep \
               ${oldModelkeep}/bin/modelkeep \
-              ${./tests/fixtures/hf_fetch_crash_fixture.py}
+              ${./tests/fixtures/hf_fetch_crash_fixture.py} \
+              ${./tests/fixtures/hf_fetch_resume_fixture.py}
             touch $out
           '';
 
@@ -208,7 +209,7 @@
             test "$(yq -r '.services.modelkeep.environment.MODELKEEP_TRUST_TAILSCALE_HEADERS' ${./compose.yaml})" = "true"
             image="$(yq -r '.services.modelkeep.image' ${./compose.yaml})"
             init_image="$(yq -r '.services."modelkeep-init".image' ${./compose.init.yaml})"
-            test "$image" = "ghcr.io/kaznak/modelkeep:v0.4.2"
+            test "$image" = "ghcr.io/kaznak/modelkeep:v0.4.3"
             test "$init_image" = "$image"
             test "$(yq -r '.services | keys | join(" ")' ${./compose.yaml})" = "modelkeep"
             test "$(yq -r '.services | keys | join(" ")' ${./compose.init.yaml})" = "modelkeep-init"

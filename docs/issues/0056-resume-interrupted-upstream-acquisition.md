@@ -5,14 +5,15 @@ related_adrs:
   - ADR-0008
   - ADR-0009
   - ADR-0010
+  - ADR-0017
 created: 2026-08-24
-updated: 2026-08-24
+updated: 2026-09-23
 ---
 # Issue 0056: Resume interrupted upstream acquisition safely
 
 - Status: Open
 - Priority: P1
-- Related ADR: ADR-0008, ADR-0009, ADR-0010
+- Related ADR: ADR-0008, ADR-0009, ADR-0010, ADR-0017
 
 ## Objective
 
@@ -86,3 +87,10 @@ The supported Hugging Face client may change its partial-download metadata or re
 behavior. ModelKeep must treat that state as an optimization, not durable archive
 format or authority. If safe compatibility cannot be demonstrated for a client
 version, starting a new acquisition is preferable to adopting ambiguous bytes.
+
+## Implementation status
+
+Implemented on 2026-09-23 with versioned fetch identity, commit-pinned helper reuse,
+atomic expired-lease claiming, persisted `resumed` job state, and a black-box
+SIGKILL/recreation test. The issue remains open until the required representative
+QNAP recreation drill and both GitHub Actions architectures have completed.

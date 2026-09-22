@@ -133,8 +133,13 @@ impl PullThrough {
         let previous = self.archive.resolve_ref(repo_id, reference).ok();
         let staging = self
             .archive
-            .create_fetch_staging()
+            .acquire_fetch_staging(repo_id, reference, &[])
             .map_err(PullThroughError::from)?;
+        progress(FetchProgress::phase(if staging.resumed {
+            "resuming_snapshot"
+        } else {
+            "acquiring_snapshot"
+        }));
         let fetched = self
             .fetcher
             .fetch_with_progress(
@@ -142,16 +147,17 @@ impl PullThrough {
                     repo_id: repo_id.into(),
                     revision: reference.into(),
                     files: Vec::new(),
-                    staging: staging.clone(),
+                    staging: staging.path.clone(),
+                    resume_commit: staging.resolved_commit.clone(),
                 },
                 progress,
             )
             .map_err(|error| {
-                let _ = std::fs::remove_dir_all(&staging);
+                self.handle_fetch_failure(&staging.path, &error);
                 PullThroughError::from(error)
             })?;
         if dry_run {
-            let _ = std::fs::remove_dir_all(&staging);
+            let _ = std::fs::remove_dir_all(&staging.path);
             return Ok(RefreshResult {
                 previous,
                 proposed: fetched.commit,
@@ -164,7 +170,7 @@ impl PullThrough {
                 .iter()
                 .map(|path| SourceFile {
                     path: path.clone(),
-                    source: staging.join(path),
+                    source: staging.path.join(path),
                 })
                 .collect();
             match self.archive.publish_revision_from_directory_with_progress(
@@ -172,7 +178,7 @@ impl PullThrough {
                     repo_id: repo_id.into(),
                     requested_revision: reference.into(),
                     commit: fetched.commit.clone(),
-                    source_root: staging.clone(),
+                    source_root: staging.path.clone(),
                     files,
                 },
                 &|phase| progress(FetchProgress::phase(phase)),
@@ -183,7 +189,7 @@ impl PullThrough {
                 Err(error) => return Err(error.into()),
             }
         }
-        let _ = std::fs::remove_dir_all(&staging);
+        let _ = std::fs::remove_dir_all(&staging.path);
         self.archive
             .update_ref(repo_id, reference, &fetched.commit)
             .map_err(PullThroughError::from)?;
@@ -215,18 +221,26 @@ impl PullThrough {
                 return Ok(commit);
             }
         }
-        let staging = self.archive.create_fetch_staging()?;
-        tracing::info!(repo_id = %repo_id, requested_revision = %requested_revision, "upstream fetch start");
+        let staging = self
+            .archive
+            .acquire_fetch_staging(repo_id, requested_revision, &[])?;
+        progress(FetchProgress::phase(if staging.resumed {
+            "resuming_snapshot"
+        } else {
+            "acquiring_snapshot"
+        }));
+        tracing::info!(repo_id = %repo_id, requested_revision = %requested_revision, resumed = staging.resumed, "upstream fetch start");
         let request = FetchRequest {
             repo_id: repo_id.to_string(),
             revision: requested_revision.to_string(),
             files: Vec::new(),
-            staging: staging.clone(),
+            staging: staging.path.clone(),
+            resume_commit: staging.resolved_commit.clone(),
         };
         let fetched = match self.fetcher.fetch_with_progress(&request, progress) {
             Ok(result) => result,
             Err(error) => {
-                let _ = std::fs::remove_dir_all(&staging);
+                self.handle_fetch_failure(&staging.path, &error);
                 return Err(error.into());
             }
         };
@@ -248,7 +262,7 @@ impl PullThrough {
             },
             &|phase| progress(FetchProgress::phase(phase)),
         );
-        let _ = std::fs::remove_dir_all(&staging);
+        let _ = std::fs::remove_dir_all(&staging.path);
         match publish {
             Ok(_) => {}
             Err(ArchiveError::AlreadyPublished(_))
@@ -261,6 +275,18 @@ impl PullThrough {
                 .update_ref(repo_id, requested_revision, &fetched.commit)?;
         }
         Ok(fetched.commit)
+    }
+
+    fn handle_fetch_failure(&self, staging: &std::path::Path, error: &UpstreamError) {
+        if matches!(
+            error,
+            UpstreamError::Unavailable | UpstreamError::Failed | UpstreamError::Io(_)
+        ) && self.archive.preserve_fetch_staging(staging).is_ok()
+        {
+            tracing::warn!(path = %staging.display(), "preserved interrupted upstream staging for retry");
+            return;
+        }
+        let _ = std::fs::remove_dir_all(staging);
     }
 }
 

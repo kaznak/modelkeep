@@ -158,6 +158,8 @@ struct Job {
     repo_id: Option<String>,
     revision: Option<String>,
     resolved_commit: Option<String>,
+    #[serde(default)]
+    resumed: bool,
     progress_bytes: Option<u64>,
     total_bytes: Option<u64>,
     #[serde(default)]
@@ -190,6 +192,7 @@ struct JobView {
     repo_id: Option<String>,
     revision: Option<String>,
     resolved_commit: Option<String>,
+    resumed: bool,
     progress_bytes: Option<u64>,
     total_bytes: Option<u64>,
     progress_files: Option<u64>,
@@ -214,6 +217,7 @@ impl From<Job> for JobView {
             repo_id: job.repo_id,
             revision: job.revision,
             resolved_commit: job.resolved_commit,
+            resumed: job.resumed,
             progress_bytes: job.progress_bytes,
             total_bytes: job.total_bytes,
             progress_files: job.progress_files,
@@ -364,6 +368,7 @@ impl JobManager {
                 repo_id: request.repo_id.clone(),
                 revision: request.revision.clone(),
                 resolved_commit: None,
+                resumed: false,
                 progress_bytes: None,
                 total_bytes: None,
                 progress_files: None,
@@ -521,6 +526,9 @@ impl JobManager {
     fn record_progress(&self, id: &str, event: FetchProgress) {
         let snapshot = self.update(id, |job| {
             job.phase = event.phase.clone();
+            if event.phase == "resuming_snapshot" {
+                job.resumed = true;
+            }
             match (event.unit.as_deref(), event.completed) {
                 (Some("bytes"), Some(completed)) => {
                     if job.total_bytes.is_none() {
@@ -1209,6 +1217,7 @@ mod tests {
             repo_id: None,
             revision: None,
             resolved_commit: None,
+            resumed: false,
             progress_bytes: None,
             total_bytes: None,
             progress_files: None,
@@ -1276,6 +1285,7 @@ mod tests {
                 total: Some(7),
             },
         );
+        manager.record_progress("progress-test", FetchProgress::phase("resuming_snapshot"));
         manager.record_progress("progress-test", FetchProgress::phase("validating_revision"));
 
         let job = manager.get("progress-test").unwrap();
@@ -1284,6 +1294,7 @@ mod tests {
         assert_eq!(job.total_bytes, Some(100));
         assert_eq!(job.progress_files, Some(2));
         assert_eq!(job.total_files, Some(7));
+        assert!(job.resumed);
         assert!(job.last_progress_at.is_some());
     }
 
@@ -1751,6 +1762,7 @@ mod tests {
             repo_id: None,
             revision: None,
             resolved_commit: None,
+            resumed: false,
             progress_bytes: None,
             total_bytes: None,
             progress_files: None,
