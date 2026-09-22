@@ -197,13 +197,35 @@ async fn model_tree(
     Path((namespace, repo, revision)): Path<(String, String, String)>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let repo_id = format!("{namespace}/{repo}");
-    let commit = if is_hf_commit(&revision) {
-        revision
-    } else {
+    let commit = match if is_hf_commit(&revision) {
         state
             .archive
-            .resolve_ref(&repo_id, &revision)
-            .map_err(status_for_archive_error)?
+            .revision_path(&repo_id, &revision)
+            .and_then(|path| {
+                if path.is_dir() {
+                    Ok(revision.clone())
+                } else {
+                    Err(ArchiveError::Io(std::io::Error::from(
+                        std::io::ErrorKind::NotFound,
+                    )))
+                }
+            })
+    } else {
+        state.archive.resolve_ref(&repo_id, &revision)
+    } {
+        Ok(commit) => commit,
+        Err(ArchiveError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            let Some(pullthrough) = state.pullthrough.clone() else {
+                return Err(StatusCode::NOT_FOUND);
+            };
+            let requested = revision.clone();
+            let repo = repo_id.clone();
+            task::spawn_blocking(move || pullthrough.ensure(&repo, &requested, &[]))
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                .map_err(status_for_pullthrough_error)?
+        }
+        Err(error) => return Err(status_for_archive_error(error)),
     };
     let manifest: serde_json::Value = serde_json::from_str(
         &state
@@ -758,6 +780,33 @@ mod tests {
             to_bytes(response.into_body(), usize::MAX).await.unwrap(),
             "cold-http"
         );
+    }
+
+    #[tokio::test]
+    async fn cold_tree_request_fetches_immutable_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        let pullthrough = Arc::new(PullThrough::new(archive.clone(), Arc::new(HttpFakeFetcher)));
+        let app = router_with_pullthrough(archive.clone(), pullthrough);
+        let commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!(
+                        "/api/models/org/model/tree/{commit}?recursive=true&expand=false"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value.as_array().unwrap().len(), 2);
+        assert_eq!(value[0]["path"], "config.json");
+        assert!(archive.is_complete_revision("org/model", commit).unwrap());
     }
 
     #[tokio::test]

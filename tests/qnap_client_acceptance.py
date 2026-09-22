@@ -36,6 +36,23 @@ REQUIRED_PHASES = (
     "post-qnap-reboot",
     "post-restore",
 )
+DEFAULT_CONFIG_PATH = "qnap-acceptance.config.json"
+REQUIRED_CONFIG_FIELDS = (
+    "endpoint",
+    "admin_endpoint",
+    "qnap_lan_address",
+    "repo_id",
+    "revision",
+    "operator",
+    "qnap_model",
+    "qts_version",
+    "container_station_version",
+    "archive_share_and_acl",
+    "snapshot_mechanism_and_retention",
+    "external_backup_target",
+    "image_tag",
+    "image_digest",
+)
 
 
 class AcceptanceError(RuntimeError):
@@ -72,6 +89,19 @@ def validate_record(record):
         config.get("repo_id", "").split("/")
     ) != 2:
         raise AcceptanceError("repo ID must have exactly namespace/name components")
+    endpoint = normalize_endpoint(config.get("endpoint", ""), "download endpoint")
+    admin_endpoint = normalize_endpoint(
+        config.get("admin_endpoint", ""), "admin endpoint"
+    )
+    if endpoint == admin_endpoint:
+        raise AcceptanceError("download endpoint and admin endpoint must be distinct")
+    site = record.get("site", {})
+    if not DIGEST_PATTERN.fullmatch(site.get("image_digest", "")):
+        raise AcceptanceError("image digest must be sha256 followed by 64 lowercase hex digits")
+    if config.get("request_timeout_seconds", 0) <= 0 or config.get(
+        "download_timeout_seconds", 0
+    ) <= 0:
+        raise AcceptanceError("timeouts must be positive")
 
 
 def read_record(path):
@@ -365,33 +395,54 @@ def run_phase(path, name, function):
     write_record(path, record)
 
 
+def read_initial_configuration(path):
+    try:
+        configuration = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise AcceptanceError(f"cannot read initial configuration: {error}") from error
+    if not isinstance(configuration, dict):
+        raise AcceptanceError("initial configuration must be a JSON object")
+    missing = [field for field in REQUIRED_CONFIG_FIELDS if not configuration.get(field)]
+    if missing:
+        raise AcceptanceError(
+            "initial configuration is missing required fields: " + ", ".join(missing)
+        )
+    return configuration
+
+
 def initialize(args):
     path = Path(args.record)
     if path.exists() and not args.force:
         raise AcceptanceError(f"record already exists: {path}; use --force to replace it")
-    revision = args.revision.lower()
+    initial = read_initial_configuration(Path(args.config))
+    revision = initial["revision"].lower()
     record = {
         "schema_version": SCHEMA_VERSION,
         "created_at": now(),
         "configuration": {
-            "endpoint": normalize_endpoint(args.endpoint, "download endpoint"),
-            "admin_endpoint": normalize_endpoint(args.admin_endpoint, "admin endpoint"),
-            "qnap_lan_address": args.qnap_lan_address,
-            "repo_id": args.repo_id,
+            "endpoint": normalize_endpoint(initial["endpoint"], "download endpoint"),
+            "admin_endpoint": normalize_endpoint(
+                initial["admin_endpoint"], "admin endpoint"
+            ),
+            "qnap_lan_address": initial["qnap_lan_address"],
+            "repo_id": initial["repo_id"],
             "revision": revision,
-            "request_timeout_seconds": args.request_timeout,
-            "download_timeout_seconds": args.download_timeout,
+            "request_timeout_seconds": initial.get("request_timeout_seconds", 10),
+            "download_timeout_seconds": initial.get("download_timeout_seconds", 7200),
         },
         "site": {
-            "operator": args.operator,
-            "qnap_model": args.qnap_model,
-            "qts_version": args.qts_version,
-            "container_station_version": args.container_station_version,
-            "archive_share_and_acl": args.archive_share_and_acl,
-            "snapshot_mechanism_and_retention": args.snapshot_mechanism_and_retention,
-            "external_backup_target": args.external_backup_target,
-            "image_tag": args.image_tag,
-            "image_digest": args.image_digest,
+            field: initial[field]
+            for field in (
+                "operator",
+                "qnap_model",
+                "qts_version",
+                "container_station_version",
+                "archive_share_and_acl",
+                "snapshot_mechanism_and_retention",
+                "external_backup_target",
+                "image_tag",
+                "image_digest",
+            )
         },
         "client": {
             "hostname": socket.gethostname(),
@@ -401,10 +452,6 @@ def initialize(args):
         "phases": {},
     }
     validate_record(record)
-    if not DIGEST_PATTERN.fullmatch(args.image_digest):
-        raise AcceptanceError("image digest must be sha256 followed by 64 lowercase hex digits")
-    if args.request_timeout <= 0 or args.download_timeout <= 0:
-        raise AcceptanceError("timeouts must be positive")
     write_record(path, record)
     print(f"initialized {path}")
 
@@ -485,22 +532,7 @@ def parser():
     commands = root.add_subparsers(dest="command", required=True)
     init = commands.add_parser("init", help="create a site acceptance record")
     init.add_argument("record")
-    init.add_argument("--endpoint", required=True)
-    init.add_argument("--admin-endpoint", required=True)
-    init.add_argument("--qnap-lan-address", required=True)
-    init.add_argument("--repo-id", required=True)
-    init.add_argument("--revision", required=True)
-    init.add_argument("--operator", required=True)
-    init.add_argument("--qnap-model", required=True)
-    init.add_argument("--qts-version", required=True)
-    init.add_argument("--container-station-version", required=True)
-    init.add_argument("--archive-share-and-acl", required=True)
-    init.add_argument("--snapshot-mechanism-and-retention", required=True)
-    init.add_argument("--external-backup-target", required=True)
-    init.add_argument("--image-tag", required=True)
-    init.add_argument("--image-digest", required=True)
-    init.add_argument("--request-timeout", type=int, default=10)
-    init.add_argument("--download-timeout", type=int, default=7200)
+    init.add_argument("--config", default=DEFAULT_CONFIG_PATH)
     init.add_argument("--force", action="store_true")
 
     for name in REQUIRED_PHASES:

@@ -1,0 +1,18 @@
+{
+  "endpoint": "https://modelkeep.example-tailnet.ts.net",
+  "admin_endpoint": "https://modelkeep-admin.example-tailnet.ts.net",
+  "qnap_lan_address": "192.0.2.10",
+  "repo_id": "org/small-public-model",
+  "revision": "REPLACE_WITH_40_CHARACTER_COMMIT_SHA",
+  "operator": "operator-name",
+  "qnap_model": "QNAP model",
+  "qts_version": "QTS or QuTS hero version",
+  "container_station_version": "Container Station version",
+  "archive_share_and_acl": "archive share and documented ACL",
+  "snapshot_mechanism_and_retention": "snapshot mechanism and retention",
+  "external_backup_target": "backup target and encryption owner",
+  "image_tag": "ghcr.io/kaznak/modelkeep:v0.4.2",
+  "image_digest": "REPLACE_WITH_SHA256_IMAGE_DIGEST",
+  "request_timeout_seconds": 10,
+  "download_timeout_seconds": 7200
+}

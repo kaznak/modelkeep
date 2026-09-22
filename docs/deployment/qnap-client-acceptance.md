@@ -31,30 +31,28 @@ use a public acceptance model and keep upstream credentials on ModelKeep only.
 
 ## Initialize the record
 
-Use site-specific literal values. Descriptions of ACL, snapshot, and backup policy
-must not contain credentials.
+Copy the tracked template to the Git-ignored local configuration path once:
 
 ```sh
-nix run .#qnap-client-acceptance -- init qnap-acceptance.json \
-  --endpoint https://modelkeep.example-tailnet.ts.net \
-  --admin-endpoint https://modelkeep-admin.example-tailnet.ts.net \
-  --qnap-lan-address 192.0.2.10 \
-  --repo-id org/small-public-model \
-  --revision 0123456789abcdef0123456789abcdef01234567 \
-  --operator kaznak \
-  --qnap-model 'QNAP model' \
-  --qts-version 'QTS version' \
-  --container-station-version 'Container Station version' \
-  --archive-share-and-acl '/share/Services/modelkeep; documented ACL' \
-  --snapshot-mechanism-and-retention 'snapshot mechanism and retention' \
-  --external-backup-target 'target and encryption owner' \
-  --image-tag ghcr.io/kaznak/modelkeep:v0.4.2 \
-  --image-digest sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+cp docs/deployment/qnap-acceptance-config.example.json qnap-acceptance.config.json
 ```
 
-Keep `qnap-acceptance.json` outside the repository if it contains private hostnames
-or site details. The file is updated atomically after every phase, including failed
-attempts.
+Edit `qnap-acceptance.config.json` with the actual site values. It must not contain
+credentials. In particular, set distinct download and administration HTTPS origins,
+an actual small public repository and immutable commit, and the deployed image
+digest. The repository root ignores both this local config and generated acceptance
+records so private hostnames and site details cannot be committed accidentally.
+
+Initialize the evidence record from that file:
+
+```sh
+nix run .#qnap-client-acceptance -- init qnap-acceptance.json
+```
+
+Use `--config <path>` only when the local configuration has a different name. The
+record is updated atomically after every phase, including failed attempts. `init`
+rejects a shared download/admin origin before any network checks, rather than later
+reporting an opaque `/healthz` 404 from the administration listener.
 
 ## Run the phases
 

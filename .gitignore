@@ -16,6 +16,7 @@ __pycache__/
 /.venv/
 /.coverage
 /htmlcov/
+/qnap-acceptance*
 
 # Local environment files may contain credentials
 /.env

@@ -13,6 +13,24 @@ SPEC.loader.exec_module(acceptance)
 
 
 class QnapClientAcceptanceTests(unittest.TestCase):
+    def complete_record(self):
+        return {
+            "schema_version": 1,
+            "created_at": "2026-08-24T00:00:00+00:00",
+            "configuration": {
+                "endpoint": "https://modelkeep.example.ts.net",
+                "admin_endpoint": "https://modelkeep-admin.example.ts.net",
+                "qnap_lan_address": "192.0.2.1",
+                "repo_id": "org/model",
+                "revision": "a" * 40,
+                "request_timeout_seconds": 10,
+                "download_timeout_seconds": 7200,
+            },
+            "site": {"image_digest": "sha256:" + "b" * 64},
+            "client": {},
+            "phases": {},
+        }
+
     def test_download_manifest_hashes_model_files_and_ignores_hf_metadata(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -46,20 +64,8 @@ class QnapClientAcceptanceTests(unittest.TestCase):
         )
 
     def test_finish_requires_every_hardware_phase(self):
-        record = {
-            "schema_version": 1,
-            "created_at": "2026-08-24T00:00:00+00:00",
-            "configuration": {
-                "endpoint": "https://modelkeep.example.ts.net",
-                "admin_endpoint": "https://modelkeep-admin.example.ts.net",
-                "qnap_lan_address": "192.0.2.1",
-                "repo_id": "org/model",
-                "revision": "a" * 40,
-            },
-            "site": {},
-            "client": {},
-            "phases": {"preflight": {"status": "passed"}},
-        }
+        record = self.complete_record()
+        record["phases"] = {"preflight": {"status": "passed"}}
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "record.json"
             path.write_text(json.dumps(record))
@@ -68,10 +74,8 @@ class QnapClientAcceptanceTests(unittest.TestCase):
                 acceptance.finish(args)
 
     def test_record_write_is_readable_and_validated(self):
-        record = {
-            "schema_version": 1,
-            "configuration": {"repo_id": "org/model", "revision": "b" * 40},
-        }
+        record = self.complete_record()
+        record["configuration"]["revision"] = "b" * 40
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "nested/record.json"
             acceptance.write_record(path, record)
@@ -80,6 +84,45 @@ class QnapClientAcceptanceTests(unittest.TestCase):
     def test_endpoint_rejects_embedded_credentials(self):
         with self.assertRaises(acceptance.AcceptanceError):
             acceptance.normalize_endpoint("https://user:secret@example.test", "endpoint")
+
+    def test_record_rejects_identical_download_and_admin_endpoints(self):
+        record = self.complete_record()
+        record["configuration"]["admin_endpoint"] = record["configuration"]["endpoint"]
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "must be distinct"):
+            acceptance.validate_record(record)
+
+    def test_initialize_reads_site_values_from_config_file(self):
+        initial = {
+            "endpoint": "https://modelkeep.example.ts.net",
+            "admin_endpoint": "https://modelkeep-admin.example.ts.net",
+            "qnap_lan_address": "192.0.2.1",
+            "repo_id": "org/model",
+            "revision": "A" * 40,
+            "operator": "operator",
+            "qnap_model": "model",
+            "qts_version": "qts",
+            "container_station_version": "container-station",
+            "archive_share_and_acl": "share and acl",
+            "snapshot_mechanism_and_retention": "snapshots",
+            "external_backup_target": "backup",
+            "image_tag": "registry.example/modelkeep:v1",
+            "image_digest": "sha256:" + "c" * 64,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "site.json"
+            record = Path(temporary) / "record.json"
+            config.write_text(json.dumps(initial))
+            args = type(
+                "Args",
+                (),
+                {"record": str(record), "config": str(config), "force": False},
+            )()
+            acceptance.initialize(args)
+            loaded = acceptance.read_record(record)
+
+        self.assertEqual(loaded["configuration"]["endpoint"], initial["endpoint"])
+        self.assertEqual(loaded["configuration"]["revision"], "a" * 40)
+        self.assertEqual(loaded["site"]["image_digest"], initial["image_digest"])
 
 
 if __name__ == "__main__":
