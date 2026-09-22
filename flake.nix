@@ -108,6 +108,15 @@
           '';
         };
 
+        hf-protocol-observation = pkgs.writeShellApplication {
+          name = "hf-protocol-observation";
+          runtimeInputs = [ python pkgs.cacert ];
+          text = ''
+            export SSL_CERT_FILE="${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+            exec python3 ${./tests/observe_hf_protocol.py} "$@"
+          '';
+        };
+
         default = self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep;
       });
 
@@ -188,6 +197,19 @@
             cp ${./upstream/hf_fetch.py} hf_fetch.py
             cp ${./upstream/test_hf_fetch.py} test_hf_fetch.py
             python3 -m unittest -v test_hf_fetch.py
+            touch $out
+          '';
+
+          hf-protocol-observation-script = pkgs.runCommand "modelkeep-hf-protocol-observation-script" {
+            nativeBuildInputs = [ python ];
+          } ''
+            cp ${./tests/observe_hf_protocol.py} observe_hf_protocol.py
+            cp ${./tests/test_observe_hf_protocol.py} test_observe_hf_protocol.py
+            cp ${./tests/validate_hf_protocol_observation.py} validate_hf_protocol_observation.py
+            python3 -m py_compile observe_hf_protocol.py
+            python3 -m unittest -v test_observe_hf_protocol.py
+            python3 validate_hf_protocol_observation.py \
+              ${./docs/observations/hugging-face-protocol-2026-09-22.json}
             touch $out
           '';
 

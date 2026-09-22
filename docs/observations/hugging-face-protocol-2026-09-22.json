@@ -1,0 +1,159 @@
+{
+  "huggingface_hub": "1.27.0",
+  "matrix": {
+    "head": true,
+    "public": true,
+    "range": true,
+    "redirect": true,
+    "revision": true,
+    "safetensors": true,
+    "sharded": true,
+    "xet": true
+  },
+  "metadata": {
+    "commit": "8301186e0724d418a8d4f5eb17011c9226f5b766",
+    "etag": "965f02b6a7e5520fc12f710e4e3b6132f697f1c8f648819553c5ade86752d2de",
+    "redirect_host": "us.aws.cdn.hf.co",
+    "size": 520212,
+    "xet": true
+  },
+  "observed_at": "2026-09-22",
+  "range_trace": [
+    {
+      "accept-ranges": "bytes",
+      "host": "huggingface.co",
+      "method": "GET",
+      "path": "/optimum-intel-internal-testing/tiny-random-bert/resolve/8301186e0724d418a8d4f5eb17011c9226f5b766/model.safetensors",
+      "range": "bytes=0-0",
+      "redirect_host": "us.aws.cdn.hf.co",
+      "status": 302,
+      "x-repo-commit": "8301186e0724d418a8d4f5eb17011c9226f5b766"
+    },
+    {
+      "accept-ranges": "bytes",
+      "content-range": "bytes 0-0/520212",
+      "host": "us.aws.cdn.hf.co",
+      "method": "GET",
+      "path": "/xet-bridge-us/68f7578eabb3c3c4b5c6c014/bffb28f3d798e5a68f84d27e18fecb2484ecd199fffd0c0f3e54c4281f25ddc5",
+      "range": "bytes=0-0",
+      "status": 206
+    }
+  ],
+  "repositories": {
+    "bumblebee-testing/tiny-random-GPT2Model-sharded": "4fca22a84867aacca5dcf7317144782ea1807e1a",
+    "optimum-intel-internal-testing/tiny-random-bert": "8301186e0724d418a8d4f5eb17011c9226f5b766"
+  },
+  "schema": 1,
+  "trace": [
+    {
+      "host": "huggingface.co",
+      "method": "GET",
+      "path": "/api/models/optimum-intel-internal-testing/tiny-random-bert/revision/8301186e0724d418a8d4f5eb17011c9226f5b766",
+      "status": 200
+    },
+    {
+      "host": "huggingface.co",
+      "method": "GET",
+      "path": "/api/models/bumblebee-testing/tiny-random-GPT2Model-sharded/revision/4fca22a84867aacca5dcf7317144782ea1807e1a",
+      "status": 200
+    },
+    {
+      "accept-ranges": "bytes",
+      "host": "huggingface.co",
+      "method": "HEAD",
+      "path": "/optimum-intel-internal-testing/tiny-random-bert/resolve/8301186e0724d418a8d4f5eb17011c9226f5b766/model.safetensors",
+      "redirect_host": "us.aws.cdn.hf.co",
+      "status": 302,
+      "x-repo-commit": "8301186e0724d418a8d4f5eb17011c9226f5b766"
+    },
+    {
+      "accept-ranges": "bytes",
+      "host": "huggingface.co",
+      "method": "HEAD",
+      "path": "/optimum-intel-internal-testing/tiny-random-bert/resolve/8301186e0724d418a8d4f5eb17011c9226f5b766/config.json",
+      "redirect_host": null,
+      "status": 307,
+      "x-repo-commit": "8301186e0724d418a8d4f5eb17011c9226f5b766"
+    },
+    {
+      "accept-ranges": "bytes",
+      "host": "huggingface.co",
+      "method": "HEAD",
+      "path": "/api/resolve-cache/models/optimum-intel-internal-testing/tiny-random-bert/8301186e0724d418a8d4f5eb17011c9226f5b766/config.json",
+      "status": 200,
+      "x-repo-commit": "8301186e0724d418a8d4f5eb17011c9226f5b766"
+    },
+    {
+      "accept-ranges": "bytes",
+      "host": "huggingface.co",
+      "method": "GET",
+      "path": "/api/resolve-cache/models/optimum-intel-internal-testing/tiny-random-bert/8301186e0724d418a8d4f5eb17011c9226f5b766/config.json",
+      "status": 200,
+      "x-repo-commit": "8301186e0724d418a8d4f5eb17011c9226f5b766"
+    },
+    {
+      "accept-ranges": "bytes",
+      "host": "huggingface.co",
+      "method": "HEAD",
+      "path": "/optimum-intel-internal-testing/tiny-random-bert/resolve/8301186e0724d418a8d4f5eb17011c9226f5b766/model.safetensors",
+      "redirect_host": "us.aws.cdn.hf.co",
+      "status": 302,
+      "x-repo-commit": "8301186e0724d418a8d4f5eb17011c9226f5b766"
+    },
+    {
+      "host": "huggingface.co",
+      "method": "GET",
+      "path": "/api/models/bumblebee-testing/tiny-random-GPT2Model-sharded/tree/4fca22a84867aacca5dcf7317144782ea1807e1a",
+      "status": 200
+    },
+    {
+      "accept-ranges": "bytes",
+      "host": "huggingface.co",
+      "method": "HEAD",
+      "path": "/bumblebee-testing/tiny-random-GPT2Model-sharded/resolve/4fca22a84867aacca5dcf7317144782ea1807e1a/config.json",
+      "redirect_host": null,
+      "status": 307,
+      "x-repo-commit": "4fca22a84867aacca5dcf7317144782ea1807e1a"
+    },
+    {
+      "accept-ranges": "bytes",
+      "host": "huggingface.co",
+      "method": "HEAD",
+      "path": "/api/resolve-cache/models/bumblebee-testing/tiny-random-GPT2Model-sharded/4fca22a84867aacca5dcf7317144782ea1807e1a/config.json",
+      "status": 200,
+      "x-repo-commit": "4fca22a84867aacca5dcf7317144782ea1807e1a"
+    },
+    {
+      "accept-ranges": "bytes",
+      "host": "huggingface.co",
+      "method": "GET",
+      "path": "/api/resolve-cache/models/bumblebee-testing/tiny-random-GPT2Model-sharded/4fca22a84867aacca5dcf7317144782ea1807e1a/config.json",
+      "status": 200,
+      "x-repo-commit": "4fca22a84867aacca5dcf7317144782ea1807e1a"
+    },
+    {
+      "accept-ranges": "bytes",
+      "host": "huggingface.co",
+      "method": "HEAD",
+      "path": "/bumblebee-testing/tiny-random-GPT2Model-sharded/resolve/4fca22a84867aacca5dcf7317144782ea1807e1a/model.safetensors.index.json",
+      "redirect_host": null,
+      "status": 307,
+      "x-repo-commit": "4fca22a84867aacca5dcf7317144782ea1807e1a"
+    },
+    {
+      "accept-ranges": "bytes",
+      "host": "huggingface.co",
+      "method": "HEAD",
+      "path": "/api/resolve-cache/models/bumblebee-testing/tiny-random-GPT2Model-sharded/4fca22a84867aacca5dcf7317144782ea1807e1a/model.safetensors.index.json",
+      "status": 200,
+      "x-repo-commit": "4fca22a84867aacca5dcf7317144782ea1807e1a"
+    },
+    {
+      "host": "huggingface.co",
+      "method": "GET",
+      "path": "/api/resolve-cache/models/bumblebee-testing/tiny-random-GPT2Model-sharded/4fca22a84867aacca5dcf7317144782ea1807e1a/model.safetensors.index.json",
+      "status": 200,
+      "x-repo-commit": "4fca22a84867aacca5dcf7317144782ea1807e1a"
+    }
+  ]
+}

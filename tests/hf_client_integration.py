@@ -26,7 +26,7 @@ def unused_port():
 
 
 @contextlib.contextmanager
-def server(binary, archive, helper=None):
+def server(binary, archive, helper=None, captured_logs=None):
     port = unused_port()
     endpoint = f"http://127.0.0.1:{port}"
     environment = os.environ.copy()
@@ -59,6 +59,8 @@ def server(binary, archive, helper=None):
     finally:
         process.terminate()
         process.wait(timeout=5)
+        if captured_logs is not None:
+            captured_logs.append(process.stderr.read())
 
 
 @contextlib.contextmanager
@@ -97,8 +99,9 @@ def main():
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         archive = root / "archive"
+        acquisition_logs = []
         with localhost_only():
-            with server(binary, archive, helper) as endpoint:
+            with server(binary, archive, helper, acquisition_logs) as endpoint:
                 for revision, expected_status in [
                     ("missing", 404),
                     ("private", 401),
@@ -111,7 +114,17 @@ def main():
                         assert error.response.status_code == expected_status
                 info = HfApi(endpoint=endpoint).repo_info(REPO_ID, revision="main")
                 assert info.sha == COMMIT
-                download(endpoint, root / "cold-client", "main")
+                cold = Path(download(endpoint, root / "cold-client", "main"))
+                expected_payloads = {
+                    "model.safetensors": b"MODELKEEP-SAFETENSORS-FIXTURE",
+                    "model-00001-of-00002.safetensors": b"MODELKEEP-SHARD-ONE",
+                    "model-00002-of-00002.safetensors": b"MODELKEEP-SHARD-TWO",
+                }
+                for relative, expected in expected_payloads.items():
+                    assert (cold / relative).read_bytes() == expected
+                index = (cold / "model.safetensors.index.json").read_text()
+                assert "model-00001-of-00002.safetensors" in index
+                assert "model-00002-of-00002.safetensors" in index
 
                 head = urllib.request.Request(
                     f"{endpoint}/{REPO_ID}/resolve/{COMMIT}/config.json",
@@ -130,8 +143,25 @@ def main():
                     assert response.status == 206
                     assert response.read() == b'{"mod'
 
+                payload_request = urllib.request.Request(
+                    f"{endpoint}/{REPO_ID}/resolve/{COMMIT}/model.safetensors",
+                    headers={"Range": "bytes=0-8"},
+                )
+                with urllib.request.urlopen(payload_request) as response:
+                    assert response.status == 206
+                    assert response.headers["Location"] is None
+                    assert response.headers["x-xet-hash"] is None
+                    assert response.headers["x-linked-etag"] is None
+                    assert response.read() == b"MODELKEEP"
+
+            assert len(acquisition_logs) == 1
+            assert '"request_kind":"head_file"' in acquisition_logs[0]
+            assert '"path":"model.safetensors"' in acquisition_logs[0]
+
             with server(binary, archive) as endpoint:
-                download(endpoint, root / "offline-client", COMMIT)
+                offline = Path(download(endpoint, root / "offline-client", COMMIT))
+                for relative, expected in expected_payloads.items():
+                    assert (offline / relative).read_bytes() == expected
                 with ThreadPoolExecutor(max_workers=4) as pool:
                     results = list(
                         pool.map(

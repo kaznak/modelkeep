@@ -14,6 +14,13 @@ downloads, upstream error mapping, and rejection of attempts to bypass ModelKeep
 It uses a local upstream fixture and does not contact Hugging Face. Optional online
 protocol observations are deliberately separate from this compatibility gate.
 
+The latest dated upstream matrix and its reproducible, credential-free procedure
+are recorded in
+[`observations/hugging-face-protocol-2026-09-22.md`](observations/hugging-face-protocol-2026-09-22.md).
+The deterministic suite mirrors its public, safetensors, sharded, immutable
+revision, `HEAD`, Range, redirect, and Xet-boundary behaviors without contacting
+Hugging Face.
+
 ## Updating the matrix
 
 1. Choose versions with a concrete operator need. Keep one oldest-supported version
