@@ -17,7 +17,7 @@ pub enum PullThroughError {
     UpstreamUnavailable,
     UpstreamNotFound,
     UpstreamUnauthorized,
-    UpstreamInvalidOutput,
+    UpstreamInvalidOutput(&'static str),
     UpstreamFailed,
     UnsafePath,
     Integrity,
@@ -31,7 +31,9 @@ impl std::fmt::Display for PullThroughError {
             Self::UpstreamUnavailable => "upstream unavailable",
             Self::UpstreamNotFound => "upstream not found",
             Self::UpstreamUnauthorized => "upstream authorization failed",
-            Self::UpstreamInvalidOutput => "upstream invalid output",
+            Self::UpstreamInvalidOutput(reason) => {
+                return write!(formatter, "upstream invalid output: {reason}")
+            }
             Self::UpstreamFailed => "upstream acquisition failed",
             Self::UnsafePath => "unsafe archive path",
             Self::Integrity => "archive integrity failure",
@@ -268,7 +270,7 @@ impl From<UpstreamError> for PullThroughError {
             UpstreamError::Unavailable => Self::UpstreamUnavailable,
             UpstreamError::NotFound => Self::UpstreamNotFound,
             UpstreamError::Unauthorized => Self::UpstreamUnauthorized,
-            UpstreamError::InvalidOutput => Self::UpstreamInvalidOutput,
+            UpstreamError::InvalidOutput(reason) => Self::UpstreamInvalidOutput(reason),
             UpstreamError::Failed | UpstreamError::Io(_) => Self::UpstreamFailed,
         }
     }

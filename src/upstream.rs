@@ -52,7 +52,7 @@ pub enum UpstreamError {
     Unavailable,
     NotFound,
     Unauthorized,
-    InvalidOutput,
+    InvalidOutput(&'static str),
     Failed,
 }
 
@@ -63,7 +63,12 @@ impl std::fmt::Display for UpstreamError {
             Self::Unavailable => write!(formatter, "upstream unavailable"),
             Self::NotFound => write!(formatter, "upstream repository or revision not found"),
             Self::Unauthorized => write!(formatter, "upstream authorization failed"),
-            Self::InvalidOutput => write!(formatter, "upstream returned invalid helper output"),
+            Self::InvalidOutput(reason) => {
+                write!(
+                    formatter,
+                    "upstream returned invalid helper output: {reason}"
+                )
+            }
             Self::Failed => write!(formatter, "upstream acquisition failed"),
         }
     }
@@ -114,27 +119,36 @@ impl UpstreamFetcher for OfficialHfFetcher {
             command.arg("--file").arg(file);
         }
         let mut child = command.spawn().map_err(UpstreamError::Io)?;
-        let stdout = child.stdout.take().ok_or(UpstreamError::InvalidOutput)?;
+        let stdout = child.stdout.take().ok_or(UpstreamError::InvalidOutput(
+            "helper stdout was unavailable",
+        ))?;
         let mut result = None;
         for line in BufReader::new(stdout).lines() {
             let line = line.map_err(UpstreamError::Io)?;
-            let value: serde_json::Value =
-                serde_json::from_str(&line).map_err(|_| UpstreamError::InvalidOutput)?;
+            let value: serde_json::Value = serde_json::from_str(&line)
+                .map_err(|_| UpstreamError::InvalidOutput("helper emitted a non-JSON line"))?;
             match value.get("type").and_then(|value| value.as_str()) {
                 Some("progress") => {
-                    let event: FetchProgress =
-                        serde_json::from_value(value).map_err(|_| UpstreamError::InvalidOutput)?;
+                    let event: FetchProgress = serde_json::from_value(value).map_err(|_| {
+                        UpstreamError::InvalidOutput("helper emitted a malformed progress event")
+                    })?;
                     if event.version > 1 {
-                        return Err(UpstreamError::InvalidOutput);
+                        return Err(UpstreamError::InvalidOutput(
+                            "helper emitted an unsupported progress version",
+                        ));
                     }
                     progress(event);
                 }
                 Some("result") | None => {
-                    result = Some(
-                        serde_json::from_value(value).map_err(|_| UpstreamError::InvalidOutput)?,
-                    );
+                    result = Some(serde_json::from_value(value).map_err(|_| {
+                        UpstreamError::InvalidOutput("helper emitted a malformed result event")
+                    })?);
                 }
-                _ => return Err(UpstreamError::InvalidOutput),
+                _ => {
+                    return Err(UpstreamError::InvalidOutput(
+                        "helper emitted an unsupported event type",
+                    ))
+                }
             }
         }
         let status = child.wait().map_err(UpstreamError::Io)?;
@@ -146,9 +160,18 @@ impl UpstreamFetcher for OfficialHfFetcher {
                 _ => UpstreamError::Failed,
             });
         }
-        let response: HelperOutput = result.ok_or(UpstreamError::InvalidOutput)?;
-        if !is_hf_commit(&response.commit) || response.files.is_empty() {
-            return Err(UpstreamError::InvalidOutput);
+        let response: HelperOutput = result.ok_or(UpstreamError::InvalidOutput(
+            "helper exited successfully without a result event",
+        ))?;
+        if !is_hf_commit(&response.commit) {
+            return Err(UpstreamError::InvalidOutput(
+                "helper returned a malformed commit identity",
+            ));
+        }
+        if response.files.is_empty() {
+            return Err(UpstreamError::InvalidOutput(
+                "helper returned an empty snapshot",
+            ));
         }
         Ok(FetchedRevision {
             commit: response.commit,
@@ -205,5 +228,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(event, FetchProgress::phase("inventorying_snapshot"));
+    }
+
+    #[test]
+    fn invalid_output_reason_is_safe_and_actionable() {
+        let error = UpstreamError::InvalidOutput("helper returned an empty snapshot");
+        assert_eq!(
+            error.to_string(),
+            "upstream returned invalid helper output: helper returned an empty snapshot"
+        );
     }
 }

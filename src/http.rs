@@ -367,7 +367,7 @@ fn status_for_pullthrough_error(error: PullThroughError) -> StatusCode {
         }
         PullThroughError::Storage => StatusCode::INSUFFICIENT_STORAGE,
         PullThroughError::UnsafePath => StatusCode::BAD_REQUEST,
-        PullThroughError::UpstreamInvalidOutput
+        PullThroughError::UpstreamInvalidOutput(_)
         | PullThroughError::Integrity
         | PullThroughError::Conflict => StatusCode::INTERNAL_SERVER_ERROR,
     }

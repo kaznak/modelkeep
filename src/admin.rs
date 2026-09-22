@@ -468,6 +468,16 @@ impl JobManager {
                 });
             }
             Err((class, message)) => {
+                tracing::warn!(
+                    event = "admin_job_failed",
+                    job_id = %id,
+                    job_kind = ?job.kind,
+                    repo_id = job.repo_id.as_deref().unwrap_or(""),
+                    revision = job.revision.as_deref().unwrap_or(""),
+                    error_class = class,
+                    error = %message,
+                    "management job failed"
+                );
                 self.update(id, |job| {
                     job.state = JobState::Failed;
                     job.phase = "failed".into();
@@ -1003,10 +1013,12 @@ fn classify_pullthrough_error(
 ) -> (&'static str, String) {
     use crate::pullthrough::PullThroughError;
     let class = match error {
-        PullThroughError::UpstreamUnavailable | PullThroughError::UpstreamFailed => "upstream",
+        PullThroughError::UpstreamUnavailable
+        | PullThroughError::UpstreamInvalidOutput(_)
+        | PullThroughError::UpstreamFailed => "upstream",
         PullThroughError::UpstreamNotFound => "not_found",
         PullThroughError::UpstreamUnauthorized => "authorization",
-        PullThroughError::Integrity | PullThroughError::UpstreamInvalidOutput => "integrity",
+        PullThroughError::Integrity => "integrity",
         PullThroughError::Storage => "storage",
         PullThroughError::UnsafePath => "unsafe_path",
         PullThroughError::Conflict => "conflict",
@@ -1078,11 +1090,24 @@ fn archive_error(error: ArchiveError) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pullthrough::PullThroughError;
     use crate::upstream::{FetchRequest, FetchedRevision, UpstreamError, UpstreamFetcher};
     use axum::{body::to_bytes, body::Body, http::Request};
     use tower::ServiceExt;
 
     struct FixtureFetcher;
+
+    #[test]
+    fn invalid_helper_output_is_an_upstream_failure() {
+        let (class, message) = classify_pullthrough_error(PullThroughError::UpstreamInvalidOutput(
+            "helper returned an empty snapshot",
+        ));
+        assert_eq!(class, "upstream");
+        assert_eq!(
+            message,
+            "upstream invalid output: helper returned an empty snapshot"
+        );
+    }
 
     impl UpstreamFetcher for FixtureFetcher {
         fn fetch(&self, request: &FetchRequest) -> Result<FetchedRevision, UpstreamError> {
