@@ -710,7 +710,7 @@ impl JobManager {
                     repo_id = job.repo_id.as_deref().unwrap_or(""),
                     revision = job.revision.as_deref().unwrap_or(""),
                     error_class = class,
-                    error = %message,
+                    safe_reason = %message,
                     "management job failed"
                 );
                 self.update(id, |job| {
@@ -1542,9 +1542,53 @@ fn archive_error(error: ArchiveError) -> Response {
 mod tests {
     use super::*;
     use crate::pullthrough::PullThroughError;
-    use crate::upstream::{FetchRequest, FetchedRevision, UpstreamError, UpstreamFetcher};
+    use crate::upstream::{
+        FetchRequest, FetchedRevision, InvalidOutputReason, OfficialHfFetcher, UpstreamError,
+        UpstreamFetcher,
+    };
     use axum::{body::to_bytes, body::Body, http::Request};
+    use std::io::Write;
     use tower::ServiceExt;
+    use tracing_subscriber::EnvFilter;
+
+    #[derive(Clone, Default)]
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl LogWriter {
+        fn output(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    fn capture_logs() -> (LogWriter, tracing::subscriber::DefaultGuard) {
+        let writer = LogWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(EnvFilter::new("info"))
+            .with_writer(writer.clone())
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (writer, guard)
+    }
 
     struct FixtureFetcher;
 
@@ -1588,13 +1632,85 @@ mod tests {
     #[test]
     fn invalid_helper_output_is_an_upstream_failure() {
         let (class, message) = classify_pullthrough_error(PullThroughError::UpstreamInvalidOutput(
-            "helper returned an empty snapshot",
+            InvalidOutputReason::EmptySnapshot,
         ));
         assert_eq!(class, "upstream");
         assert_eq!(
             message,
             "upstream invalid output: helper returned an empty snapshot"
         );
+    }
+
+    #[test]
+    fn invalid_helper_output_is_safe_in_management_state_and_failure_event() {
+        let (writer, _guard) = capture_logs();
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Arc::new(Archive::new(directory.path()).unwrap());
+        let manager = JobManager::open(&archive).unwrap();
+        let mut job = stored_job("invalid-output-job", 1);
+        job.kind = JobKind::Prefetch;
+        job.state = JobState::Queued;
+        job.phase = "queued".into();
+        job.repo_id = Some("public/model".into());
+        job.revision = Some("main".into());
+        job.started_at = None;
+        job.finished_at = None;
+        assert!(manager.persist_new(&job).unwrap());
+        manager
+            .inner
+            .active_jobs
+            .lock()
+            .unwrap()
+            .insert(job.id.clone(), job.clone());
+        let helper = directory.path().join("unsafe-helper.sh");
+        std::fs::write(
+            &helper,
+            concat!(
+                "#!/bin/sh\n",
+                "echo '{\"type\":\"unsupported\",\"payload\":\"https://signed.example?token=stdout-secret\"}'\n",
+                "echo 'Bearer stderr-secret' >&2\n",
+            ),
+        )
+        .unwrap();
+        let pullthrough = Arc::new(PullThrough::new(
+            (*archive).clone(),
+            Arc::new(OfficialHfFetcher {
+                python: "/bin/sh".into(),
+                helper,
+            }),
+        ));
+
+        manager.run(&job.id, archive, Some(pullthrough));
+
+        let failed = manager.get(&job.id).unwrap().unwrap();
+        assert_eq!(failed.state, JobState::Failed);
+        assert_eq!(failed.error_class.as_deref(), Some("upstream"));
+        assert_eq!(
+            failed.message.as_deref(),
+            Some("upstream invalid output: helper emitted an unsupported event type")
+        );
+        let state = serde_json::to_string(&failed).unwrap();
+        let output = writer.output();
+        for expected in [
+            "admin_job_failed",
+            "invalid-output-job",
+            "public/model",
+            "main",
+            "upstream",
+            "safe_reason",
+            "helper emitted an unsupported event type",
+        ] {
+            assert!(output.contains(expected), "missing {expected}: {output}");
+        }
+        for secret in [
+            "signed.example",
+            "stdout-secret",
+            "Bearer stderr-secret",
+            "stderr-secret",
+        ] {
+            assert!(!state.contains(secret));
+            assert!(!output.contains(secret));
+        }
     }
 
     impl UpstreamFetcher for FixtureFetcher {

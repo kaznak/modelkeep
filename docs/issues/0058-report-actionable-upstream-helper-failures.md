@@ -5,7 +5,7 @@ related_adrs:
   - ADR-0005
   - ADR-0015
 created: 2026-09-22
-updated: 2026-09-22
+updated: 2026-09-23
 ---
 # Issue 0058: Report actionable upstream helper failures
 
@@ -51,3 +51,17 @@ identify the rejected helper contract condition.
 
 This improves diagnosis but does not by itself correct the underlying helper result.
 The QNAP reproduction is required to identify and fix that separate cause.
+
+## Verification outcome
+
+The two repositories from the original report,
+`google/gemma-4-26B-A4B-it@main` and
+`google/diffusiongemma-26B-A4B-it@main`, were prefetched again on QNAP with
+ModelKeep v0.4.2. Both acquisitions proceeded successfully, so the original
+helper contract failure did not reproduce. This result records no deployment
+hostname, internal URL, credential, or operator identity.
+
+Automated tests therefore retain the failure path: every helper contract
+rejection maps to a closed set of fixed safe reasons, and injected helper
+stdout/stderr payloads cannot reach the returned error, management state, or
+structured failure event.

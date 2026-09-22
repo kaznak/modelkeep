@@ -18,6 +18,7 @@ headers, bearer tokens, signed URLs, or upstream error payloads.
 | `archive_verification_failed` | WARN | `repo_id` and immutable `commit`, or `requested_revision` and `operation`; credential-safe `error_class` |
 | `archive_published` | INFO | `repo_id`, `requested_revision`, immutable `commit`, `operation` |
 | `archive_storage_failed` | ERROR | `repo_id`, `requested_revision`, `operation`, `error_class=storage`, `io_kind` |
+| `admin_job_failed` | WARN | `job_id`, `job_kind`, job target (`repo_id`, `revision`), `error_class`, credential-safe `safe_reason` |
 | `incomplete_fetch_preserved` | WARN | `repo_id`, `requested_revision` |
 | `incomplete_fetch_recovered` | INFO | `repo_id`, `requested_revision`, `recovery_action`; resumable staging also has immutable `commit` |
 
@@ -26,10 +27,14 @@ headers, bearer tokens, signed URLs, or upstream error payloads.
 `pull_through`, `refresh`, `stage`, `publish`, or `update_ref`.
 
 `upstream_fetch_failed.error_class` is one of `unavailable`, `not_found`,
-`unauthorized`, `invalid_output`, `failed`, or `io`. The upstream diagnostic itself
+`unauthorized`, `invalid_output`, `storage`, `failed`, or `io`. The upstream diagnostic itself
 is intentionally excluded because helper output can contain credentials or signed
 URLs. Detailed helper diagnostics are available only through their separately
 redacted diagnostic path.
+
+For an invalid fetch-helper contract, `admin_job_failed.error_class` is `upstream`
+and `safe_reason` contains only ModelKeep's fixed description of the rejected
+contract condition. Raw helper stdout and stderr are never included.
 
 For storage failures, `io_kind=out_of_space` identifies ENOSPC. Other I/O failures
 use `io_kind=other`. ModelKeep never deletes an archived revision in response to

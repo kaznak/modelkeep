@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use crate::singleflight::SingleFlight;
-use crate::upstream::{FetchProgress, FetchRequest, UpstreamError, UpstreamFetcher};
+use crate::upstream::{
+    FetchProgress, FetchRequest, InvalidOutputReason, UpstreamError, UpstreamFetcher,
+};
 use crate::{is_hf_commit, Archive, ArchiveError, SourceFile};
 
 #[derive(Clone)]
@@ -17,7 +19,7 @@ pub enum PullThroughError {
     UpstreamUnavailable,
     UpstreamNotFound,
     UpstreamUnauthorized,
-    UpstreamInvalidOutput(&'static str),
+    UpstreamInvalidOutput(InvalidOutputReason),
     UpstreamFailed,
     UnsafePath,
     Integrity,
@@ -315,7 +317,10 @@ impl PullThrough {
     ) {
         if matches!(
             error,
-            UpstreamError::Unavailable | UpstreamError::Failed | UpstreamError::Io(_)
+            UpstreamError::Unavailable
+                | UpstreamError::Failed
+                | UpstreamError::Io(_)
+                | UpstreamError::Storage
         ) && self
             .archive
             .preserve_fetch_staging(staging)
@@ -334,6 +339,7 @@ fn upstream_error_class(error: &UpstreamError) -> &'static str {
         UpstreamError::NotFound => "not_found",
         UpstreamError::Unauthorized => "unauthorized",
         UpstreamError::InvalidOutput(_) => "invalid_output",
+        UpstreamError::Storage => "storage",
         UpstreamError::Failed => "failed",
         UpstreamError::Io(_) => "io",
     }
@@ -391,6 +397,7 @@ impl From<UpstreamError> for PullThroughError {
             UpstreamError::NotFound => Self::UpstreamNotFound,
             UpstreamError::Unauthorized => Self::UpstreamUnauthorized,
             UpstreamError::InvalidOutput(reason) => Self::UpstreamInvalidOutput(reason),
+            UpstreamError::Storage => Self::Storage,
             UpstreamError::Failed | UpstreamError::Io(_) => Self::UpstreamFailed,
         }
     }
@@ -410,7 +417,7 @@ impl From<ArchiveError> for PullThroughError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::upstream::FetchedRevision;
+    use crate::upstream::{FetchedRevision, InvalidOutputReason};
     use std::fs;
     use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -911,7 +918,7 @@ mod tests {
     impl UpstreamFetcher for SensitiveFailureFetcher {
         fn fetch(&self, _request: &FetchRequest) -> Result<FetchedRevision, UpstreamError> {
             Err(UpstreamError::InvalidOutput(
-                "signed-url-secret?token=bearer-secret",
+                InvalidOutputReason::EmptySnapshot,
             ))
         }
     }
@@ -930,6 +937,23 @@ mod tests {
             .unwrap();
             fs::write(request.staging.join("partial.bin"), b"partial").unwrap();
             Err(UpstreamError::Unavailable)
+        }
+    }
+
+    struct StorageFailureResolvedFetcher;
+
+    impl UpstreamFetcher for StorageFailureResolvedFetcher {
+        fn fetch(&self, request: &FetchRequest) -> Result<FetchedRevision, UpstreamError> {
+            crate::record_fetch_resolved_commit(
+                &request.staging,
+                &request.repo_id,
+                &request.revision,
+                &request.files,
+                "8888888888888888888888888888888888888888",
+            )
+            .unwrap();
+            fs::write(request.staging.join("partial.bin"), b"partial").unwrap();
+            Err(UpstreamError::Storage)
         }
     }
 
@@ -954,6 +978,25 @@ mod tests {
     }
 
     #[test]
+    fn helper_staging_storage_failure_is_classified_and_preserved_for_resume() {
+        let (writer, _guard) = capture_logs();
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let pull = PullThrough::new(archive, Arc::new(StorageFailureResolvedFetcher));
+
+        assert_eq!(
+            pull.ensure("org/model", "main", &[]),
+            Err(PullThroughError::Storage)
+        );
+
+        let output = writer.output();
+        assert!(output.contains("incomplete_fetch_preserved"));
+        assert!(output.contains("upstream_fetch_failed"));
+        assert!(output.contains("storage"));
+        assert!(!output.contains("partial.bin"));
+    }
+
+    #[test]
     fn fetch_failure_event_uses_safe_class_without_error_payload() {
         let (writer, _guard) = capture_logs();
         let root = tempfile::tempdir().unwrap();
@@ -963,7 +1006,7 @@ mod tests {
         assert_eq!(
             pull.ensure("org/model", "main", &[]),
             Err(PullThroughError::UpstreamInvalidOutput(
-                "signed-url-secret?token=bearer-secret"
+                InvalidOutputReason::EmptySnapshot
             ))
         );
 
