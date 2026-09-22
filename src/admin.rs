@@ -341,6 +341,18 @@ impl JobManager {
                 };
             }
         }
+        if let Some(existing) = jobs
+            .values()
+            .find(|job| {
+                matches!(job.state, JobState::Queued | JobState::Running)
+                    && job.kind == request.kind
+                    && job.repo_id == request.repo_id
+                    && job.revision == request.revision
+            })
+            .cloned()
+        {
+            return Ok((existing, false));
+        }
         let now = unix_timestamp();
         let mut job = None;
         for _ in 0..16 {
@@ -1097,6 +1109,43 @@ mod tests {
 
     struct FixtureFetcher;
 
+    struct BlockingFetcher {
+        calls: std::sync::atomic::AtomicUsize,
+        released: (Mutex<bool>, std::sync::Condvar),
+    }
+
+    impl BlockingFetcher {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                released: (Mutex::new(false), std::sync::Condvar::new()),
+            }
+        }
+
+        fn release(&self) {
+            *self.released.0.lock().unwrap() = true;
+            self.released.1.notify_all();
+        }
+    }
+
+    impl UpstreamFetcher for BlockingFetcher {
+        fn fetch(&self, request: &FetchRequest) -> Result<FetchedRevision, UpstreamError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut released = self.released.0.lock().unwrap();
+            while !*released {
+                released = self.released.1.wait(released).unwrap();
+            }
+            std::fs::create_dir_all(&request.staging).map_err(UpstreamError::Io)?;
+            std::fs::write(request.staging.join("config.json"), b"model")
+                .map_err(UpstreamError::Io)?;
+            Ok(FetchedRevision {
+                commit: "d".repeat(40),
+                files: vec!["config.json".into()],
+                staging: request.staging.clone(),
+            })
+        }
+    }
+
     #[test]
     fn invalid_helper_output_is_an_upstream_failure() {
         let (class, message) = classify_pullthrough_error(PullThroughError::UpstreamInvalidOutput(
@@ -1384,6 +1433,162 @@ mod tests {
         .unwrap();
         assert_eq!(persisted.created_at, 1);
         assert_eq!(persisted.message, None);
+    }
+
+    #[test]
+    fn equivalent_active_job_is_reused_across_keys_and_principals() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Arc::new(Archive::new(directory.path()).unwrap());
+        let manager = JobManager::open(&archive).unwrap();
+        let mut existing = stored_job("active-prefetch", 1);
+        existing.kind = JobKind::Prefetch;
+        existing.state = JobState::Running;
+        existing.repo_id = Some("org/model".into());
+        existing.revision = Some("main".into());
+        existing.principal = Some(PrincipalView {
+            auth_method: "tailscale".into(),
+            login: Some("first@example.com".into()),
+            name: None,
+        });
+        manager
+            .inner
+            .jobs
+            .lock()
+            .unwrap()
+            .insert(existing.id.clone(), existing.clone());
+
+        let (reused, created) = manager
+            .submit(
+                JobRequest {
+                    kind: JobKind::Prefetch,
+                    repo_id: Some("org/model".into()),
+                    revision: Some("main".into()),
+                },
+                Some("different-key"),
+                archive,
+                None,
+                PrincipalView {
+                    auth_method: "tailscale".into(),
+                    login: Some("second@example.com".into()),
+                    name: None,
+                },
+            )
+            .unwrap();
+
+        assert!(!created);
+        assert_eq!(reused.id, existing.id);
+        assert_eq!(reused.principal, existing.principal);
+        assert_eq!(manager.list().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_or_different_jobs_do_not_block_submission() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Arc::new(Archive::new(directory.path()).unwrap());
+        let manager = JobManager::open(&archive).unwrap();
+        let mut terminal = stored_job("completed-prefetch", 1);
+        terminal.kind = JobKind::Prefetch;
+        terminal.state = JobState::Completed;
+        terminal.repo_id = Some("org/model".into());
+        terminal.revision = Some("main".into());
+        let mut failed = terminal.clone();
+        failed.id = "failed-prefetch".into();
+        failed.state = JobState::Failed;
+        let mut cancelled = terminal.clone();
+        cancelled.id = "cancelled-prefetch".into();
+        cancelled.state = JobState::Cancelled;
+        let mut different = terminal.clone();
+        different.id = "different-refresh".into();
+        different.kind = JobKind::Refresh;
+        different.state = JobState::Running;
+        let mut jobs = manager.inner.jobs.lock().unwrap();
+        for job in [terminal, failed, cancelled] {
+            jobs.insert(job.id.clone(), job);
+        }
+        jobs.insert(different.id.clone(), different);
+        drop(jobs);
+
+        let (submitted, created) = manager
+            .submit(
+                JobRequest {
+                    kind: JobKind::Prefetch,
+                    repo_id: Some("org/model".into()),
+                    revision: Some("main".into()),
+                },
+                Some("retry-prefetch"),
+                archive,
+                None,
+                PrincipalView {
+                    auth_method: "bearer".into(),
+                    login: None,
+                    name: None,
+                },
+            )
+            .unwrap();
+
+        assert!(created);
+        assert_ne!(submitted.id, "completed-prefetch");
+        assert_ne!(submitted.id, "different-refresh");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_equivalent_submissions_create_one_active_job() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Arc::new(Archive::new(directory.path()).unwrap());
+        let manager = JobManager::open(&archive).unwrap();
+        let fetcher = Arc::new(BlockingFetcher::new());
+        let pullthrough = Arc::new(PullThrough::new(archive.as_ref().clone(), fetcher.clone()));
+        let barrier = Arc::new(tokio::sync::Barrier::new(8));
+        let mut submissions = Vec::new();
+
+        for index in 0..8 {
+            let manager = manager.clone();
+            let archive = archive.clone();
+            let pullthrough = pullthrough.clone();
+            let barrier = barrier.clone();
+            submissions.push(tokio::spawn(async move {
+                barrier.wait().await;
+                manager
+                    .submit(
+                        JobRequest {
+                            kind: JobKind::Prefetch,
+                            repo_id: Some("org/concurrent".into()),
+                            revision: Some("main".into()),
+                        },
+                        Some(&format!("concurrent-{index}")),
+                        archive,
+                        Some(pullthrough),
+                        PrincipalView {
+                            auth_method: "bearer".into(),
+                            login: None,
+                            name: None,
+                        },
+                    )
+                    .unwrap()
+            }));
+        }
+
+        let mut results = Vec::new();
+        for submission in submissions {
+            results.push(submission.await.unwrap());
+        }
+        let job_id = results[0].0.id.clone();
+        assert!(results.iter().all(|(job, _)| job.id == job_id));
+        assert_eq!(results.iter().filter(|(_, created)| *created).count(), 1);
+        assert_eq!(manager.list().len(), 1);
+
+        fetcher.release();
+        for _ in 0..100 {
+            if manager
+                .get(&job_id)
+                .is_some_and(|job| job.state == JobState::Completed)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(fetcher.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(manager.get(&job_id).unwrap().state, JobState::Completed);
     }
 
     #[tokio::test]
