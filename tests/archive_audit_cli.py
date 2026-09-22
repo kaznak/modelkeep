@@ -21,13 +21,14 @@ def main():
     binary = Path(sys.argv[1])
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
-        cache = root / "cache" / "models--org--model"
-        blob = cache / "blobs/config"
-        snapshot = cache / "snapshots" / COMMIT
-        blob.parent.mkdir(parents=True)
-        snapshot.mkdir(parents=True)
-        blob.write_bytes(b"healthy")
-        (snapshot / "config.json").symlink_to(blob)
+        for repo_type, payload in (("models", b"model"), ("datasets", b"dataset")):
+            cache = root / "cache" / f"{repo_type}--org--shared"
+            blob = cache / "blobs/config"
+            snapshot = cache / "snapshots" / COMMIT
+            blob.parent.mkdir(parents=True)
+            snapshot.mkdir(parents=True)
+            blob.write_bytes(payload)
+            (snapshot / "config.json").symlink_to(blob)
 
         archive = root / "archive"
         subprocess.run(
@@ -37,13 +38,48 @@ def main():
         clean = audit(binary, archive)
         assert clean.returncode == 0, clean.stderr
         clean_report = json.loads(clean.stdout)
-        assert clean_report == {"checked": 1, "failures": [], "status": "clean"}
+        assert clean_report == {"checked": 2, "failures": [], "status": "clean"}
+
+        model_list = subprocess.run(
+            [binary, "list", archive, "org/shared"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        dataset_list = subprocess.run(
+            [
+                binary,
+                "list",
+                archive,
+                "org/shared",
+                "--repo-type",
+                "dataset",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert model_list.stdout.strip() == COMMIT
+        assert dataset_list.stdout.strip() == COMMIT
+
+        subprocess.run(
+            [
+                binary,
+                "verify",
+                archive,
+                "org/shared",
+                COMMIT,
+                "--repo-type",
+                "dataset",
+            ],
+            check=True,
+        )
 
         archived_file = (
             archive
-            / "models"
+            / "datasets"
             / "org"
-            / "model"
+            / "shared"
             / "revisions"
             / COMMIT
             / "config.json"
@@ -54,9 +90,10 @@ def main():
         assert failed.returncode != 0
         failed_report = json.loads(failed.stdout)
         assert failed_report["status"] == "failed"
-        assert failed_report["checked"] == 1
+        assert failed_report["checked"] == 2
         assert len(failed_report["failures"]) == 1
-        assert failed_report["failures"][0]["repo_id"] == "org/model"
+        assert failed_report["failures"][0]["repo_type"] == "dataset"
+        assert failed_report["failures"][0]["repo_id"] == "org/shared"
         assert failed_report["failures"][0]["commit"] == COMMIT
 
 

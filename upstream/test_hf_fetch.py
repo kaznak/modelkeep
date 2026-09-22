@@ -104,7 +104,37 @@ class HfFetchTests(unittest.TestCase):
 
         self.assertEqual(api.request, ("org/model", "main", "model", True))
         self.assertEqual(len(download_calls), 1)
+        self.assertEqual(download_calls[0]["repo_type"], "model")
         self.assertEqual(result, {"commit": COMMIT_A, "files": ["config.json", "model.bin"]})
+
+    def test_dataset_type_is_used_for_metadata_and_download(self):
+        api = MovingRefApi()
+        download_calls = []
+
+        def download(**kwargs):
+            download_calls.append(kwargs)
+            Path(kwargs["local_dir"], "data.jsonl").write_bytes(b'{"value":1}\n')
+
+        with tempfile.TemporaryDirectory() as output:
+            api.repo_info = lambda repo_id, revision, repo_type, files_metadata=False: (
+                setattr(api, "request", (repo_id, revision, repo_type, files_metadata))
+                or SimpleNamespace(
+                    sha=COMMIT_A,
+                    siblings=[SimpleNamespace(rfilename="data.jsonl", size=12)],
+                )
+            )
+            result = hf_fetch.acquire(
+                "org/shared",
+                "main",
+                output,
+                repo_type="dataset",
+                api=api,
+                download=download,
+            )
+
+        self.assertEqual(api.request, ("org/shared", "main", "dataset", True))
+        self.assertEqual(download_calls[0]["repo_type"], "dataset")
+        self.assertEqual(result, {"commit": COMMIT_A, "files": ["data.jsonl"]})
 
     def test_malformed_resolved_commit_is_rejected_before_download(self):
         api = MovingRefApi()

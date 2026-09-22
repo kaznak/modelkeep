@@ -80,9 +80,10 @@ def localhost_only():
         socket.socket.connect = original_connect
 
 
-def download(endpoint, destination, revision):
+def download(endpoint, destination, revision, repo_type="model"):
     return snapshot_download(
         repo_id=REPO_ID,
+        repo_type=repo_type,
         revision=revision,
         endpoint=endpoint,
         local_dir=str(destination),
@@ -126,6 +127,38 @@ def main():
                 assert "model-00001-of-00002.safetensors" in index
                 assert "model-00002-of-00002.safetensors" in index
 
+                dataset_info = HfApi(endpoint=endpoint).repo_info(
+                    REPO_ID, revision="main", repo_type="dataset"
+                )
+                assert dataset_info.id == REPO_ID
+                assert dataset_info.sha == COMMIT
+                dataset_payloads = {
+                    "README.md": b"# ModelKeep dataset fixture\n",
+                    "data/test.csv": b"split,value\ntest,dataset\n",
+                    "data/train.csv": b"split,value\ntrain,dataset\n",
+                }
+                cold_dataset = Path(
+                    download(
+                        endpoint,
+                        root / "cold-dataset-client",
+                        "main",
+                        repo_type="dataset",
+                    )
+                )
+                for relative, expected in dataset_payloads.items():
+                    assert (cold_dataset / relative).read_bytes() == expected
+
+                # The identical repo ID and commit above must identify two distinct
+                # archives. Re-read the model after the dataset acquisition to catch
+                # an implementation that aliases the durable namespaces.
+                assert (cold / "README.md").read_bytes() == b"# ModelKeep model fixture\n"
+                model_again = Path(
+                    download(endpoint, root / "model-after-dataset", COMMIT)
+                )
+                assert (model_again / "config.json").read_bytes() == (
+                    b'{"model_type":"modelkeep-fixture"}'
+                )
+
                 head = urllib.request.Request(
                     f"{endpoint}/{REPO_ID}/resolve/{COMMIT}/config.json",
                     method="HEAD",
@@ -154,6 +187,27 @@ def main():
                     assert response.headers["x-linked-etag"] is None
                     assert response.read() == b"MODELKEEP"
 
+                dataset_head = urllib.request.Request(
+                    f"{endpoint}/datasets/{REPO_ID}/resolve/{COMMIT}/data/test.csv",
+                    method="HEAD",
+                )
+                with urllib.request.urlopen(dataset_head) as response:
+                    assert response.status == 200
+                    assert response.headers["Content-Length"] == str(
+                        len(dataset_payloads["data/test.csv"])
+                    )
+                    assert response.headers["Location"] is None
+                    assert response.read() == b""
+
+                dataset_range = urllib.request.Request(
+                    f"{endpoint}/datasets/{REPO_ID}/resolve/{COMMIT}/data/test.csv",
+                    headers={"Range": "bytes=0-4"},
+                )
+                with urllib.request.urlopen(dataset_range) as response:
+                    assert response.status == 206
+                    assert response.headers["Location"] is None
+                    assert response.read() == b"split"
+
             assert len(acquisition_logs) == 1
             assert '"request_kind":"head_file"' in acquisition_logs[0]
             assert '"path":"model.safetensors"' in acquisition_logs[0]
@@ -162,6 +216,16 @@ def main():
                 offline = Path(download(endpoint, root / "offline-client", COMMIT))
                 for relative, expected in expected_payloads.items():
                     assert (offline / relative).read_bytes() == expected
+                offline_dataset = Path(
+                    download(
+                        endpoint,
+                        root / "offline-dataset-client",
+                        COMMIT,
+                        repo_type="dataset",
+                    )
+                )
+                for relative, expected in dataset_payloads.items():
+                    assert (offline_dataset / relative).read_bytes() == expected
                 with ThreadPoolExecutor(max_workers=4) as pool:
                     results = list(
                         pool.map(

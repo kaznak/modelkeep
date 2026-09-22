@@ -117,6 +117,15 @@
           '';
         };
 
+        hf-dataset-protocol-observation = pkgs.writeShellApplication {
+          name = "hf-dataset-protocol-observation";
+          runtimeInputs = [ python pkgs.cacert ];
+          text = ''
+            export SSL_CERT_FILE="${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+            exec python3 ${./tests/observe_hf_dataset_protocol.py} "$@"
+          '';
+        };
+
         default = self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep;
       });
 
@@ -206,10 +215,16 @@
             cp ${./tests/observe_hf_protocol.py} observe_hf_protocol.py
             cp ${./tests/test_observe_hf_protocol.py} test_observe_hf_protocol.py
             cp ${./tests/validate_hf_protocol_observation.py} validate_hf_protocol_observation.py
+            cp ${./tests/observe_hf_dataset_protocol.py} observe_hf_dataset_protocol.py
+            cp ${./tests/test_observe_hf_dataset_protocol.py} test_observe_hf_dataset_protocol.py
+            cp ${./tests/validate_hf_dataset_protocol_observation.py} validate_hf_dataset_protocol_observation.py
             python3 -m py_compile observe_hf_protocol.py
-            python3 -m unittest -v test_observe_hf_protocol.py
+            python3 -m py_compile observe_hf_dataset_protocol.py
+            python3 -m unittest -v test_observe_hf_protocol.py test_observe_hf_dataset_protocol.py
             python3 validate_hf_protocol_observation.py \
               ${./docs/observations/hugging-face-protocol-2026-09-22.json}
+            python3 validate_hf_dataset_protocol_observation.py \
+              ${./docs/observations/hugging-face-dataset-protocol-2026-09-22.json}
             touch $out
           '';
 

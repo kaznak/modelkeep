@@ -9,6 +9,7 @@ from pathlib import Path
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--repo-id", required=True)
+parser.add_argument("--repo-type", choices=("model", "dataset"), default="model")
 parser.add_argument("--revision", required=True)
 parser.add_argument("--output", required=True)
 parser.add_argument("--file", action="append")

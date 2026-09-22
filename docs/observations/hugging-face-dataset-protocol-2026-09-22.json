@@ -1,0 +1,61 @@
+{
+  "file": {
+    "path": "data/test.csv",
+    "sha256": "d9e0cbb5b8850ef7efc1955f7400b0462fa2cef6dfe517b64ed6fcf7ea712c58",
+    "size": 894
+  },
+  "huggingface_hub": "1.27.0",
+  "matrix": {
+    "head": true,
+    "inventory": true,
+    "metadata": true,
+    "payload": true,
+    "revision": true,
+    "tree": true
+  },
+  "observed_at": "2026-09-22",
+  "repository": {
+    "commit": "87ecf163bedca9d80598b528940a9c4f99e14c11",
+    "repo_id": "lhoestq/demo1",
+    "repo_type": "dataset"
+  },
+  "schema": 1,
+  "trace": [
+    {
+      "host": "huggingface.co",
+      "method": "GET",
+      "path": "/api/datasets/lhoestq/demo1/revision/87ecf163bedca9d80598b528940a9c4f99e14c11",
+      "status": 200
+    },
+    {
+      "host": "huggingface.co",
+      "method": "GET",
+      "path": "/api/datasets/lhoestq/demo1/tree/87ecf163bedca9d80598b528940a9c4f99e14c11",
+      "status": 200
+    },
+    {
+      "accept-ranges": "bytes",
+      "host": "huggingface.co",
+      "method": "HEAD",
+      "path": "/datasets/lhoestq/demo1/resolve/87ecf163bedca9d80598b528940a9c4f99e14c11/data/test.csv",
+      "status": 307,
+      "x-repo-commit": "87ecf163bedca9d80598b528940a9c4f99e14c11"
+    },
+    {
+      "accept-ranges": "bytes",
+      "host": "huggingface.co",
+      "method": "HEAD",
+      "path": "/api/resolve-cache/datasets/lhoestq/demo1/87ecf163bedca9d80598b528940a9c4f99e14c11/data/test.csv",
+      "status": 200,
+      "x-repo-commit": "87ecf163bedca9d80598b528940a9c4f99e14c11"
+    },
+    {
+      "accept-ranges": "bytes",
+      "host": "huggingface.co",
+      "method": "GET",
+      "path": "/api/resolve-cache/datasets/lhoestq/demo1/87ecf163bedca9d80598b528940a9c4f99e14c11/data/test.csv",
+      "status": 200,
+      "x-repo-commit": "87ecf163bedca9d80598b528940a9c4f99e14c11"
+    }
+  ]
+}

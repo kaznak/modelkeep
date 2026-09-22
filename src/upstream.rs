@@ -4,10 +4,11 @@ use std::process::{Child, Command, Stdio};
 
 use serde::Deserialize;
 
-use crate::{is_hf_commit, record_fetch_resolved_commit};
+use crate::{is_hf_commit, record_fetch_resolved_commit_for_type, RepositoryType};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchRequest {
+    pub repo_type: RepositoryType,
     pub repo_id: String,
     pub revision: String,
     pub files: Vec<String>,
@@ -174,6 +175,8 @@ impl UpstreamFetcher for OfficialHfFetcher {
         let mut command = Command::new(&self.python);
         command
             .arg(&self.helper)
+            .arg("--repo-type")
+            .arg(request.repo_type.to_string())
             .arg("--repo-id")
             .arg(&request.repo_id)
             .arg("--revision")
@@ -219,8 +222,9 @@ impl UpstreamFetcher for OfficialHfFetcher {
                                 InvalidOutputReason::MalformedResolvedCommit,
                             ));
                         }
-                        record_fetch_resolved_commit(
+                        record_fetch_resolved_commit_for_type(
                             &request.staging,
+                            request.repo_type,
                             &request.repo_id,
                             &request.revision,
                             &request.files,
@@ -331,6 +335,7 @@ mod tests {
             helper,
         }
         .fetch(&FetchRequest {
+            repo_type: RepositoryType::Model,
             repo_id: "public/model".into(),
             revision: "main".into(),
             files: Vec::new(),
@@ -502,6 +507,7 @@ mod tests {
             helper,
         }
         .fetch(&FetchRequest {
+            repo_type: RepositoryType::Model,
             repo_id: "public/model".into(),
             revision: "main".into(),
             files: Vec::new(),

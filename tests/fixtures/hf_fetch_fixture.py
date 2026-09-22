@@ -10,6 +10,7 @@ COMMIT = "a" * 40
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--repo-id", required=True)
+parser.add_argument("--repo-type", choices=("model", "dataset"), default="model")
 parser.add_argument("--revision", required=True)
 parser.add_argument("--output", required=True)
 parser.add_argument("--file", action="append")
@@ -24,6 +25,16 @@ if args.revision == "unavailable":
 
 output = Path(args.output)
 output.mkdir(parents=True, exist_ok=True)
+(output / "README.md").write_text(f"# ModelKeep {args.repo_type} fixture\n")
+if args.repo_type == "dataset":
+    data = output / "data"
+    data.mkdir()
+    (data / "test.csv").write_bytes(b"split,value\ntest,dataset\n")
+    (data / "train.csv").write_bytes(b"split,value\ntrain,dataset\n")
+    files = ["README.md", "data/test.csv", "data/train.csv"]
+    print(json.dumps({"commit": COMMIT, "files": files}))
+    sys.exit(0)
+
 (output / "config.json").write_text('{"model_type":"modelkeep-fixture"}')
 (output / "tokenizer.json").write_text('{"version":"1.0"}')
 (output / "model.safetensors").write_bytes(b"MODELKEEP-SAFETENSORS-FIXTURE")
@@ -42,6 +53,7 @@ output.mkdir(parents=True, exist_ok=True)
     )
 )
 files = [
+    "README.md",
     "config.json",
     "model-00001-of-00002.safetensors",
     "model-00002-of-00002.safetensors",

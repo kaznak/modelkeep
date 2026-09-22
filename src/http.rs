@@ -16,7 +16,9 @@ use tokio::{
 use tokio_util::io::ReaderStream;
 
 use crate::pullthrough::{PullThrough, PullThroughError};
-use crate::{is_hf_commit, parse_range, Archive, ArchiveError, ByteRange, RangeError};
+use crate::{
+    is_hf_commit, parse_range, Archive, ArchiveError, ByteRange, RangeError, RepositoryType,
+};
 
 #[derive(Clone)]
 pub struct HttpState {
@@ -104,8 +106,20 @@ fn router_with_state(state: HttpState) -> Router {
             get(model_tree),
         )
         .route(
+            "/api/datasets/{namespace}/{repo}/revision/{revision}",
+            get(dataset_info),
+        )
+        .route(
+            "/api/datasets/{namespace}/{repo}/tree/{revision}",
+            get(dataset_tree),
+        )
+        .route(
             "/{namespace}/{repo}/resolve/{revision}/{*path}",
             get(get_file).head(head_file),
+        )
+        .route(
+            "/datasets/{namespace}/{repo}/resolve/{revision}/{*path}",
+            get(get_dataset_file).head(head_dataset_file),
         )
         .with_state(state)
 }
@@ -140,9 +154,27 @@ async fn model_info(
     State(state): State<HttpState>,
     Path((namespace, repo, revision)): Path<(String, String, String)>,
 ) -> Result<impl IntoResponse, StatusCode> {
+    repository_info(state, namespace, repo, revision, RepositoryType::Model).await
+}
+
+async fn dataset_info(
+    State(state): State<HttpState>,
+    Path((namespace, repo, revision)): Path<(String, String, String)>,
+) -> Result<impl IntoResponse, StatusCode> {
+    repository_info(state, namespace, repo, revision, RepositoryType::Dataset).await
+}
+
+async fn repository_info(
+    state: HttpState,
+    namespace: String,
+    repo: String,
+    revision: String,
+    repo_type: RepositoryType,
+) -> Result<impl IntoResponse, StatusCode> {
     let repo_id = format!("{namespace}/{repo}");
     tracing::info!(
         event = "archive_request",
+        repo_type = %repo_type,
         request_kind = "model_info",
         repo_id = %repo_id,
         requested_revision = %revision,
@@ -151,7 +183,7 @@ async fn model_info(
     let commit = match if is_hf_commit(&revision) {
         state
             .archive
-            .revision_path(&repo_id, &revision)
+            .revision_path_for_type(repo_type, &repo_id, &revision)
             .and_then(|path| {
                 if path.is_dir() {
                     Ok(revision.clone())
@@ -162,33 +194,31 @@ async fn model_info(
                 }
             })
     } else {
-        state.archive.resolve_ref(&repo_id, &revision)
+        state
+            .archive
+            .resolve_ref_for_type(repo_type, &repo_id, &revision)
     } {
         Ok(commit) => {
-            tracing::info!(event = "archive_hit", request_kind = "model_info", repo_id = %repo_id, requested_revision = %revision, commit = %commit, "archive request served locally");
+            tracing::info!(event = "archive_hit", request_kind = "model_info", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %revision, commit = %commit, "archive request served locally");
             commit
         }
         Err(ArchiveError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            tracing::info!(event = "archive_miss", request_kind = "model_info", repo_id = %repo_id, requested_revision = %revision, "archive request requires upstream acquisition");
+            tracing::info!(event = "archive_miss", request_kind = "model_info", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %revision, "archive request requires upstream acquisition");
             let Some(pullthrough) = state.pullthrough.clone() else {
                 return Err(StatusCode::NOT_FOUND);
             };
             let requested = revision.clone();
             let repo = repo_id.clone();
-            task::spawn_blocking(move || pullthrough.ensure(&repo, &requested, &[]))
-                .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-                .map_err(status_for_pullthrough_error)?
+            task::spawn_blocking(move || {
+                pullthrough.ensure_for_type(repo_type, &repo, &requested, &[])
+            })
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(status_for_pullthrough_error)?
         }
         Err(error) => return Err(status_for_archive_error(error)),
     };
-    let manifest: serde_json::Value = serde_json::from_str(
-        &state
-            .archive
-            .manifest(&repo_id, &commit)
-            .map_err(status_for_archive_error)?,
-    )
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let manifest = validated_manifest(&state.archive, repo_type, &repo_id, &commit)?;
     let siblings = manifest["files"]
         .as_array()
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?
@@ -206,9 +236,27 @@ async fn model_tree(
     State(state): State<HttpState>,
     Path((namespace, repo, revision)): Path<(String, String, String)>,
 ) -> Result<impl IntoResponse, StatusCode> {
+    repository_tree(state, namespace, repo, revision, RepositoryType::Model).await
+}
+
+async fn dataset_tree(
+    State(state): State<HttpState>,
+    Path((namespace, repo, revision)): Path<(String, String, String)>,
+) -> Result<impl IntoResponse, StatusCode> {
+    repository_tree(state, namespace, repo, revision, RepositoryType::Dataset).await
+}
+
+async fn repository_tree(
+    state: HttpState,
+    namespace: String,
+    repo: String,
+    revision: String,
+    repo_type: RepositoryType,
+) -> Result<impl IntoResponse, StatusCode> {
     let repo_id = format!("{namespace}/{repo}");
     tracing::info!(
         event = "archive_request",
+        repo_type = %repo_type,
         request_kind = "model_tree",
         repo_id = %repo_id,
         requested_revision = %revision,
@@ -217,7 +265,7 @@ async fn model_tree(
     let commit = match if is_hf_commit(&revision) {
         state
             .archive
-            .revision_path(&repo_id, &revision)
+            .revision_path_for_type(repo_type, &repo_id, &revision)
             .and_then(|path| {
                 if path.is_dir() {
                     Ok(revision.clone())
@@ -228,33 +276,31 @@ async fn model_tree(
                 }
             })
     } else {
-        state.archive.resolve_ref(&repo_id, &revision)
+        state
+            .archive
+            .resolve_ref_for_type(repo_type, &repo_id, &revision)
     } {
         Ok(commit) => {
-            tracing::info!(event = "archive_hit", request_kind = "model_tree", repo_id = %repo_id, requested_revision = %revision, commit = %commit, "archive request served locally");
+            tracing::info!(event = "archive_hit", request_kind = "model_tree", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %revision, commit = %commit, "archive request served locally");
             commit
         }
         Err(ArchiveError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            tracing::info!(event = "archive_miss", request_kind = "model_tree", repo_id = %repo_id, requested_revision = %revision, "archive request requires upstream acquisition");
+            tracing::info!(event = "archive_miss", request_kind = "model_tree", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %revision, "archive request requires upstream acquisition");
             let Some(pullthrough) = state.pullthrough.clone() else {
                 return Err(StatusCode::NOT_FOUND);
             };
             let requested = revision.clone();
             let repo = repo_id.clone();
-            task::spawn_blocking(move || pullthrough.ensure(&repo, &requested, &[]))
-                .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-                .map_err(status_for_pullthrough_error)?
+            task::spawn_blocking(move || {
+                pullthrough.ensure_for_type(repo_type, &repo, &requested, &[])
+            })
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(status_for_pullthrough_error)?
         }
         Err(error) => return Err(status_for_archive_error(error)),
     };
-    let manifest: serde_json::Value = serde_json::from_str(
-        &state
-            .archive
-            .manifest(&repo_id, &commit)
-            .map_err(status_for_archive_error)?,
-    )
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let manifest = validated_manifest(&state.archive, repo_type, &repo_id, &commit)?;
     let files = manifest["files"]
         .as_array()
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?
@@ -271,12 +317,40 @@ async fn model_tree(
     Ok(Json(files))
 }
 
+fn validated_manifest(
+    archive: &Archive,
+    repo_type: RepositoryType,
+    repo_id: &str,
+    commit: &str,
+) -> Result<serde_json::Value, StatusCode> {
+    match archive
+        .is_complete_revision_for_type(repo_type, repo_id, commit)
+        .map_err(status_for_archive_error)?
+    {
+        true => {}
+        false => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+    serde_json::from_str(
+        &archive
+            .manifest_for_type(repo_type, repo_id, commit)
+            .map_err(status_for_archive_error)?,
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 async fn get_file(
     State(state): State<HttpState>,
     Path((namespace, repo, revision, path)): Path<(String, String, String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
-    file_response(state, namespace, repo, revision, path, headers, false).await
+    file_response(
+        state,
+        (namespace, repo, revision, path),
+        headers,
+        false,
+        RepositoryType::Model,
+    )
+    .await
 }
 
 async fn head_file(
@@ -284,43 +358,79 @@ async fn head_file(
     Path((namespace, repo, revision, path)): Path<(String, String, String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
-    file_response(state, namespace, repo, revision, path, headers, true).await
+    file_response(
+        state,
+        (namespace, repo, revision, path),
+        headers,
+        true,
+        RepositoryType::Model,
+    )
+    .await
+}
+
+async fn get_dataset_file(
+    State(state): State<HttpState>,
+    Path((namespace, repo, revision, path)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, StatusCode> {
+    file_response(
+        state,
+        (namespace, repo, revision, path),
+        headers,
+        false,
+        RepositoryType::Dataset,
+    )
+    .await
+}
+
+async fn head_dataset_file(
+    State(state): State<HttpState>,
+    Path((namespace, repo, revision, path)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, StatusCode> {
+    file_response(
+        state,
+        (namespace, repo, revision, path),
+        headers,
+        true,
+        RepositoryType::Dataset,
+    )
+    .await
 }
 
 async fn file_response(
     state: HttpState,
-    namespace: String,
-    repo: String,
-    revision: String,
-    path: String,
+    target: (String, String, String, String),
     headers: HeaderMap,
     head_only: bool,
+    repo_type: RepositoryType,
 ) -> Result<Response, StatusCode> {
+    let (namespace, repo, revision, path) = target;
     let repo_id = format!("{namespace}/{repo}");
-    tracing::info!(event = "archive_request", request_kind = if head_only { "head_file" } else { "get_file" }, repo_id = %repo_id, requested_revision = %revision, path = %path, "archive request received");
+    tracing::info!(event = "archive_request", request_kind = if head_only { "head_file" } else { "get_file" }, repo_type = %repo_type, repo_id = %repo_id, requested_revision = %revision, path = %path, "archive request received");
     let resolved_result = if is_hf_commit(&revision) {
         state
             .archive
-            .resolve_file(&repo_id, &revision, &path)
+            .resolve_file_for_type(repo_type, &repo_id, &revision, &path)
             .map(|file| (file, revision.clone()))
     } else {
         state
             .archive
-            .resolve_ref(&repo_id, &revision)
+            .resolve_ref_for_type(repo_type, &repo_id, &revision)
             .and_then(|commit| {
                 state
                     .archive
-                    .resolve_file(&repo_id, &commit, &path)
+                    .resolve_file_for_type(repo_type, &repo_id, &commit, &path)
                     .map(|file| (file, commit))
             })
     };
     let (resolved, resolved_commit) = match resolved_result {
         Ok((resolved, commit)) => {
-            tracing::info!(event = "archive_hit", request_kind = if head_only { "head_file" } else { "get_file" }, repo_id = %repo_id, requested_revision = %revision, commit = %commit, path = %path, "archive request served locally");
+            tracing::info!(event = "archive_hit", request_kind = if head_only { "head_file" } else { "get_file" }, repo_type = %repo_type, repo_id = %repo_id, requested_revision = %revision, commit = %commit, path = %path, "archive request served locally");
             (resolved, commit)
         }
         Err(ArchiveError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            tracing::info!(event = "archive_miss", request_kind = if head_only { "head_file" } else { "get_file" }, repo_id = %repo_id, requested_revision = %revision, path = %path, "archive request requires upstream acquisition");
+            tracing::info!(event = "archive_miss", request_kind = if head_only { "head_file" } else { "get_file" }, repo_type = %repo_type, repo_id = %repo_id, requested_revision = %revision, path = %path, "archive request requires upstream acquisition");
             let Some(pullthrough) = state.pullthrough.clone() else {
                 return Err(StatusCode::NOT_FOUND);
             };
@@ -328,14 +438,14 @@ async fn file_response(
             let requested_file = path.clone();
             let repo = repo_id.clone();
             let commit = task::spawn_blocking(move || {
-                pullthrough.ensure(&repo, &requested, &[requested_file])
+                pullthrough.ensure_for_type(repo_type, &repo, &requested, &[requested_file])
             })
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
             .map_err(status_for_pullthrough_error)?;
             let resolved = state
                 .archive
-                .resolve_file(&repo_id, &commit, &path)
+                .resolve_file_for_type(repo_type, &repo_id, &commit, &path)
                 .map_err(status_for_archive_error)?;
             (resolved, commit)
         }
@@ -495,7 +605,154 @@ mod tests {
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             )
             .unwrap();
+        archive
+            .publish_revision_for_type(
+                RepositoryType::Dataset,
+                crate::PublishRequest {
+                    repo_id: "org/model".into(),
+                    requested_revision: "main".into(),
+                    commit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                    files: vec![crate::ArchiveFile {
+                        path: "data/example.jsonl".into(),
+                        bytes: b"dataset-payload".to_vec(),
+                    }],
+                },
+            )
+            .unwrap();
+        archive
+            .update_ref_for_type(
+                RepositoryType::Dataset,
+                "org/model",
+                "main",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            )
+            .unwrap();
         (router(archive), directory)
+    }
+
+    #[tokio::test]
+    async fn dataset_routes_serve_the_dataset_namespace_without_model_collision() {
+        let (app, _directory) = test_router();
+
+        let info = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/datasets/org/model/revision/main")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(info.status(), StatusCode::OK);
+        let info: serde_json::Value =
+            serde_json::from_slice(&to_bytes(info.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(info["id"], "org/model");
+        assert_eq!(info["sha"], "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+        let tree = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/datasets/org/model/tree/main")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tree.status(), StatusCode::OK);
+        let tree: serde_json::Value =
+            serde_json::from_slice(&to_bytes(tree.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(tree[0]["path"], "data/example.jsonl");
+
+        let file = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/datasets/org/model/resolve/main/data/example.jsonl")
+                    .header(header::RANGE, "bytes=0-6")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(file.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            to_bytes(file.into_body(), usize::MAX).await.unwrap(),
+            "dataset"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_routes_reject_unvalidated_manifests() {
+        async fn assert_rejected(app: Router, paths: &[&str]) {
+            for path in paths {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri(*path)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+
+        let (app, directory) = test_router();
+        let dataset_manifest = directory
+            .path()
+            .join("datasets/org/model/revisions")
+            .join("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            .join(".modelkeep-manifest.json");
+        let valid_dataset = std::fs::read_to_string(&dataset_manifest).unwrap();
+
+        std::fs::write(
+            &dataset_manifest,
+            valid_dataset.replace("\"repo_type\":\"dataset\"", "\"repo_type\":\"model\""),
+        )
+        .unwrap();
+        assert_rejected(
+            app.clone(),
+            &[
+                "/api/datasets/org/model/revision/main",
+                "/api/datasets/org/model/tree/main",
+            ],
+        )
+        .await;
+
+        std::fs::write(
+            &dataset_manifest,
+            valid_dataset.replace("\"repo_type\":\"dataset\",", ""),
+        )
+        .unwrap();
+        assert_rejected(
+            app.clone(),
+            &[
+                "/api/datasets/org/model/revision/main",
+                "/api/datasets/org/model/tree/main",
+            ],
+        )
+        .await;
+
+        let model_manifest = directory
+            .path()
+            .join("models/org/model/revisions")
+            .join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .join(".modelkeep-manifest.json");
+        let incomplete = std::fs::read_to_string(&model_manifest)
+            .unwrap()
+            .replace("\"complete\":true", "\"complete\":false");
+        std::fs::write(model_manifest, incomplete).unwrap();
+        assert_rejected(
+            app,
+            &[
+                "/api/models/org/model/revision/main",
+                "/api/models/org/model/tree/main",
+            ],
+        )
+        .await;
     }
 
     #[tokio::test]

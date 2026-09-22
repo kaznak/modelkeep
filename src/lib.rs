@@ -34,10 +34,42 @@ const STAGING_LEASE_SECONDS: u64 = 120;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct FetchStagingMetadata {
     version: u32,
+    #[serde(default)]
+    pub(crate) repo_type: RepositoryType,
     pub(crate) repo_id: String,
     pub(crate) requested_revision: String,
     pub(crate) files: Vec<String>,
     pub(crate) resolved_commit: Option<String>,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryType {
+    #[default]
+    Model,
+    Dataset,
+}
+
+impl RepositoryType {
+    pub const ALL: [Self; 2] = [Self::Model, Self::Dataset];
+
+    pub const fn archive_directory(self) -> &'static str {
+        match self {
+            Self::Model => "models",
+            Self::Dataset => "datasets",
+        }
+    }
+}
+
+impl fmt::Display for RepositoryType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Model => "model",
+            Self::Dataset => "dataset",
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +138,8 @@ pub enum RangeError {
 struct Manifest {
     #[serde(default)]
     complete: bool,
+    #[serde(default)]
+    repo_type: RepositoryType,
     files: Vec<ManifestFile>,
 }
 
@@ -154,6 +188,7 @@ pub struct RevisionRemoval {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditFailure {
+    pub repo_type: RepositoryType,
     pub repo_id: String,
     pub commit: String,
     pub error: String,
@@ -167,6 +202,7 @@ pub struct AuditReport {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RepositorySummary {
+    pub repo_type: RepositoryType,
     pub repo_id: String,
     pub revision_count: usize,
     pub ref_count: usize,
@@ -183,6 +219,7 @@ pub struct RevisionSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RepositoryInventory {
+    pub repo_type: RepositoryType,
     pub repo_id: String,
     pub refs: BTreeMap<String, String>,
     pub revisions: Vec<RevisionSummary>,
@@ -198,6 +235,7 @@ impl Archive {
     pub fn new(root: impl Into<PathBuf>) -> ArchiveResult<Self> {
         let root = root.into();
         fs::create_dir_all(root.join("models"))?;
+        fs::create_dir_all(root.join("datasets"))?;
         fs::create_dir_all(root.join("tmp"))?;
         Ok(Self {
             root,
@@ -219,6 +257,14 @@ impl Archive {
 
     /// Publishes one complete immutable revision.
     pub fn publish_revision(&self, request: PublishRequest) -> ArchiveResult<PathBuf> {
+        self.publish_revision_for_type(RepositoryType::Model, request)
+    }
+
+    pub fn publish_revision_for_type(
+        &self,
+        repo_type: RepositoryType,
+        request: PublishRequest,
+    ) -> ArchiveResult<PathBuf> {
         let (namespace, name) = validate_repo_id(&request.repo_id)?;
         validate_component(&request.requested_revision)?;
         validate_revision(&request.commit)?;
@@ -228,7 +274,7 @@ impl Archive {
 
         let revisions = self
             .root
-            .join("models")
+            .join(repo_type.archive_directory())
             .join(namespace)
             .join(name)
             .join("revisions");
@@ -239,7 +285,7 @@ impl Archive {
         }
 
         let staging = self.create_staging("revision")?;
-        let result = self.write_revision(&staging, &request);
+        let result = self.write_revision(&staging, repo_type, &request);
         if let Err(error) = result {
             let _ = fs::remove_dir_all(&staging);
             return Err(error);
@@ -259,12 +305,22 @@ impl Archive {
 
     /// Updates a mutable ref only after the target revision is published.
     pub fn update_ref(&self, repo_id: &str, reference: &str, commit: &str) -> ArchiveResult<()> {
+        self.update_ref_for_type(RepositoryType::Model, repo_id, reference, commit)
+    }
+
+    pub fn update_ref_for_type(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        reference: &str,
+        commit: &str,
+    ) -> ArchiveResult<()> {
         let (namespace, name) = validate_repo_id(repo_id)?;
         validate_component(reference)?;
         validate_revision(commit)?;
         let revision = self
             .root
-            .join("models")
+            .join(repo_type.archive_directory())
             .join(namespace)
             .join(name)
             .join("revisions")
@@ -343,6 +399,7 @@ impl Archive {
                 if let Some(identity) = &fetch_identity {
                     tracing::info!(
                         event = "incomplete_fetch_recovered",
+                        repo_type = %identity.repo_type,
                         repo_id = %identity.repo_id,
                         requested_revision = %identity.requested_revision,
                         commit = identity.resolved_commit.as_deref().unwrap_or(""),
@@ -357,6 +414,7 @@ impl Archive {
             if let Some(identity) = &fetch_identity {
                 tracing::info!(
                     event = "incomplete_fetch_recovered",
+                    repo_type = %identity.repo_type,
                     repo_id = %identity.repo_id,
                     requested_revision = %identity.requested_revision,
                     recovery_action = "discarded",
@@ -368,10 +426,18 @@ impl Archive {
     }
 
     pub fn list_revisions(&self, repo_id: &str) -> ArchiveResult<Vec<String>> {
+        self.list_revisions_for_type(RepositoryType::Model, repo_id)
+    }
+
+    pub fn list_revisions_for_type(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+    ) -> ArchiveResult<Vec<String>> {
         let (namespace, name) = validate_repo_id(repo_id)?;
         let revisions = self
             .root
-            .join("models")
+            .join(repo_type.archive_directory())
             .join(namespace)
             .join(name)
             .join("revisions");
@@ -391,41 +457,62 @@ impl Archive {
 
     pub fn list_repositories(&self) -> ArchiveResult<Vec<RepositorySummary>> {
         let mut repositories = Vec::new();
-        for namespace in fs::read_dir(self.root.join("models"))? {
-            let namespace = namespace?;
-            if !namespace.file_type()?.is_dir() {
+        for repo_type in RepositoryType::ALL {
+            let root = self.root.join(repo_type.archive_directory());
+            if !root.is_dir() {
                 continue;
             }
-            let namespace_name = namespace.file_name().to_string_lossy().into_owned();
-            validate_component(&namespace_name)?;
-            for repository in fs::read_dir(namespace.path())? {
-                let repository = repository?;
-                if !repository.file_type()?.is_dir() {
+            for namespace in fs::read_dir(root)? {
+                let namespace = namespace?;
+                if !namespace.file_type()?.is_dir() {
                     continue;
                 }
-                let repository_name = repository.file_name().to_string_lossy().into_owned();
-                validate_component(&repository_name)?;
-                let repo_id = format!("{namespace_name}/{repository_name}");
-                let inventory = self.repository_inventory(&repo_id)?;
-                repositories.push(RepositorySummary {
-                    repo_id,
-                    revision_count: inventory.revisions.len(),
-                    ref_count: inventory.refs.len(),
-                    logical_bytes: inventory
-                        .revisions
-                        .iter()
-                        .map(|revision| revision.logical_bytes)
-                        .sum(),
-                });
+                let namespace_name = namespace.file_name().to_string_lossy().into_owned();
+                validate_component(&namespace_name)?;
+                for repository in fs::read_dir(namespace.path())? {
+                    let repository = repository?;
+                    if !repository.file_type()?.is_dir() {
+                        continue;
+                    }
+                    let repository_name = repository.file_name().to_string_lossy().into_owned();
+                    validate_component(&repository_name)?;
+                    let repo_id = format!("{namespace_name}/{repository_name}");
+                    let inventory = self.repository_inventory_for_type(repo_type, &repo_id)?;
+                    repositories.push(RepositorySummary {
+                        repo_type,
+                        repo_id,
+                        revision_count: inventory.revisions.len(),
+                        ref_count: inventory.refs.len(),
+                        logical_bytes: inventory
+                            .revisions
+                            .iter()
+                            .map(|revision| revision.logical_bytes)
+                            .sum(),
+                    });
+                }
             }
         }
-        repositories.sort_by(|left, right| left.repo_id.cmp(&right.repo_id));
+        repositories.sort_by(|left, right| {
+            (left.repo_type, &left.repo_id).cmp(&(right.repo_type, &right.repo_id))
+        });
         Ok(repositories)
     }
 
     pub fn repository_inventory(&self, repo_id: &str) -> ArchiveResult<RepositoryInventory> {
+        self.repository_inventory_for_type(RepositoryType::Model, repo_id)
+    }
+
+    pub fn repository_inventory_for_type(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+    ) -> ArchiveResult<RepositoryInventory> {
         let (namespace, name) = validate_repo_id(repo_id)?;
-        let repository = self.root.join("models").join(namespace).join(name);
+        let repository = self
+            .root
+            .join(repo_type.archive_directory())
+            .join(namespace)
+            .join(name);
         if !repository.is_dir() {
             return Err(io::Error::new(io::ErrorKind::NotFound, "repository not found").into());
         }
@@ -445,10 +532,9 @@ impl Archive {
             }
         }
         let mut revisions = Vec::new();
-        for commit in self.list_revisions(repo_id)? {
+        for commit in self.list_revisions_for_type(repo_type, repo_id)? {
             validate_revision(&commit)?;
-            let manifest: Manifest = serde_json::from_str(&self.manifest(repo_id, &commit)?)
-                .map_err(|error| ArchiveError::IntegrityMismatch(error.to_string()))?;
+            let manifest = self.read_manifest_for(repo_type, repo_id, &commit)?;
             if !manifest.complete {
                 return Err(ArchiveError::IntegrityMismatch(format!(
                     "revision {commit} is not complete"
@@ -468,6 +554,7 @@ impl Archive {
         }
         revisions.sort_by(|left, right| left.commit.cmp(&right.commit));
         Ok(RepositoryInventory {
+            repo_type,
             repo_id: repo_id.to_string(),
             refs,
             revisions,
@@ -480,7 +567,17 @@ impl Archive {
         commit: &str,
         dry_run: bool,
     ) -> ArchiveResult<RevisionRemoval> {
-        let revision = self.revision_path(repo_id, commit)?;
+        self.remove_revision_for_type(RepositoryType::Model, repo_id, commit, dry_run)
+    }
+
+    pub fn remove_revision_for_type(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        commit: &str,
+        dry_run: bool,
+    ) -> ArchiveResult<RevisionRemoval> {
+        let revision = self.revision_path_for_type(repo_type, repo_id, commit)?;
         if !revision.is_dir() {
             return Err(
                 io::Error::new(io::ErrorKind::NotFound, "revision is not published").into(),
@@ -515,18 +612,36 @@ impl Archive {
     }
 
     pub fn manifest(&self, repo_id: &str, commit: &str) -> ArchiveResult<String> {
+        self.manifest_for_type(RepositoryType::Model, repo_id, commit)
+    }
+
+    pub fn manifest_for_type(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        commit: &str,
+    ) -> ArchiveResult<String> {
         Ok(fs::read_to_string(
-            self.revision_path(repo_id, commit)?
+            self.revision_path_for_type(repo_type, repo_id, commit)?
                 .join(".modelkeep-manifest.json"),
         )?)
     }
 
     pub fn resolve_ref(&self, repo_id: &str, reference: &str) -> ArchiveResult<String> {
+        self.resolve_ref_for_type(RepositoryType::Model, repo_id, reference)
+    }
+
+    pub fn resolve_ref_for_type(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        reference: &str,
+    ) -> ArchiveResult<String> {
         let (namespace, name) = validate_repo_id(repo_id)?;
         validate_component(reference)?;
         let path = self
             .root
-            .join("models")
+            .join(repo_type.archive_directory())
             .join(namespace)
             .join(name)
             .join("refs")
@@ -538,7 +653,11 @@ impl Archive {
 
     pub fn check_readiness(&self) -> ArchiveResult<()> {
         let result = (|| {
-            for directory in [self.root.join("models"), self.root.join("tmp")] {
+            for directory in [
+                self.root.join("models"),
+                self.root.join("datasets"),
+                self.root.join("tmp"),
+            ] {
                 if !directory.is_dir() {
                     return Err(ArchiveError::Io(io::Error::new(
                         io::ErrorKind::NotFound,
@@ -578,8 +697,24 @@ impl Archive {
         self.create_staging("fetch")
     }
 
+    #[allow(dead_code)] // Model-default compatibility for internal callers and older tests.
     pub(crate) fn acquire_fetch_staging(
         &self,
+        repo_id: &str,
+        requested_revision: &str,
+        files: &[String],
+    ) -> ArchiveResult<FetchStaging> {
+        self.acquire_fetch_staging_for_type(
+            RepositoryType::Model,
+            repo_id,
+            requested_revision,
+            files,
+        )
+    }
+
+    pub(crate) fn acquire_fetch_staging_for_type(
+        &self,
+        repo_type: RepositoryType,
         repo_id: &str,
         requested_revision: &str,
         files: &[String],
@@ -604,7 +739,8 @@ impl Archive {
             let Ok(metadata) = read_fetch_staging_metadata(&old) else {
                 continue;
             };
-            if metadata.repo_id != repo_id
+            if metadata.repo_type != repo_type
+                || metadata.repo_id != repo_id
                 || metadata.requested_revision != requested_revision
                 || metadata.files != files
                 || metadata.resolved_commit.is_none()
@@ -653,7 +789,8 @@ impl Archive {
             }
             let path = entry.path();
             if read_fetch_staging_metadata(&path).is_ok_and(|metadata| {
-                metadata.repo_id == repo_id
+                metadata.repo_type == repo_type
+                    && metadata.repo_id == repo_id
                     && metadata.requested_revision == requested_revision
                     && metadata.files == files
             }) {
@@ -665,6 +802,7 @@ impl Archive {
             &path,
             &FetchStagingMetadata {
                 version: 1,
+                repo_type,
                 repo_id: repo_id.into(),
                 requested_revision: requested_revision.into(),
                 files: files.to_vec(),
@@ -695,11 +833,20 @@ impl Archive {
     }
 
     pub fn revision_path(&self, repo_id: &str, commit: &str) -> ArchiveResult<PathBuf> {
+        self.revision_path_for_type(RepositoryType::Model, repo_id, commit)
+    }
+
+    pub fn revision_path_for_type(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        commit: &str,
+    ) -> ArchiveResult<PathBuf> {
         let (namespace, name) = validate_repo_id(repo_id)?;
         validate_revision(commit)?;
         Ok(self
             .root
-            .join("models")
+            .join(repo_type.archive_directory())
             .join(namespace)
             .join(name)
             .join("revisions")
@@ -707,8 +854,16 @@ impl Archive {
     }
 
     pub fn is_complete_revision(&self, repo_id: &str, commit: &str) -> ArchiveResult<bool> {
-        let manifest: Manifest = serde_json::from_str(&self.manifest(repo_id, commit)?)
-            .map_err(|error| ArchiveError::IntegrityMismatch(error.to_string()))?;
+        self.is_complete_revision_for_type(RepositoryType::Model, repo_id, commit)
+    }
+
+    pub fn is_complete_revision_for_type(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        commit: &str,
+    ) -> ArchiveResult<bool> {
+        let manifest = self.read_manifest_for(repo_type, repo_id, commit)?;
         Ok(manifest.complete)
     }
 
@@ -718,10 +873,19 @@ impl Archive {
         commit: &str,
         relative_path: &str,
     ) -> ArchiveResult<ResolvedFile> {
+        self.resolve_file_for_type(RepositoryType::Model, repo_id, commit, relative_path)
+    }
+
+    pub fn resolve_file_for_type(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        commit: &str,
+        relative_path: &str,
+    ) -> ArchiveResult<ResolvedFile> {
         let relative = validate_relative_file_path(relative_path)?;
-        let revision = self.revision_path(repo_id, commit)?;
-        let manifest: Manifest = serde_json::from_str(&self.manifest(repo_id, commit)?)
-            .map_err(|error| ArchiveError::IntegrityMismatch(error.to_string()))?;
+        let revision = self.revision_path_for_type(repo_type, repo_id, commit)?;
+        let manifest = self.read_manifest_for(repo_type, repo_id, commit)?;
         if !manifest.complete {
             return Err(ArchiveError::IntegrityMismatch(
                 "revision is not complete".into(),
@@ -746,10 +910,20 @@ impl Archive {
     }
 
     pub fn verify_revision(&self, repo_id: &str, commit: &str) -> ArchiveResult<usize> {
-        let result = self.verify_revision_inner(repo_id, commit);
+        self.verify_revision_for_type(RepositoryType::Model, repo_id, commit)
+    }
+
+    pub fn verify_revision_for_type(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        commit: &str,
+    ) -> ArchiveResult<usize> {
+        let result = self.verify_revision_inner(repo_type, repo_id, commit);
         if let Err(error) = &result {
             tracing::warn!(
                 event = "archive_verification_failed",
+                repo_type = %repo_type,
                 repo_id,
                 commit,
                 error_class = match error {
@@ -767,11 +941,17 @@ impl Archive {
         result
     }
 
-    fn verify_revision_inner(&self, repo_id: &str, commit: &str) -> ArchiveResult<usize> {
-        let revision = self.revision_path(repo_id, commit)?;
+    fn verify_revision_inner(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        commit: &str,
+    ) -> ArchiveResult<usize> {
+        let revision = self.revision_path_for_type(repo_type, repo_id, commit)?;
         let manifest_path = revision.join(".modelkeep-manifest.json");
         let manifest: Manifest = serde_json::from_slice(&fs::read(&manifest_path)?)
             .map_err(|error| ArchiveError::IntegrityMismatch(error.to_string()))?;
+        self.ensure_manifest_type(repo_type, &manifest)?;
         if !manifest.complete {
             return Err(ArchiveError::IntegrityMismatch(
                 "revision is not complete".into(),
@@ -779,7 +959,7 @@ impl Archive {
         }
         let mut verified = 0;
         for entry in &manifest.files {
-            let resolved = self.resolve_file(repo_id, commit, &entry.path)?;
+            let resolved = self.resolve_file_for_type(repo_type, repo_id, commit, &entry.path)?;
             if resolved.size != entry.size {
                 return Err(ArchiveError::IntegrityMismatch(entry.path.clone()));
             }
@@ -803,44 +983,80 @@ impl Archive {
         Ok(verified)
     }
 
+    fn read_manifest_for(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        commit: &str,
+    ) -> ArchiveResult<Manifest> {
+        let manifest: Manifest =
+            serde_json::from_str(&self.manifest_for_type(repo_type, repo_id, commit)?)
+                .map_err(|error| ArchiveError::IntegrityMismatch(error.to_string()))?;
+        self.ensure_manifest_type(repo_type, &manifest)?;
+        Ok(manifest)
+    }
+
+    fn ensure_manifest_type(
+        &self,
+        repo_type: RepositoryType,
+        manifest: &Manifest,
+    ) -> ArchiveResult<()> {
+        if manifest.repo_type != repo_type {
+            return Err(ArchiveError::IntegrityMismatch(format!(
+                "manifest repository type {} does not match archive root {repo_type}",
+                manifest.repo_type
+            )));
+        }
+        Ok(())
+    }
+
     pub fn audit(&self) -> ArchiveResult<AuditReport> {
         let mut report = AuditReport {
             checked: 0,
             failures: Vec::new(),
         };
-        for namespace in fs::read_dir(self.root.join("models"))? {
-            let namespace = namespace?;
-            if !namespace.file_type()?.is_dir() {
+        for repo_type in RepositoryType::ALL {
+            let root = self.root.join(repo_type.archive_directory());
+            if !root.is_dir() {
                 continue;
             }
-            for repository in fs::read_dir(namespace.path())? {
-                let repository = repository?;
-                if !repository.file_type()?.is_dir() {
+            for namespace in fs::read_dir(root)? {
+                let namespace = namespace?;
+                if !namespace.file_type()?.is_dir() {
                     continue;
                 }
-                let repo_id = format!(
-                    "{}/{}",
-                    namespace.file_name().to_string_lossy(),
-                    repository.file_name().to_string_lossy()
-                );
-                let revisions = repository.path().join("revisions");
-                if !revisions.is_dir() {
-                    continue;
-                }
-                for revision in fs::read_dir(revisions)? {
-                    let revision = revision?;
-                    if !revision.file_type()?.is_dir() {
+                for repository in fs::read_dir(namespace.path())? {
+                    let repository = repository?;
+                    if !repository.file_type()?.is_dir() {
                         continue;
                     }
-                    let commit = revision.file_name().to_string_lossy().into_owned();
-                    report.checked += 1;
-                    tracing::info!(repo_id = %repo_id, commit = %commit, "archive audit revision");
-                    if let Err(error) = self.verify_revision(&repo_id, &commit) {
-                        report.failures.push(AuditFailure {
-                            repo_id: repo_id.clone(),
-                            commit,
-                            error: error.to_string(),
-                        });
+                    let repo_id = format!(
+                        "{}/{}",
+                        namespace.file_name().to_string_lossy(),
+                        repository.file_name().to_string_lossy()
+                    );
+                    let revisions = repository.path().join("revisions");
+                    if !revisions.is_dir() {
+                        continue;
+                    }
+                    for revision in fs::read_dir(revisions)? {
+                        let revision = revision?;
+                        if !revision.file_type()?.is_dir() {
+                            continue;
+                        }
+                        let commit = revision.file_name().to_string_lossy().into_owned();
+                        report.checked += 1;
+                        tracing::info!(repo_type = %repo_type, repo_id = %repo_id, commit = %commit, "archive audit revision");
+                        if let Err(error) =
+                            self.verify_revision_for_type(repo_type, &repo_id, &commit)
+                        {
+                            report.failures.push(AuditFailure {
+                                repo_type,
+                                repo_id: repo_id.clone(),
+                                commit,
+                                error: error.to_string(),
+                            });
+                        }
                     }
                 }
             }
@@ -852,11 +1068,32 @@ impl Archive {
         &self,
         request: SourcePublishRequest,
     ) -> ArchiveResult<PathBuf> {
-        self.publish_revision_from_directory_with_progress(request, &|_| {})
+        self.publish_revision_from_directory_for_type(RepositoryType::Model, request)
+    }
+
+    pub fn publish_revision_from_directory_for_type(
+        &self,
+        repo_type: RepositoryType,
+        request: SourcePublishRequest,
+    ) -> ArchiveResult<PathBuf> {
+        self.publish_revision_from_directory_with_progress_for_type(repo_type, request, &|_| {})
     }
 
     pub fn publish_revision_from_directory_with_progress(
         &self,
+        request: SourcePublishRequest,
+        progress: &(dyn Fn(&str) + Send + Sync),
+    ) -> ArchiveResult<PathBuf> {
+        self.publish_revision_from_directory_with_progress_for_type(
+            RepositoryType::Model,
+            request,
+            progress,
+        )
+    }
+
+    pub fn publish_revision_from_directory_with_progress_for_type(
+        &self,
+        repo_type: RepositoryType,
         request: SourcePublishRequest,
         progress: &(dyn Fn(&str) + Send + Sync),
     ) -> ArchiveResult<PathBuf> {
@@ -875,7 +1112,7 @@ impl Archive {
         }
         let revisions = self
             .root
-            .join("models")
+            .join(repo_type.archive_directory())
             .join(namespace)
             .join(name)
             .join("revisions");
@@ -893,9 +1130,9 @@ impl Archive {
         };
         progress("validating_revision");
         let result = if reuse_staging {
-            Self::write_source_manifest(&staging, &source_root, &request, progress)
+            Self::write_source_manifest(&staging, &source_root, repo_type, &request, progress)
         } else {
-            self.write_source_revision(&staging, &source_root, &request)
+            self.write_source_revision(&staging, &source_root, repo_type, &request)
         };
         if let Err(error) = result {
             let _ = fs::remove_dir_all(&staging);
@@ -935,7 +1172,12 @@ impl Archive {
         )))
     }
 
-    fn write_revision(&self, staging: &Path, request: &PublishRequest) -> ArchiveResult<()> {
+    fn write_revision(
+        &self,
+        staging: &Path,
+        repo_type: RepositoryType,
+        request: &PublishRequest,
+    ) -> ArchiveResult<()> {
         let mut entries = Vec::with_capacity(request.files.len());
         for archive_file in &request.files {
             let relative = validate_relative_file_path(&archive_file.path)?;
@@ -960,6 +1202,7 @@ impl Archive {
         let mut file = File::create(manifest)?;
         write_manifest(
             &mut file,
+            repo_type,
             &request.repo_id,
             &request.requested_revision,
             &request.commit,
@@ -972,6 +1215,7 @@ impl Archive {
     fn write_source_manifest(
         staging: &Path,
         source_root: &Path,
+        repo_type: RepositoryType,
         request: &SourcePublishRequest,
         progress: &(dyn Fn(&str) + Send + Sync),
     ) -> ArchiveResult<()> {
@@ -1016,6 +1260,7 @@ impl Archive {
         let mut file = File::create(staging.join(".modelkeep-manifest.json"))?;
         write_manifest(
             &mut file,
+            repo_type,
             &request.repo_id,
             &request.requested_revision,
             &request.commit,
@@ -1031,6 +1276,7 @@ impl Archive {
         &self,
         staging: &Path,
         source_root: &Path,
+        repo_type: RepositoryType,
         request: &SourcePublishRequest,
     ) -> ArchiveResult<()> {
         let mut entries = Vec::with_capacity(request.files.len());
@@ -1071,6 +1317,7 @@ impl Archive {
         let mut file = File::create(staging.join(".modelkeep-manifest.json"))?;
         write_manifest(
             &mut file,
+            repo_type,
             &request.repo_id,
             &request.requested_revision,
             &request.commit,
@@ -1082,6 +1329,7 @@ impl Archive {
     }
 }
 
+#[allow(dead_code)] // Model-default compatibility for internal callers and older tests.
 pub(crate) fn record_fetch_resolved_commit(
     staging: &Path,
     request_repo_id: &str,
@@ -1089,9 +1337,28 @@ pub(crate) fn record_fetch_resolved_commit(
     files: &[String],
     commit: &str,
 ) -> ArchiveResult<()> {
+    record_fetch_resolved_commit_for_type(
+        staging,
+        RepositoryType::Model,
+        request_repo_id,
+        request_revision,
+        files,
+        commit,
+    )
+}
+
+pub(crate) fn record_fetch_resolved_commit_for_type(
+    staging: &Path,
+    repo_type: RepositoryType,
+    request_repo_id: &str,
+    request_revision: &str,
+    files: &[String],
+    commit: &str,
+) -> ArchiveResult<()> {
     validate_revision(commit)?;
     let mut metadata = read_fetch_staging_metadata(staging)?;
-    if metadata.repo_id != request_repo_id
+    if metadata.repo_type != repo_type
+        || metadata.repo_id != request_repo_id
         || metadata.requested_revision != request_revision
         || metadata.files != files
     {
@@ -1338,6 +1605,7 @@ fn validate_relative_file_path(value: &str) -> ArchiveResult<&Path> {
 
 fn write_manifest(
     output: &mut File,
+    repo_type: RepositoryType,
     repo_id: &str,
     requested_revision: &str,
     commit: &str,
@@ -1345,7 +1613,8 @@ fn write_manifest(
 ) -> io::Result<()> {
     write!(
         output,
-        "{{\"version\":1,\"complete\":true,\"repo_type\":\"model\",\"repo_id\":\"{}\",\"requested_revision\":\"{}\",\"commit\":\"{}\",\"archived_at\":{},\"files\":[",
+        "{{\"version\":1,\"complete\":true,\"repo_type\":\"{}\",\"repo_id\":\"{}\",\"requested_revision\":\"{}\",\"commit\":\"{}\",\"archived_at\":{},\"files\":[",
+        repo_type,
         json_escape(repo_id),
         json_escape(requested_revision),
         commit,
@@ -1527,6 +1796,191 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let archive = Archive::new(directory.path()).unwrap();
         (archive, directory)
+    }
+
+    #[test]
+    fn model_and_dataset_with_same_id_are_isolated() {
+        let (archive, directory) = archive();
+        let commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        for (repo_type, contents) in [
+            (RepositoryType::Model, b"model".as_slice()),
+            (RepositoryType::Dataset, b"dataset".as_slice()),
+        ] {
+            archive
+                .publish_revision_for_type(
+                    repo_type,
+                    PublishRequest {
+                        repo_id: "org/shared".into(),
+                        requested_revision: "main".into(),
+                        commit: commit.into(),
+                        files: vec![ArchiveFile {
+                            path: "data.bin".into(),
+                            bytes: contents.to_vec(),
+                        }],
+                    },
+                )
+                .unwrap();
+            archive
+                .update_ref_for_type(repo_type, "org/shared", "main", commit)
+                .unwrap();
+        }
+
+        assert_eq!(
+            fs::read(
+                archive
+                    .resolve_file_for_type(RepositoryType::Model, "org/shared", commit, "data.bin",)
+                    .unwrap()
+                    .path,
+            )
+            .unwrap(),
+            b"model"
+        );
+        assert_eq!(
+            fs::read(
+                archive
+                    .resolve_file_for_type(
+                        RepositoryType::Dataset,
+                        "org/shared",
+                        commit,
+                        "data.bin",
+                    )
+                    .unwrap()
+                    .path,
+            )
+            .unwrap(),
+            b"dataset"
+        );
+        assert!(directory.path().join("models/org/shared").is_dir());
+        assert!(directory.path().join("datasets/org/shared").is_dir());
+        let repositories = archive.list_repositories().unwrap();
+        assert_eq!(repositories.len(), 2);
+        assert_eq!(repositories[0].repo_type, RepositoryType::Model);
+        assert_eq!(repositories[1].repo_type, RepositoryType::Dataset);
+    }
+
+    #[test]
+    fn manifest_repository_type_must_match_archive_root() {
+        let (archive, _directory) = archive();
+        let commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        archive
+            .publish_revision_for_type(
+                RepositoryType::Dataset,
+                PublishRequest {
+                    repo_id: "org/data".into(),
+                    requested_revision: "main".into(),
+                    commit: commit.into(),
+                    files: vec![ArchiveFile {
+                        path: "data.json".into(),
+                        bytes: b"{}".to_vec(),
+                    }],
+                },
+            )
+            .unwrap();
+        let manifest = archive
+            .revision_path_for_type(RepositoryType::Dataset, "org/data", commit)
+            .unwrap()
+            .join(".modelkeep-manifest.json");
+        let contents = fs::read_to_string(&manifest)
+            .unwrap()
+            .replace("\"repo_type\":\"dataset\"", "\"repo_type\":\"model\"");
+        fs::write(manifest, contents).unwrap();
+
+        assert!(matches!(
+            archive.verify_revision_for_type(RepositoryType::Dataset, "org/data", commit),
+            Err(ArchiveError::IntegrityMismatch(_))
+        ));
+        let report = archive.audit().unwrap();
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].repo_type, RepositoryType::Dataset);
+    }
+
+    #[test]
+    fn fetch_staging_identity_includes_repository_type() {
+        let (archive, _directory) = archive();
+        let model = archive
+            .acquire_fetch_staging_for_type(RepositoryType::Model, "org/shared", "main", &[])
+            .unwrap();
+        let dataset = archive
+            .acquire_fetch_staging_for_type(RepositoryType::Dataset, "org/shared", "main", &[])
+            .unwrap();
+        assert_ne!(model.path, dataset.path);
+        assert!(record_fetch_resolved_commit_for_type(
+            &model.path,
+            RepositoryType::Dataset,
+            "org/shared",
+            "main",
+            &[],
+            &"c".repeat(40),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn old_model_only_archive_opens_read_only_without_dataset_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("models")).unwrap();
+        fs::create_dir(directory.path().join("tmp")).unwrap();
+
+        let archive = Archive::open_read_only(directory.path()).unwrap();
+        assert!(archive.list_repositories().unwrap().is_empty());
+        assert_eq!(archive.audit().unwrap().checked, 0);
+        assert!(!directory.path().join("datasets").exists());
+    }
+
+    #[test]
+    fn writable_upgrade_only_adds_empty_dataset_namespace() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("models")).unwrap();
+        fs::create_dir(directory.path().join("tmp")).unwrap();
+        let sentinel = directory.path().join("models/operator-sentinel");
+        fs::write(&sentinel, b"unchanged").unwrap();
+
+        let _archive = Archive::new(directory.path()).unwrap();
+
+        assert_eq!(fs::read(sentinel).unwrap(), b"unchanged");
+        let datasets = directory.path().join("datasets");
+        assert!(datasets.is_dir());
+        assert_eq!(fs::read_dir(datasets).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn typed_removal_does_not_remove_same_id_sibling_type() {
+        let (archive, _directory) = archive();
+        let commit = "dddddddddddddddddddddddddddddddddddddddd";
+        for repo_type in RepositoryType::ALL {
+            archive
+                .publish_revision_for_type(
+                    repo_type,
+                    PublishRequest {
+                        repo_id: "org/shared-removal".into(),
+                        requested_revision: commit.into(),
+                        commit: commit.into(),
+                        files: vec![ArchiveFile {
+                            path: "payload.bin".into(),
+                            bytes: repo_type.to_string().into_bytes(),
+                        }],
+                    },
+                )
+                .unwrap();
+        }
+
+        archive
+            .remove_revision_for_type(RepositoryType::Dataset, "org/shared-removal", commit, false)
+            .unwrap();
+
+        assert!(!archive
+            .revision_path_for_type(RepositoryType::Dataset, "org/shared-removal", commit)
+            .unwrap()
+            .exists());
+        let model = archive
+            .resolve_file_for_type(
+                RepositoryType::Model,
+                "org/shared-removal",
+                commit,
+                "payload.bin",
+            )
+            .unwrap();
+        assert_eq!(fs::read(model.path).unwrap(), b"model");
     }
 
     fn request(commit: &str, content: &[u8]) -> PublishRequest {

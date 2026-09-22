@@ -8,7 +8,9 @@ use std::{
     time::Duration,
 };
 
-use modelkeep::{admin, http, pullthrough::PullThrough, upstream::OfficialHfFetcher, Archive};
+use modelkeep::{
+    admin, http, pullthrough::PullThrough, upstream::OfficialHfFetcher, Archive, RepositoryType,
+};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -81,15 +83,40 @@ fn initialize_ownership(target: PathBuf) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-fn parse_remove_option(option: Option<&str>, has_extra: bool) -> Result<bool, String> {
-    if has_extra {
-        return Err("remove accepts only --dry-run".into());
+#[derive(Debug, PartialEq, Eq)]
+struct RepositoryCommandOptions {
+    repo_type: RepositoryType,
+    dry_run: bool,
+}
+
+fn parse_repository_options(
+    arguments: Vec<String>,
+    allow_dry_run: bool,
+) -> Result<RepositoryCommandOptions, String> {
+    let mut repo_type = RepositoryType::Model;
+    let mut repo_type_set = false;
+    let mut dry_run = false;
+    let mut arguments = arguments.into_iter();
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--repo-type" if !repo_type_set => {
+                repo_type = match arguments.next().as_deref() {
+                    Some("model") => RepositoryType::Model,
+                    Some("dataset") => RepositoryType::Dataset,
+                    Some(value) => {
+                        return Err(format!(
+                            "unsupported repository type {value}; expected model or dataset"
+                        ));
+                    }
+                    None => return Err("--repo-type requires model or dataset".into()),
+                };
+                repo_type_set = true;
+            }
+            "--dry-run" if allow_dry_run && !dry_run => dry_run = true,
+            _ => return Err(format!("unexpected option: {argument}")),
+        }
     }
-    match option {
-        None => Ok(false),
-        Some("--dry-run") => Ok(true),
-        Some(_) => Err("remove accepts only --dry-run".into()),
-    }
+    Ok(RepositoryCommandOptions { repo_type, dry_run })
 }
 
 fn probe_endpoint(endpoint: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -118,8 +145,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/data"));
             let repo = args.next().ok_or("list requires repository id")?;
+            let options = parse_repository_options(args.collect(), false)?;
             let archive = Archive::new(root)?;
-            for commit in archive.list_revisions(&repo)? {
+            for commit in archive.list_revisions_for_type(options.repo_type, &repo)? {
                 println!("{commit}");
             }
             Ok(())
@@ -131,8 +159,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|| PathBuf::from("/data"));
             let repo = args.next().ok_or("show requires repository id")?;
             let commit = args.next().ok_or("show requires commit")?;
+            let options = parse_repository_options(args.collect(), false)?;
             let archive = Archive::new(root)?;
-            print!("{}", archive.manifest(&repo, &commit)?);
+            print!(
+                "{}",
+                archive.manifest_for_type(options.repo_type, &repo, &commit)?
+            );
             Ok(())
         }
         Some("import-hf-cache") => {
@@ -158,9 +190,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|| PathBuf::from("/data"));
             let repo = args.next().ok_or("verify requires repository id")?;
             let commit = args.next().ok_or("verify requires commit")?;
+            let options = parse_repository_options(args.collect(), false)?;
             let archive = Archive::new(root)?;
-            let count = archive.verify_revision(&repo, &commit)?;
-            println!("verified {count} files for {repo}@{commit}");
+            let count = archive.verify_revision_for_type(options.repo_type, &repo, &commit)?;
+            println!(
+                "verified {count} files for {}:{repo}@{commit}",
+                options.repo_type
+            );
             Ok(())
         }
         Some("audit") => {
@@ -178,7 +214,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "status": if report.failures.is_empty() { "clean" } else { "failed" },
                     "checked": report.checked,
                     "failures": report.failures.iter().map(|failure| serde_json::json!({
-                        "repo_id": failure.repo_id, "commit": failure.commit, "error": failure.error
+                        "repo_type": failure.repo_type, "repo_id": failure.repo_id,
+                        "commit": failure.commit, "error": failure.error
                     })).collect::<Vec<_>>()
                 })
             );
@@ -195,14 +232,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|| PathBuf::from("/data"));
             let repo = args.next().ok_or("remove requires repository id")?;
             let commit = args.next().ok_or("remove requires commit")?;
-            let dry_run = parse_remove_option(args.next().as_deref(), args.next().is_some())?;
+            let options = parse_repository_options(args.collect(), true)?;
             let archive = Archive::new(root)?;
             archive.recover_incomplete()?;
-            let result = archive.remove_revision(&repo, &commit, dry_run)?;
+            let result = archive.remove_revision_for_type(
+                options.repo_type,
+                &repo,
+                &commit,
+                options.dry_run,
+            )?;
             if result.removed {
-                println!("removed {repo}@{commit}");
+                println!("removed {}:{repo}@{commit}", options.repo_type);
             } else {
-                println!("would remove {repo}@{commit}");
+                println!("would remove {}:{repo}@{commit}", options.repo_type);
             }
             Ok(())
         }
@@ -213,7 +255,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|| PathBuf::from("/data"));
             let repo = args.next().ok_or("refresh requires repository id")?;
             let reference = args.next().ok_or("refresh requires mutable ref")?;
-            let dry_run = parse_remove_option(args.next().as_deref(), args.next().is_some())?;
+            let options = parse_repository_options(args.collect(), true)?;
             let python = env::var("MODELKEEP_HF_PYTHON")?;
             let helper = env::var("MODELKEEP_HF_HELPER")?;
             let archive = Archive::new(root)?;
@@ -225,7 +267,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     helper: helper.into(),
                 }),
             );
-            let result = pull.refresh(&repo, &reference, dry_run)?;
+            let result =
+                pull.refresh_for_type(options.repo_type, &repo, &reference, options.dry_run)?;
             println!(
                 "{} -> {}{}",
                 result.previous.as_deref().unwrap_or("<none>"),
@@ -354,17 +397,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some("ready") => probe_endpoint("/readyz"),
         Some("help") | None => {
             println!(
-                "usage: modelkeep list [archive-root] <repo-id>
-       modelkeep show [archive-root] <repo-id> <commit>
+                "usage: modelkeep list [archive-root] <repo-id> [--repo-type model|dataset]
+       modelkeep show [archive-root] <repo-id> <commit> [--repo-type model|dataset]
        modelkeep import-hf-cache <cache-path> [archive-root]
        modelkeep serve [archive-root] [bind-address]
        modelkeep init-ownership [target-path]
        modelkeep health
        modelkeep ready
        modelkeep audit [archive-root]
-       modelkeep refresh [archive-root] <repo-id> <ref> [--dry-run]
-       modelkeep verify [archive-root] <repo-id> <commit>
-       modelkeep remove [archive-root] <repo-id> <commit> [--dry-run]"
+       modelkeep refresh [archive-root] <repo-id> <ref> [--repo-type model|dataset] [--dry-run]
+       modelkeep verify [archive-root] <repo-id> <commit> [--repo-type model|dataset]
+       modelkeep remove [archive-root] <repo-id> <commit> [--repo-type model|dataset] [--dry-run]"
             );
             Ok(())
         }
@@ -374,20 +417,32 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{log_filter_from, parse_remove_option};
+    use super::{log_filter_from, parse_repository_options};
+    use modelkeep::RepositoryType;
     use std::env::VarError;
 
     #[test]
-    fn remove_option_parser_accepts_real_delete_and_dry_run() {
-        assert!(!parse_remove_option(None, false).unwrap());
-        assert!(parse_remove_option(Some("--dry-run"), false).unwrap());
+    fn repository_option_parser_defaults_to_model_and_accepts_dataset() {
+        let defaults = parse_repository_options(vec![], false).unwrap();
+        assert_eq!(defaults.repo_type, RepositoryType::Model);
+        assert!(!defaults.dry_run);
+        let dataset = parse_repository_options(
+            vec!["--repo-type".into(), "dataset".into(), "--dry-run".into()],
+            true,
+        )
+        .unwrap();
+        assert_eq!(dataset.repo_type, RepositoryType::Dataset);
+        assert!(dataset.dry_run);
     }
 
     #[test]
-    fn remove_option_parser_rejects_unknown_and_extra_arguments() {
-        assert!(parse_remove_option(Some("--other"), false).is_err());
-        assert!(parse_remove_option(None, true).is_err());
-        assert!(parse_remove_option(Some("--dry-run"), true).is_err());
+    fn repository_option_parser_rejects_invalid_or_disallowed_options() {
+        assert!(parse_repository_options(vec!["--other".into()], false).is_err());
+        assert!(parse_repository_options(vec!["--dry-run".into()], false).is_err());
+        assert!(parse_repository_options(vec!["--repo-type".into()], false).is_err());
+        assert!(
+            parse_repository_options(vec!["--repo-type".into(), "space".into()], false).is_err()
+        );
     }
 
     #[test]

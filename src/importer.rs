@@ -1,7 +1,9 @@
 use std::fs;
 use std::path::Path;
 
-use crate::{Archive, ArchiveError, ArchiveResult, SourceFile, SourcePublishRequest};
+use crate::{
+    Archive, ArchiveError, ArchiveResult, RepositoryType, SourceFile, SourcePublishRequest,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportReport {
@@ -21,7 +23,8 @@ pub fn import_hf_cache(archive: &Archive, cache_root: &Path) -> ArchiveResult<Im
         if !entry.file_type()?.is_dir() {
             continue;
         }
-        let Some(repo_id) = decode_repository_name(entry.file_name().to_string_lossy().as_ref())
+        let Some((repo_type, repo_id)) =
+            decode_repository_name(entry.file_name().to_string_lossy().as_ref())
         else {
             continue;
         };
@@ -46,7 +49,7 @@ pub fn import_hf_cache(archive: &Archive, cache_root: &Path) -> ArchiveResult<Im
                 source_root: repository.clone(),
                 files,
             };
-            match archive.publish_revision_from_directory(request) {
+            match archive.publish_revision_from_directory_for_type(repo_type, request) {
                 Ok(_) => report.revisions += 1,
                 Err(ArchiveError::AlreadyPublished(_)) => {}
                 Err(error) => return Err(error),
@@ -64,7 +67,7 @@ pub fn import_hf_cache(archive: &Archive, cache_root: &Path) -> ArchiveResult<Im
                 if commit.is_empty() {
                     continue;
                 }
-                archive.update_ref(&repo_id, &name, &commit)?;
+                archive.update_ref_for_type(repo_type, &repo_id, &name, &commit)?;
                 report.refs += 1;
             }
         }
@@ -72,15 +75,20 @@ pub fn import_hf_cache(archive: &Archive, cache_root: &Path) -> ArchiveResult<Im
     Ok(report)
 }
 
-fn decode_repository_name(name: &str) -> Option<String> {
-    let encoded = name.strip_prefix("models--")?;
+fn decode_repository_name(name: &str) -> Option<(RepositoryType, String)> {
+    let (repo_type, encoded) = if let Some(encoded) = name.strip_prefix("models--") {
+        (RepositoryType::Model, encoded)
+    } else {
+        let encoded = name.strip_prefix("datasets--")?;
+        (RepositoryType::Dataset, encoded)
+    };
     let mut parts = encoded.split("--");
     let namespace = parts.next()?;
     let repository = parts.next()?;
     if parts.next().is_some() || namespace.is_empty() || repository.is_empty() {
         return None;
     }
-    Some(format!("{namespace}/{repository}"))
+    Some((repo_type, format!("{namespace}/{repository}")))
 }
 
 fn collect_files(
@@ -153,6 +161,52 @@ mod tests {
         assert_eq!(fs::read(path.join("config.json")).unwrap(), b"from cache");
         assert_eq!(
             fs::read_to_string(path.parent().unwrap().parent().unwrap().join("refs/main")).unwrap(),
+            "aaaaaaaa"
+        );
+    }
+
+    #[test]
+    fn imports_model_and_dataset_with_the_same_repository_id_without_collision() {
+        let cache = tempfile::tempdir().unwrap();
+        for (prefix, payload) in [
+            ("models", b"model".as_slice()),
+            ("datasets", b"dataset".as_slice()),
+        ] {
+            let repository = cache.path().join(format!("{prefix}--org--shared"));
+            let snapshot = repository.join("snapshots/aaaaaaaa");
+            let blob = repository.join("blobs/blob1");
+            fs::create_dir_all(&snapshot).unwrap();
+            fs::create_dir_all(blob.parent().unwrap()).unwrap();
+            fs::write(&blob, payload).unwrap();
+            symlink(&blob, snapshot.join("config.json")).unwrap();
+            fs::create_dir_all(repository.join("refs")).unwrap();
+            fs::write(repository.join("refs/main"), "aaaaaaaa\n").unwrap();
+        }
+
+        let archive_dir = tempfile::tempdir().unwrap();
+        let archive = Archive::new(archive_dir.path()).unwrap();
+        let report = import_hf_cache(&archive, cache.path()).unwrap();
+        assert_eq!(report.revisions, 2);
+        assert_eq!(report.refs, 2);
+
+        let model = archive
+            .revision_path_for_type(RepositoryType::Model, "org/shared", "aaaaaaaa")
+            .unwrap();
+        let dataset = archive
+            .revision_path_for_type(RepositoryType::Dataset, "org/shared", "aaaaaaaa")
+            .unwrap();
+        assert_eq!(fs::read(model.join("config.json")).unwrap(), b"model");
+        assert_eq!(fs::read(dataset.join("config.json")).unwrap(), b"dataset");
+        assert_eq!(
+            archive
+                .resolve_ref_for_type(RepositoryType::Model, "org/shared", "main")
+                .unwrap(),
+            "aaaaaaaa"
+        );
+        assert_eq!(
+            archive
+                .resolve_ref_for_type(RepositoryType::Dataset, "org/shared", "main")
+                .unwrap(),
             "aaaaaaaa"
         );
     }

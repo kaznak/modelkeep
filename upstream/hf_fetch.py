@@ -148,7 +148,16 @@ def expected_files(info, patterns=None):
     return sorted(result)
 
 
-def acquire(repo_id, requested_revision, output, files=None, api=None, download=None, progress=None):
+def acquire(
+    repo_id,
+    requested_revision,
+    output,
+    files=None,
+    repo_type="model",
+    api=None,
+    download=None,
+    progress=None,
+):
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     api = api or HfApi()
@@ -159,7 +168,7 @@ def acquire(repo_id, requested_revision, output, files=None, api=None, download=
     info = api.repo_info(
         repo_id,
         revision=requested_revision,
-        repo_type="model",
+        repo_type=repo_type,
         files_metadata=True,
     )
     commit = info.sha
@@ -176,7 +185,7 @@ def acquire(repo_id, requested_revision, output, files=None, api=None, download=
     download_kwargs = dict(
         repo_id=repo_id,
         revision=commit,
-        repo_type="model",
+        repo_type=repo_type,
         local_dir=str(output),
         allow_patterns=files or None,
     )
@@ -198,6 +207,7 @@ def acquire(repo_id, requested_revision, output, files=None, api=None, download=
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo-id", required=True)
+    parser.add_argument("--repo-type", choices=("model", "dataset"), default="model")
     parser.add_argument("--revision", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--file", action="append", dest="files")
@@ -205,6 +215,7 @@ def main():
 
     result = acquire(
         repo_id=args.repo_id,
+        repo_type=args.repo_type,
         requested_revision=args.revision,
         output=args.output,
         files=args.files,

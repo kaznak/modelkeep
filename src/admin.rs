@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 use crate::upstream::FetchProgress;
 use crate::{
     pullthrough::PullThrough, validate_repository_id, validate_revision_ref, Archive, ArchiveError,
-    ArchiveResult, RepositorySummary,
+    ArchiveResult, RepositorySummary, RepositoryType,
 };
 
 const ADMIN_CAPABILITY: &str = "io.modelkeep/cap/admin";
@@ -184,6 +184,8 @@ struct StatusBody {
     ready: bool,
     pullthrough_enabled: bool,
     repository_count: usize,
+    model_repository_count: usize,
+    dataset_repository_count: usize,
     logical_archive_bytes: u64,
     archive_filesystem_path: String,
     archive_filesystem_total_bytes: u64,
@@ -277,6 +279,8 @@ struct Job {
     kind: JobKind,
     state: JobState,
     phase: String,
+    #[serde(default)]
+    repo_type: RepositoryType,
     repo_id: Option<String>,
     revision: Option<String>,
     resolved_commit: Option<String>,
@@ -311,6 +315,7 @@ struct JobView {
     kind: JobKind,
     state: JobState,
     phase: String,
+    repo_type: RepositoryType,
     repo_id: Option<String>,
     revision: Option<String>,
     resolved_commit: Option<String>,
@@ -336,6 +341,7 @@ impl From<Job> for JobView {
             kind: job.kind,
             state: job.state,
             phase: job.phase,
+            repo_type: job.repo_type,
             repo_id: job.repo_id,
             revision: job.revision,
             resolved_commit: job.resolved_commit,
@@ -362,9 +368,11 @@ struct JobPage {
     next_cursor: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct JobRequest {
     kind: JobKind,
+    #[serde(default)]
+    repo_type: RepositoryType,
     repo_id: Option<String>,
     revision: Option<String>,
 }
@@ -546,7 +554,12 @@ impl JobManager {
             match self.read_idempotency(hash) {
                 Ok(Some(entry)) => match self.read_job(&entry.job_id) {
                     Ok(existing) => {
-                        return if Some(entry.request_hash) == idempotency_request_hash {
+                        let legacy_model_match = request.repo_type == RepositoryType::Model
+                            && entry.request_hash
+                                == hash_legacy_idempotency_request(&request, &principal);
+                        return if Some(entry.request_hash) == idempotency_request_hash
+                            || legacy_model_match
+                        {
                             Ok((existing, false))
                         } else {
                             Err("idempotency_conflict")
@@ -565,12 +578,7 @@ impl JobManager {
         }
         if let Some(existing) = jobs
             .values()
-            .find(|job| {
-                matches!(job.state, JobState::Queued | JobState::Running)
-                    && job.kind == request.kind
-                    && job.repo_id == request.repo_id
-                    && job.revision == request.revision
-            })
+            .find(|job| is_equivalent_active_job(job, &request))
             .cloned()
         {
             return Ok((existing, false));
@@ -583,6 +591,7 @@ impl JobManager {
                 kind: request.kind,
                 state: JobState::Queued,
                 phase: "queued".into(),
+                repo_type: request.repo_type,
                 repo_id: request.repo_id.clone(),
                 revision: request.revision.clone(),
                 resolved_commit: None,
@@ -649,7 +658,8 @@ impl JobManager {
                 .ok_or_else(|| ("upstream_disabled", "pull-through is disabled".into()))
                 .and_then(|pullthrough| {
                     pullthrough
-                        .ensure_with_progress(
+                        .ensure_with_progress_for_type(
+                            job.repo_type,
                             job.repo_id.as_deref().unwrap(),
                             job.revision.as_deref().unwrap(),
                             &[],
@@ -663,7 +673,8 @@ impl JobManager {
                 .ok_or_else(|| ("upstream_disabled", "pull-through is disabled".into()))
                 .and_then(|pullthrough| {
                     pullthrough
-                        .refresh_with_progress(
+                        .refresh_with_progress_for_type(
+                            job.repo_type,
                             job.repo_id.as_deref().unwrap(),
                             job.revision.as_deref().unwrap(),
                             false,
@@ -673,7 +684,8 @@ impl JobManager {
                         .map_err(classify_pullthrough_error)
                 }),
             JobKind::Verify => archive
-                .verify_revision(
+                .verify_revision_for_type(
+                    job.repo_type,
                     job.repo_id.as_deref().unwrap(),
                     job.revision.as_deref().unwrap(),
                 )
@@ -707,6 +719,7 @@ impl JobManager {
                     event = "admin_job_failed",
                     job_id = %id,
                     job_kind = ?job.kind,
+                    repo_type = %job.repo_type,
                     repo_id = job.repo_id.as_deref().unwrap_or(""),
                     revision = job.revision.as_deref().unwrap_or(""),
                     error_class = class,
@@ -783,6 +796,7 @@ impl JobManager {
             tracing::info!(
                 event = "admin_job_progress",
                 job_id = %id,
+                repo_type = %job.repo_type,
                 repo_id = job.repo_id.as_deref().unwrap_or(""),
                 progress_bytes = job.progress_bytes,
                 total_bytes = job.total_bytes,
@@ -1045,6 +1059,14 @@ impl JobManager {
     }
 }
 
+fn is_equivalent_active_job(job: &Job, request: &JobRequest) -> bool {
+    matches!(job.state, JobState::Queued | JobState::Running)
+        && job.kind == request.kind
+        && job.repo_type == request.repo_type
+        && job.repo_id == request.repo_id
+        && job.revision == request.revision
+}
+
 pub fn router(
     archive: Archive,
     config: Config,
@@ -1070,6 +1092,10 @@ pub fn router(
         .route("/api/admin/v1/repositories", get(repositories))
         .route(
             "/api/admin/v1/repositories/{namespace}/{repository}",
+            get(model_repository),
+        )
+        .route(
+            "/api/admin/v1/repositories/{repo_type}/{namespace}/{repository}",
             get(repository),
         )
         .route("/api/admin/v1/jobs", get(list_jobs).post(create_job))
@@ -1271,6 +1297,14 @@ async fn status(state: AdminState, headers: HeaderMap, pullthrough_enabled: bool
             ready: state.archive.last_readiness().unwrap_or(false),
             pullthrough_enabled,
             repository_count: repositories.len(),
+            model_repository_count: repositories
+                .iter()
+                .filter(|repository| repository.repo_type == RepositoryType::Model)
+                .count(),
+            dataset_repository_count: repositories
+                .iter()
+                .filter(|repository| repository.repo_type == RepositoryType::Dataset)
+                .count(),
             logical_archive_bytes: repositories
                 .iter()
                 .map(|repository| repository.logical_bytes)
@@ -1298,19 +1332,33 @@ async fn repositories(
         return unauthorized(&state.config);
     }
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let cursor = match query.cursor.as_deref().map(parse_repository_cursor) {
+        Some(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorBody {
+                    error: "invalid_cursor",
+                }),
+            )
+                .into_response();
+        }
+        Some(Some(cursor)) => Some(cursor),
+        None => None,
+    };
     match state.archive.list_repositories() {
         Ok(repositories) => {
             let mut filtered = repositories
                 .into_iter()
                 .filter(|repository| {
-                    query
-                        .cursor
-                        .as_ref()
-                        .is_none_or(|cursor| repository.repo_id > *cursor)
+                    cursor.as_ref().is_none_or(|cursor| {
+                        (repository.repo_type, repository.repo_id.as_str())
+                            > (cursor.0, cursor.1.as_str())
+                    })
                 })
                 .take(limit + 1)
                 .collect::<Vec<_>>();
-            let next_cursor = (filtered.len() > limit).then(|| filtered[limit - 1].repo_id.clone());
+            let next_cursor =
+                (filtered.len() > limit).then(|| repository_cursor(&filtered[limit - 1]));
             filtered.truncate(limit);
             Json(RepositoryPage {
                 items: filtered,
@@ -1325,14 +1373,14 @@ async fn repositories(
 async fn repository(
     State(state): State<AdminState>,
     headers: HeaderMap,
-    Path((namespace, repository)): Path<(String, String)>,
+    Path((repo_type, namespace, repository)): Path<(RepositoryType, String, String)>,
 ) -> Response {
     if !authorized(&state.config, &headers) {
         return unauthorized(&state.config);
     }
     match state
         .archive
-        .repository_inventory(&format!("{namespace}/{repository}"))
+        .repository_inventory_for_type(repo_type, &format!("{namespace}/{repository}"))
     {
         Ok(inventory) => Json(inventory).into_response(),
         Err(ArchiveError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => (
@@ -1342,6 +1390,43 @@ async fn repository(
             .into_response(),
         Err(error) => archive_error(error),
     }
+}
+
+async fn model_repository(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path((namespace, repository)): Path<(String, String)>,
+) -> Response {
+    if !authorized(&state.config, &headers) {
+        return unauthorized(&state.config);
+    }
+    match state
+        .archive
+        .repository_inventory_for_type(RepositoryType::Model, &format!("{namespace}/{repository}"))
+    {
+        Ok(inventory) => Json(inventory).into_response(),
+        Err(ArchiveError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody { error: "not_found" }),
+        )
+            .into_response(),
+        Err(error) => archive_error(error),
+    }
+}
+
+fn repository_cursor(repository: &RepositorySummary) -> String {
+    format!("{}:{}", repository.repo_type, repository.repo_id)
+}
+
+fn parse_repository_cursor(cursor: &str) -> Option<(RepositoryType, String)> {
+    let (repo_type, repo_id) = cursor.split_once(':')?;
+    let repo_type = match repo_type {
+        "model" => RepositoryType::Model,
+        "dataset" => RepositoryType::Dataset,
+        _ => return None,
+    };
+    validate_repository_id(repo_id).ok()?;
+    Some((repo_type, repo_id.to_string()))
 }
 
 fn authorized(config: &Config, headers: &HeaderMap) -> bool {
@@ -1424,6 +1509,22 @@ fn hash_idempotency_key(value: &str) -> Result<String, &'static str> {
 }
 
 fn hash_idempotency_request(request: &JobRequest, principal: &PrincipalView) -> String {
+    let value = format!(
+        "{:?}\0{}\0{}\0{}\0{}\0{}",
+        request.kind,
+        request.repo_type,
+        request.repo_id.as_deref().unwrap_or(""),
+        request.revision.as_deref().unwrap_or(""),
+        principal.auth_method,
+        principal.login.as_deref().unwrap_or("")
+    );
+    Sha256::digest(value.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn hash_legacy_idempotency_request(request: &JobRequest, principal: &PrincipalView) -> String {
     let value = format!(
         "{:?}\0{}\0{}\0{}\0{}",
         request.kind,
@@ -1546,6 +1647,7 @@ mod tests {
         FetchRequest, FetchedRevision, InvalidOutputReason, OfficialHfFetcher, UpstreamError,
         UpstreamFetcher,
     };
+    use crate::{ArchiveFile, PublishRequest};
     use axum::{body::to_bytes, body::Body, http::Request};
     use std::io::Write;
     use std::sync::OnceLock;
@@ -1769,6 +1871,7 @@ mod tests {
             kind: JobKind::Audit,
             state: JobState::Completed,
             phase: "completed".into(),
+            repo_type: RepositoryType::Model,
             repo_id: None,
             revision: None,
             resolved_commit: None,
@@ -1788,6 +1891,88 @@ mod tests {
             created_at,
             updated_at: created_at,
         }
+    }
+
+    #[test]
+    fn legacy_jobs_and_requests_default_to_model_repositories() {
+        let mut stored = serde_json::to_value(stored_job("legacy-model-job", 1)).unwrap();
+        stored.as_object_mut().unwrap().remove("repo_type");
+        let job: Job = serde_json::from_value(stored).unwrap();
+        assert_eq!(job.repo_type, RepositoryType::Model);
+
+        let request: JobRequest =
+            serde_json::from_str(r#"{"kind":"prefetch","repo_id":"org/repo","revision":"main"}"#)
+                .unwrap();
+        assert_eq!(request.repo_type, RepositoryType::Model);
+    }
+
+    #[test]
+    fn repository_cursor_includes_type_and_rejects_invalid_values() {
+        let model = RepositorySummary {
+            repo_type: RepositoryType::Model,
+            repo_id: "org/shared".into(),
+            revision_count: 1,
+            ref_count: 1,
+            logical_bytes: 1,
+        };
+        let dataset = RepositorySummary {
+            repo_type: RepositoryType::Dataset,
+            ..model.clone()
+        };
+        assert_eq!(repository_cursor(&model), "model:org/shared");
+        assert_eq!(repository_cursor(&dataset), "dataset:org/shared");
+        assert_eq!(
+            parse_repository_cursor("dataset:org/shared"),
+            Some((RepositoryType::Dataset, "org/shared".into()))
+        );
+        assert_eq!(parse_repository_cursor("space:org/shared"), None);
+        assert_eq!(parse_repository_cursor("model:../escape"), None);
+    }
+
+    #[test]
+    fn repository_type_is_part_of_idempotency_identity() {
+        let principal = PrincipalView {
+            auth_method: "bearer".into(),
+            login: None,
+            name: None,
+        };
+        let model = JobRequest {
+            kind: JobKind::Prefetch,
+            repo_type: RepositoryType::Model,
+            repo_id: Some("org/shared".into()),
+            revision: Some("main".into()),
+        };
+        let dataset = JobRequest {
+            repo_type: RepositoryType::Dataset,
+            ..model.clone()
+        };
+        assert_ne!(
+            hash_idempotency_request(&model, &principal),
+            hash_idempotency_request(&dataset, &principal)
+        );
+    }
+
+    #[test]
+    fn active_job_deduplication_is_scoped_by_repository_type() {
+        let mut active = stored_job("active-shared", 1);
+        active.kind = JobKind::Prefetch;
+        active.state = JobState::Running;
+        active.repo_id = Some("org/shared".into());
+        active.revision = Some("main".into());
+        let model = JobRequest {
+            kind: JobKind::Prefetch,
+            repo_type: RepositoryType::Model,
+            repo_id: Some("org/shared".into()),
+            revision: Some("main".into()),
+        };
+        let dataset = JobRequest {
+            repo_type: RepositoryType::Dataset,
+            ..model.clone()
+        };
+        assert!(is_equivalent_active_job(&active, &model));
+        assert!(!is_equivalent_active_job(&active, &dataset));
+        active.repo_type = RepositoryType::Dataset;
+        assert!(is_equivalent_active_job(&active, &dataset));
     }
 
     #[test]
@@ -1900,6 +2085,100 @@ mod tests {
         let body = to_bytes(allowed.into_body(), usize::MAX).await.unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["items"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn management_inventory_distinguishes_model_and_dataset_namespaces() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        for (repo_type, commit, bytes) in [
+            (RepositoryType::Model, "a".repeat(40), b"model".as_slice()),
+            (
+                RepositoryType::Dataset,
+                "b".repeat(40),
+                b"dataset".as_slice(),
+            ),
+        ] {
+            archive
+                .publish_revision_for_type(
+                    repo_type,
+                    PublishRequest {
+                        repo_id: "org/shared".into(),
+                        requested_revision: "main".into(),
+                        commit,
+                        files: vec![ArchiveFile {
+                            path: "data.bin".into(),
+                            bytes: bytes.to_vec(),
+                        }],
+                    },
+                )
+                .unwrap();
+        }
+        let app = router(
+            archive,
+            Config::token("127.0.0.1:0".parse().unwrap(), "secret"),
+            None,
+        )
+        .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(request(
+                "/api/admin/v1/repositories?limit=10",
+                Some("secret"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(value["items"].as_array().unwrap().len(), 2);
+        assert_eq!(value["items"][0]["repo_type"], "model");
+        assert_eq!(value["items"][1]["repo_type"], "dataset");
+
+        let detail = app
+            .clone()
+            .oneshot(request(
+                "/api/admin/v1/repositories/dataset/org/shared",
+                Some("secret"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(detail.status(), StatusCode::OK);
+        let detail: serde_json::Value =
+            serde_json::from_slice(&to_bytes(detail.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(detail["repo_type"], "dataset");
+        assert_eq!(detail["revisions"][0]["logical_bytes"], 7);
+
+        let legacy_model_detail = app
+            .clone()
+            .oneshot(request(
+                "/api/admin/v1/repositories/org/shared",
+                Some("secret"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(legacy_model_detail.status(), StatusCode::OK);
+        let legacy_model_detail: serde_json::Value = serde_json::from_slice(
+            &to_bytes(legacy_model_detail.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(legacy_model_detail["repo_type"], "model");
+
+        let status = app
+            .oneshot(request("/api/admin/v1/status", Some("secret")))
+            .await
+            .unwrap();
+        let status: serde_json::Value =
+            serde_json::from_slice(&to_bytes(status.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(status["repository_count"], 2);
+        assert_eq!(status["model_repository_count"], 1);
+        assert_eq!(status["dataset_repository_count"], 1);
     }
 
     #[tokio::test]
@@ -2062,6 +2341,7 @@ mod tests {
             .submit(
                 JobRequest {
                     kind: JobKind::Prefetch,
+                    repo_type: RepositoryType::Model,
                     repo_id: Some("org/model".into()),
                     revision: Some("main".into()),
                 },
@@ -2117,6 +2397,7 @@ mod tests {
             .submit(
                 JobRequest {
                     kind: JobKind::Prefetch,
+                    repo_type: RepositoryType::Model,
                     repo_id: Some("org/model".into()),
                     revision: Some("main".into()),
                 },
@@ -2157,6 +2438,7 @@ mod tests {
                     .submit(
                         JobRequest {
                             kind: JobKind::Prefetch,
+                            repo_type: RepositoryType::Model,
                             repo_id: Some("org/concurrent".into()),
                             revision: Some("main".into()),
                         },
@@ -2316,6 +2598,7 @@ mod tests {
         let first = manager.submit(
             JobRequest {
                 kind: JobKind::Audit,
+                repo_type: RepositoryType::Model,
                 repo_id: None,
                 revision: None,
             },
@@ -2333,6 +2616,7 @@ mod tests {
         let different_principal = manager.submit(
             JobRequest {
                 kind: JobKind::Audit,
+                repo_type: RepositoryType::Model,
                 repo_id: None,
                 revision: None,
             },
@@ -2355,6 +2639,7 @@ mod tests {
         let manager = JobManager::open(&archive).unwrap();
         let request = JobRequest {
             kind: JobKind::Audit,
+            repo_type: RepositoryType::Model,
             repo_id: None,
             revision: None,
         };
@@ -2366,17 +2651,39 @@ mod tests {
         let key_hash = hash_idempotency_key("restart-key").unwrap();
         let mut existing = stored_job("idempotent-history", 1);
         existing.idempotency_hash = Some(key_hash);
-        existing.idempotency_request_hash = Some(hash_idempotency_request(&request, &principal));
+        existing.idempotency_request_hash =
+            Some(hash_legacy_idempotency_request(&request, &principal));
         manager.persist_new(&existing).unwrap();
         drop(manager);
 
         let reopened = JobManager::open(&archive).unwrap();
         assert!(reopened.inner.active_jobs.lock().unwrap().is_empty());
         let (job, created) = reopened
-            .submit(request, Some("restart-key"), archive, None, principal)
+            .submit(
+                request.clone(),
+                Some("restart-key"),
+                archive.clone(),
+                None,
+                principal.clone(),
+            )
             .unwrap();
         assert!(!created);
         assert_eq!(job.id, "idempotent-history");
+
+        let dataset_request = JobRequest {
+            repo_type: RepositoryType::Dataset,
+            ..request
+        };
+        assert!(matches!(
+            reopened.submit(
+                dataset_request,
+                Some("restart-key"),
+                archive,
+                None,
+                principal
+            ),
+            Err("idempotency_conflict")
+        ));
     }
 
     #[test]
@@ -2454,6 +2761,7 @@ mod tests {
             kind: JobKind::Audit,
             state: JobState::Running,
             phase: "auditing_archive".into(),
+            repo_type: RepositoryType::Model,
             repo_id: None,
             revision: None,
             resolved_commit: None,

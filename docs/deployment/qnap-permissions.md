@@ -26,7 +26,9 @@ If a QNAP shared-folder ACL prevents even the init service from accessing the bi
 mount, use the QNAP shared-folder permission GUI to grant the Application's storage
 path access. This is the exceptional ACL case, not the normal first-start procedure.
 
-The archive directory must be writable for `models/`, `tmp/`, revision publication, mutable refs, and explicit revision deletion. Keep backups and snapshots outside the container lifecycle; the contents below `/data` are the durable state.
+The archive directory must be writable for `models/`, `datasets/`, `tmp/`, revision
+publication, mutable refs, and explicit revision deletion. Keep backups and snapshots
+outside the container lifecycle; the contents below `/data` are the durable state.
 
 ## Preflight
 

@@ -224,6 +224,7 @@ MVP では以下を対象外とする。
  |          +------------+                        |
  |                                                |
  | /data/models/...       ordinary model files    |
+ | /data/datasets/...     ordinary dataset files  |
  | /data/metadata/...     reconstructable metadata|
  | /data/tmp/...          incomplete downloads    |
  +------------------------------------------------+

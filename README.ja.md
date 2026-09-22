@@ -2,7 +2,7 @@
 
 <p align="right"><a href="README.md">English</a> · <a href="README.ja.md">日本語</a></p>
 
-ModelKeep は、Hugging Face モデルリポジトリ向けの persistent pull-through mirror です。
+ModelKeep は、Hugging Face のモデルおよびデータセットリポジトリ向けの persistent pull-through mirror です。
 取得済み revision を永続ストレージ上の通常ファイルとして保存し、`HF_ENDPOINT` を設定した
 既存の `hf` / `huggingface_hub` クライアントへ HTTP で再配信します。
 
@@ -35,6 +35,7 @@ Hugging Face client の endpoint を ModelKeep に向けます。
 export HF_ENDPOINT=http://modelkeep:8090
 export HF_HUB_DISABLE_XET=1
 hf download Qwen/example-model
+hf download lhoestq/demo1 --repo-type dataset
 ```
 
 保存済み revision は Hugging Face へ接続せず配信されます。公式 fetch helper が設定された
@@ -124,11 +125,11 @@ modelkeep serve [archive-root] [bind-address]
 modelkeep health
 modelkeep ready
 modelkeep audit [archive-root]
-modelkeep refresh [archive-root] <repo-id> <ref> [--dry-run]
-modelkeep list [archive-root] <repo-id>
-modelkeep show [archive-root] <repo-id> <commit>
-modelkeep verify [archive-root] <repo-id> <commit>
-modelkeep remove [archive-root] <repo-id> <commit> [--dry-run]
+modelkeep refresh [archive-root] <repo-id> <ref> [--dry-run] [--repo-type model|dataset]
+modelkeep list [archive-root] <repo-id> [--repo-type model|dataset]
+modelkeep show [archive-root] <repo-id> <commit> [--repo-type model|dataset]
+modelkeep verify [archive-root] <repo-id> <commit> [--repo-type model|dataset]
+modelkeep remove [archive-root] <repo-id> <commit> [--dry-run] [--repo-type model|dataset]
 modelkeep import-hf-cache <cache-path> [archive-root]
 ```
 
@@ -153,6 +154,9 @@ healthcheck に `modelkeep ready` を使用し、archive path が利用可能か
 /data/
   models/<namespace>/<name>/
     revisions/<commit>/       通常のモデルファイルと manifest
+    refs/main                  commit を指す mutable ref
+  datasets/<namespace>/<name>/
+    revisions/<commit>/       通常のデータセットファイルと manifest
     refs/main                  commit を指す mutable ref
   tmp/                         作業中データのみ
 ```

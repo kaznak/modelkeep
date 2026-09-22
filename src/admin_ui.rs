@@ -75,7 +75,7 @@ const INDEX: &str = r#"<!doctype html>
         <p class="eyebrow">Archive operation</p><h2>Start a job</h2>
         <form id="job-form">
           <label for="kind">Operation</label><select id="kind"><option value="prefetch">Prefetch</option><option value="refresh">Refresh ref</option><option value="verify">Verify revision</option><option value="audit">Audit archive</option></select>
-          <div id="target-fields"><label for="repo-id">Repository</label><input id="repo-id" placeholder="namespace/model" required><label for="revision">Revision or ref</label><input id="revision" value="main" required></div>
+          <div id="target-fields"><label for="repo-type">Repository type</label><select id="repo-type"><option value="model">Model</option><option value="dataset">Dataset</option></select><label for="repo-id">Repository</label><input id="repo-id" placeholder="namespace/repository" required><label for="revision">Revision or ref</label><input id="revision" value="main" required></div>
           <button id="submit-job">Start job</button>
         </form>
         <p id="form-message" role="status"></p>
@@ -153,7 +153,8 @@ function duration(seconds) {
 function renderOverview(status) {
   const capacity = `${bytes(status.archive_filesystem_available_bytes)} free of ${bytes(status.archive_filesystem_total_bytes)} (${status.archive_filesystem_available_percent}%)`;
   const storage = status.archive_filesystem_low_space ? `Low space · ${capacity}` : capacity;
-  const values = [['Service', status.ready ? 'Ready' : 'Not ready'], ['Repositories', status.repository_count], ['Archive size', bytes(status.logical_archive_bytes)], ['Storage', storage], ['Measured path', status.archive_filesystem_path], ['Pull-through', status.pullthrough_enabled ? 'Enabled' : 'Disabled']];
+  const repositories = `${status.repository_count} · ${status.model_repository_count} models · ${status.dataset_repository_count} datasets`;
+  const values = [['Service', status.ready ? 'Ready' : 'Not ready'], ['Repositories', repositories], ['Archive size', bytes(status.logical_archive_bytes)], ['Storage', storage], ['Measured path', status.archive_filesystem_path], ['Pull-through', status.pullthrough_enabled ? 'Enabled' : 'Disabled']];
   $('overview').replaceChildren(...values.map(([label, value]) => { const card = node('article', 'metric'); card.append(node('span', '', label), node('strong', '', value)); return card; }));
 }
 
@@ -161,16 +162,16 @@ function renderRepositories(page) {
   if (!page.items.length) { $('repositories').replaceChildren(node('p', 'empty', 'No archived repositories.')); return; }
   $('repositories').replaceChildren(...page.items.map((repo) => {
     const button = node('button', 'list-row'); button.type = 'button';
-    const title = node('span'); title.append(node('strong', '', repo.repo_id), node('small', '', `${repo.revision_count} revisions · ${bytes(repo.logical_bytes)}`));
+    const title = node('span'); const heading = node('strong'); heading.append(node('span', `badge ${repo.repo_type}`, repo.repo_type), text(` ${repo.repo_id}`)); title.append(heading, node('small', '', `${repo.revision_count} revisions · ${bytes(repo.logical_bytes)}`));
     button.append(title, node('span', 'arrow', '→'));
-    button.addEventListener('click', () => loadRepository(repo.repo_id)); return button;
+    button.addEventListener('click', () => loadRepository(repo.repo_type, repo.repo_id)); return button;
   }));
 }
 
-async function loadRepository(repoId) {
+async function loadRepository(repoType, repoId) {
   try {
-    const value = await api(`/api/admin/v1/repositories/${repoId.split('/').map(encodeURIComponent).join('/')}`);
-    $('detail-title').textContent = repoId; $('repo-id').value = repoId;
+    const value = await api(`/api/admin/v1/repositories/${encodeURIComponent(repoType)}/${repoId.split('/').map(encodeURIComponent).join('/')}`);
+    $('detail-title').textContent = `${repoType}: ${repoId}`; $('repo-type').value = repoType; $('repo-id').value = repoId;
     const refs = node('div'); refs.append(node('h3', '', 'Refs'));
     const refList = node('ul', 'compact'); Object.entries(value.refs || {}).forEach(([name, commit]) => { const li = node('li'); li.append(node('code', '', name), text(' → '), node('code', '', commit)); refList.append(li); }); refs.append(refList);
     const revisions = node('div'); revisions.append(node('h3', '', 'Revisions'));
@@ -185,7 +186,7 @@ function renderJobs(page, append = false) {
     const row = node('article', 'job'); const top = node('div', 'job-top');
     const active = job.state === 'queued' || job.state === 'running';
     top.append(node('strong', '', job.kind), node('span', `badge ${job.state}`, job.state)); row.append(top);
-    row.append(node('p', 'job-target', job.repo_id ? `${job.repo_id}@${job.revision}` : 'entire archive'));
+    row.append(node('p', 'job-target', job.repo_id ? `${job.repo_type}: ${job.repo_id}@${job.revision}` : 'entire archive'));
     if (job.principal) row.append(node('small', 'job-meta', `Started by ${job.principal.login || job.principal.auth_method}`));
     if (job.started_at != null) {
       const end = job.finished_at == null ? Date.now() / 1000 : job.finished_at;
@@ -236,7 +237,7 @@ $('more-jobs').addEventListener('click', async () => {
 $('kind').addEventListener('change', () => { const audit = $('kind').value === 'audit'; $('target-fields').hidden = audit; $('repo-id').required = !audit; $('revision').required = !audit; });
 $('job-form').addEventListener('submit', async (event) => {
   event.preventDefault(); const kind = $('kind').value; const body = {kind};
-  if (kind !== 'audit') { body.repo_id = $('repo-id').value.trim(); body.revision = $('revision').value.trim(); }
+  if (kind !== 'audit') { body.repo_type = $('repo-type').value; body.repo_id = $('repo-id').value.trim(); body.revision = $('revision').value.trim(); }
   $('submit-job').disabled = true; $('form-message').textContent = 'Submitting…';
   try { const job = await api('/api/admin/v1/jobs', {method: 'POST', body: JSON.stringify(body)}); $('repo-id').value = ''; $('form-message').textContent = `Job ${job.id} queued.`; await load(); }
   catch (error) { $('form-message').textContent = error.message; }
@@ -245,7 +246,7 @@ $('job-form').addEventListener('submit', async (event) => {
 load(); timer = setInterval(load, 3000); window.addEventListener('pagehide', () => clearInterval(timer));
 "#;
 
-const STYLE: &str = r#":root{color-scheme:dark;--bg:#0b1014;--panel:#121a20;--line:#26343d;--text:#edf5f2;--muted:#91a29f;--accent:#71e0b1;--warn:#ffd166;--error:#ff8e8e;font:16px/1.5 system-ui,sans-serif}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top left,#15352c 0,transparent 30rem),var(--bg);color:var(--text)}header,main{width:min(1180px,calc(100% - 2rem));margin:auto}header{display:flex;justify-content:space-between;align-items:end;padding:3rem 0 2rem;border-bottom:1px solid var(--line)}h1,h2,h3,p{margin-top:0}h1{font-size:clamp(2.5rem,8vw,5rem);line-height:.9;margin-bottom:0}h2{font-size:1.35rem;margin-bottom:1rem}.eyebrow{text-transform:uppercase;letter-spacing:.14em;color:var(--accent);font-size:.72rem;font-weight:700;margin-bottom:.5rem}main{display:grid;gap:2rem;padding:2rem 0 5rem}.panel,.metric{background:color-mix(in srgb,var(--panel) 92%,transparent);border:1px solid var(--line);border-radius:14px;padding:1.25rem}.auth{display:flex;justify-content:space-between;gap:2rem;align-items:end}.grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem}.operations{grid-template-columns:minmax(16rem,.7fr) minmax(20rem,1.3fr)}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:1rem}.metric span,.metric strong{display:block}.metric span,small,.empty,#connection{color:var(--muted)}.metric strong{font-size:1.3rem;margin-top:.4rem}.section-heading,.job-top,.inline{display:flex;align-items:center;justify-content:space-between;gap:1rem}.section-heading h2{margin-bottom:0}.list{display:grid;gap:.55rem}.list-row,.job{width:100%;text-align:left;background:#0d1519;border:1px solid var(--line);border-radius:10px;padding:.85rem;color:inherit}.list-row{display:flex;align-items:center;justify-content:space-between;cursor:pointer}.list-row:hover,.list-row:focus-visible{border-color:var(--accent)}.list-row span:first-child,.list-row small,.job-meta{display:block}.arrow{color:var(--accent)}button,input,select{font:inherit;border-radius:8px;border:1px solid var(--line);padding:.68rem .8rem}button{background:var(--accent);color:#082018;border:0;font-weight:750;cursor:pointer}button.secondary{background:transparent;color:var(--text);border:1px solid var(--line)}button:disabled{opacity:.55}input,select{width:100%;background:#0b1115;color:var(--text);margin:.3rem 0 1rem}label{display:block;font-weight:650}.auth form{min-width:min(26rem,100%)}.inline input{margin:0}.badge{padding:.15rem .55rem;border-radius:99px;background:#26343d;font-size:.75rem}.badge.completed{color:var(--accent)}.badge.failed{color:var(--error)}.badge.running{color:var(--warn)}.job p{margin:.35rem 0}.error{color:var(--error);overflow-wrap:anywhere}.compact{padding-left:1.2rem}.compact li{margin:.45rem 0;overflow-wrap:anywhere}code{font-size:.82rem}.detail{display:grid;gap:1rem}@media(max-width:760px){header{align-items:start;gap:1rem}.grid,.operations,.metrics{grid-template-columns:1fr}.auth{display:block}.section-heading{align-items:end}.jobs-panel{min-width:0}}"#;
+const STYLE: &str = r#":root{color-scheme:dark;--bg:#0b1014;--panel:#121a20;--line:#26343d;--text:#edf5f2;--muted:#91a29f;--accent:#71e0b1;--warn:#ffd166;--error:#ff8e8e;font:16px/1.5 system-ui,sans-serif}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top left,#15352c 0,transparent 30rem),var(--bg);color:var(--text)}header,main{width:min(1180px,calc(100% - 2rem));margin:auto}header{display:flex;justify-content:space-between;align-items:end;padding:3rem 0 2rem;border-bottom:1px solid var(--line)}h1,h2,h3,p{margin-top:0}h1{font-size:clamp(2.5rem,8vw,5rem);line-height:.9;margin-bottom:0}h2{font-size:1.35rem;margin-bottom:1rem}.eyebrow{text-transform:uppercase;letter-spacing:.14em;color:var(--accent);font-size:.72rem;font-weight:700;margin-bottom:.5rem}main{display:grid;gap:2rem;padding:2rem 0 5rem}.panel,.metric{background:color-mix(in srgb,var(--panel) 92%,transparent);border:1px solid var(--line);border-radius:14px;padding:1.25rem}.auth{display:flex;justify-content:space-between;gap:2rem;align-items:end}.grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem}.operations{grid-template-columns:minmax(16rem,.7fr) minmax(20rem,1.3fr)}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:1rem}.metric span,.metric strong{display:block}.metric span,small,.empty,#connection{color:var(--muted)}.metric strong{font-size:1.3rem;margin-top:.4rem}.section-heading,.job-top,.inline{display:flex;align-items:center;justify-content:space-between;gap:1rem}.section-heading h2{margin-bottom:0}.list{display:grid;gap:.55rem}.list-row,.job{width:100%;text-align:left;background:#0d1519;border:1px solid var(--line);border-radius:10px;padding:.85rem;color:inherit}.list-row{display:flex;align-items:center;justify-content:space-between;cursor:pointer}.list-row:hover,.list-row:focus-visible{border-color:var(--accent)}.list-row span:first-child,.list-row small,.job-meta{display:block}.arrow{color:var(--accent)}button,input,select{font:inherit;border-radius:8px;border:1px solid var(--line);padding:.68rem .8rem}button{background:var(--accent);color:#082018;border:0;font-weight:750;cursor:pointer}button.secondary{background:transparent;color:var(--text);border:1px solid var(--line)}button:disabled{opacity:.55}input,select{width:100%;background:#0b1115;color:var(--text);margin:.3rem 0 1rem}label{display:block;font-weight:650}.auth form{min-width:min(26rem,100%)}.inline input{margin:0}.badge{padding:.15rem .55rem;border-radius:99px;background:#26343d;font-size:.75rem}.badge.dataset{color:#9fc5ff}.badge.completed{color:var(--accent)}.badge.failed{color:var(--error)}.badge.running{color:var(--warn)}.job p{margin:.35rem 0}.error{color:var(--error);overflow-wrap:anywhere}.compact{padding-left:1.2rem}.compact li{margin:.45rem 0;overflow-wrap:anywhere}code{font-size:.82rem}.detail{display:grid;gap:1rem}@media(max-width:760px){header{align-items:start;gap:1rem}.grid,.operations,.metrics{grid-template-columns:1fr}.auth{display:block}.section-heading{align-items:end}.jobs-panel{min-width:0}}"#;
 
 #[cfg(test)]
 mod tests {
@@ -280,5 +281,13 @@ mod tests {
         assert!(SCRIPT.contains("archive_filesystem_low_space ? `Low space"));
         assert!(SCRIPT.contains("archive_filesystem_path"));
         assert!(SCRIPT.contains("$('repo-id').value = ''; $('form-message').textContent"));
+        assert!(INDEX.contains("id=\"repo-type\""));
+        assert!(INDEX.contains("<option value=\"dataset\">Dataset</option>"));
+        assert!(SCRIPT.contains("body.repo_type = $('repo-type').value"));
+        assert!(SCRIPT.contains("repositories/${encodeURIComponent(repoType)}/"));
+        assert!(SCRIPT.contains("`badge ${repo.repo_type}`"));
+        assert!(SCRIPT.contains("`${job.repo_type}: ${job.repo_id}@${job.revision}`"));
+        assert!(SCRIPT.contains("status.dataset_repository_count"));
+        assert!(STYLE.contains(".badge.dataset"));
     }
 }

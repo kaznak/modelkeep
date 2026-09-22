@@ -3,6 +3,7 @@
 
 import contextlib
 import hashlib
+import json
 import os
 import signal
 import socket
@@ -187,6 +188,9 @@ def upgrade_check(old, current, root):
     import_cache(old, cache, archive)
     models = archive / "models"
     before = tree_digests(models)
+    sentinel = archive / "operator-sentinel"
+    sentinel.write_bytes(b"must-remain-unchanged")
+    legacy_tree = tree_digests(archive)
 
     subprocess.run(
         [str(current), "verify", str(archive), "org/upgrade", STABLE_COMMIT],
@@ -204,6 +208,55 @@ def upgrade_check(old, current, root):
             assert response.read() == payload
 
     assert tree_digests(models) == before, "current reader modified the old archive"
+    assert (archive / "datasets").is_dir(), "upgrade did not add the dataset namespace"
+    assert not any((archive / "datasets").iterdir()), "upgrade populated the dataset namespace"
+    expected_upgrade_tree = dict(legacy_tree)
+    assert tree_digests(archive) == expected_upgrade_tree, "upgrade modified legacy archive files"
+
+    downgrade_check(old, archive, payload)
+
+
+def downgrade_check(old, archive, model_payload):
+    """A pre-dataset reader must ignore, and never modify, the dataset namespace."""
+    commit = STABLE_COMMIT
+    revision = archive / "datasets" / "org" / "upgrade" / "revisions" / commit
+    revision.mkdir(parents=True)
+    dataset_payload = b"dataset-must-not-be-served-as-model"
+    (revision / "config.json").write_bytes(dataset_payload)
+    manifest = {
+        "version": 1,
+        "complete": True,
+        "repo_type": "dataset",
+        "repo_id": "org/upgrade",
+        "requested_revision": "main",
+        "commit": commit,
+        "archived_at": 0,
+        "files": [
+            {
+                "path": "config.json",
+                "size": len(dataset_payload),
+                "sha256": hashlib.sha256(dataset_payload).hexdigest(),
+            }
+        ],
+    }
+    (revision / ".modelkeep-manifest.json").write_text(
+        json.dumps(manifest, separators=(",", ":")) + "\n"
+    )
+    refs = archive / "datasets" / "org" / "upgrade" / "refs"
+    refs.mkdir()
+    (refs / "main").write_text(commit)
+    before = tree_digests(archive)
+
+    with server(old, archive) as endpoint:
+        with urllib.request.urlopen(
+            f"{endpoint}/org/upgrade/resolve/{commit}/config.json"
+        ) as response:
+            assert response.read() == model_payload
+        assert response_status(
+            f"{endpoint}/api/datasets/org/upgrade/revision/{commit}"
+        ) == 404
+
+    assert tree_digests(archive) == before, "pre-dataset binary modified archive contents"
 
 
 def main():

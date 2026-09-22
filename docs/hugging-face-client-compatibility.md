@@ -8,9 +8,10 @@ versions:
 | 0.36.0 | oldest supported pre-1.0 client |
 | 1.27.0 | current client shipped in the pinned nixpkgs input |
 
-Both versions run the same deterministic black-box suite. The suite covers a cold
-miss, warm and upstream-offline downloads, `HEAD`, byte `Range`, concurrent warm
-downloads, upstream error mapping, and rejection of attempts to bypass ModelKeep.
+Both versions run the same deterministic black-box suite for model and dataset
+repositories. The suite covers a cold miss, warm and upstream-offline downloads,
+`HEAD`, byte `Range`, concurrent warm downloads, same-ID model/dataset isolation,
+upstream error mapping, and rejection of attempts to bypass ModelKeep.
 It uses a local upstream fixture and does not contact Hugging Face. Optional online
 protocol observations are deliberately separate from this compatibility gate.
 
@@ -22,6 +23,9 @@ is validated offline by `nix flake check`.
 The deterministic suite mirrors its public, safetensors, sharded, immutable
 revision, `HEAD`, Range, redirect, and Xet-boundary behaviors without contacting
 Hugging Face.
+
+The dataset route behavior is recorded separately in
+[`observations/hugging-face-dataset-protocol-2026-09-23.md`](observations/hugging-face-dataset-protocol-2026-09-23.md).
 
 ## Updating the matrix
 

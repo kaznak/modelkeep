@@ -2,7 +2,7 @@
 
 <p align="right"><a href="README.md">English</a> · <a href="README.ja.md">日本語</a></p>
 
-ModelKeep is a persistent pull-through mirror for Hugging Face model repositories.
+ModelKeep is a persistent pull-through mirror for Hugging Face model and dataset repositories.
 It stores archived revisions as ordinary files on durable storage and exposes an HTTP
 endpoint that existing `hf` and `huggingface_hub` clients can use through `HF_ENDPOINT`.
 
@@ -37,6 +37,7 @@ Point a supported Hugging Face client at ModelKeep:
 export HF_ENDPOINT=http://modelkeep:8090
 export HF_HUB_DISABLE_XET=1
 hf download Qwen/example-model
+hf download lhoestq/demo1 --repo-type dataset
 ```
 
 Archived revisions are served without contacting Hugging Face. A request for a missing
@@ -142,11 +143,11 @@ modelkeep serve [archive-root] [bind-address]
 modelkeep health
 modelkeep ready
 modelkeep audit [archive-root]
-modelkeep refresh [archive-root] <repo-id> <ref> [--dry-run]
-modelkeep list [archive-root] <repo-id>
-modelkeep show [archive-root] <repo-id> <commit>
-modelkeep verify [archive-root] <repo-id> <commit>
-modelkeep remove [archive-root] <repo-id> <commit> [--dry-run]
+modelkeep refresh [archive-root] <repo-id> <ref> [--dry-run] [--repo-type model|dataset]
+modelkeep list [archive-root] <repo-id> [--repo-type model|dataset]
+modelkeep show [archive-root] <repo-id> <commit> [--repo-type model|dataset]
+modelkeep verify [archive-root] <repo-id> <commit> [--repo-type model|dataset]
+modelkeep remove [archive-root] <repo-id> <commit> [--dry-run] [--repo-type model|dataset]
 modelkeep import-hf-cache <cache-path> [archive-root]
 ```
 
@@ -171,6 +172,9 @@ Capacity pressure is observational only and never triggers archive deletion.
 /data/
   models/<namespace>/<name>/
     revisions/<commit>/       ordinary model files and manifest
+    refs/main                  mutable ref pointing to a commit
+  datasets/<namespace>/<name>/
+    revisions/<commit>/       ordinary dataset files and manifest
     refs/main                  mutable ref pointing to a commit
   tmp/                         incomplete work only
 ```

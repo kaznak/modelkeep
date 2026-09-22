@@ -4,13 +4,13 @@ use crate::singleflight::SingleFlight;
 use crate::upstream::{
     FetchProgress, FetchRequest, InvalidOutputReason, UpstreamError, UpstreamFetcher,
 };
-use crate::{is_hf_commit, Archive, ArchiveError, SourceFile};
+use crate::{is_hf_commit, Archive, ArchiveError, RepositoryType, SourceFile};
 
 #[derive(Clone)]
 pub struct PullThrough {
     archive: Archive,
     fetcher: Arc<dyn UpstreamFetcher>,
-    flights: Arc<SingleFlight<String, String, PullThroughError>>,
+    flights: Arc<SingleFlight<(RepositoryType, String, String), String, PullThroughError>>,
     refresh_flights: Arc<SingleFlight<(String, String, bool), RefreshResult, PullThroughError>>,
 }
 
@@ -71,7 +71,17 @@ impl PullThrough {
         requested_revision: &str,
         files: &[String],
     ) -> Result<String, PullThroughError> {
-        self.ensure_with_progress(repo_id, requested_revision, files, &|_| {})
+        self.ensure_for_type(RepositoryType::Model, repo_id, requested_revision, files)
+    }
+
+    pub fn ensure_for_type(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        requested_revision: &str,
+        files: &[String],
+    ) -> Result<String, PullThroughError> {
+        self.ensure_with_progress_for_type(repo_type, repo_id, requested_revision, files, &|_| {})
     }
 
     pub fn ensure_with_progress(
@@ -81,22 +91,46 @@ impl PullThrough {
         files: &[String],
         progress: &(dyn Fn(FetchProgress) + Send + Sync),
     ) -> Result<String, PullThroughError> {
-        if let Ok(commit) = self.archive.resolve_ref(repo_id, requested_revision) {
-            if self.revision_is_ready(repo_id, &commit, files) {
+        self.ensure_with_progress_for_type(
+            RepositoryType::Model,
+            repo_id,
+            requested_revision,
+            files,
+            progress,
+        )
+    }
+
+    pub fn ensure_with_progress_for_type(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        requested_revision: &str,
+        files: &[String],
+        progress: &(dyn Fn(FetchProgress) + Send + Sync),
+    ) -> Result<String, PullThroughError> {
+        if let Ok(commit) =
+            self.archive
+                .resolve_ref_for_type(repo_type, repo_id, requested_revision)
+        {
+            if self.revision_is_ready(repo_type, repo_id, &commit, files) {
                 return Ok(commit);
             }
         }
-        if self.revision_is_ready(repo_id, requested_revision, files) {
+        if self.revision_is_ready(repo_type, repo_id, requested_revision, files) {
             return Ok(requested_revision.to_string());
         }
 
-        let key = format!("{repo_id}@{requested_revision}");
+        let key = (
+            repo_type,
+            repo_id.to_string(),
+            requested_revision.to_string(),
+        );
         let repo_id = repo_id.to_string();
         let requested_revision = requested_revision.to_string();
         let files = files.to_vec();
         let this = self.clone();
         self.flights.run(key, move || {
-            this.fetch_and_publish(&repo_id, &requested_revision, &files, progress)
+            this.fetch_and_publish(repo_type, &repo_id, &requested_revision, &files, progress)
         })
     }
 
@@ -106,7 +140,17 @@ impl PullThrough {
         reference: &str,
         dry_run: bool,
     ) -> Result<RefreshResult, PullThroughError> {
-        self.refresh_with_progress(repo_id, reference, dry_run, &|_| {})
+        self.refresh_for_type(RepositoryType::Model, repo_id, reference, dry_run)
+    }
+
+    pub fn refresh_for_type(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        reference: &str,
+        dry_run: bool,
+    ) -> Result<RefreshResult, PullThroughError> {
+        self.refresh_with_progress_for_type(repo_type, repo_id, reference, dry_run, &|_| {})
     }
 
     pub fn refresh_with_progress(
@@ -116,37 +160,63 @@ impl PullThrough {
         dry_run: bool,
         progress: &(dyn Fn(FetchProgress) + Send + Sync),
     ) -> Result<RefreshResult, PullThroughError> {
-        let key = (repo_id.to_string(), reference.to_string(), dry_run);
-        self.refresh_flights.run(key, || {
-            // Joined callers receive the same final result. Progress belongs to the
-            // leader callback; followers remain in their acquiring phase until the
-            // shared operation completes.
-            self.refresh_once(repo_id, reference, dry_run, progress)
-        })
+        self.refresh_with_progress_for_type(
+            RepositoryType::Model,
+            repo_id,
+            reference,
+            dry_run,
+            progress,
+        )
     }
 
-    fn refresh_once(
+    pub fn refresh_with_progress_for_type(
         &self,
+        repo_type: RepositoryType,
         repo_id: &str,
         reference: &str,
         dry_run: bool,
         progress: &(dyn Fn(FetchProgress) + Send + Sync),
     ) -> Result<RefreshResult, PullThroughError> {
-        let previous = self.archive.resolve_ref(repo_id, reference).ok();
+        let key = (
+            format!("{repo_type}:{repo_id}"),
+            reference.to_string(),
+            dry_run,
+        );
+        self.refresh_flights.run(key, || {
+            // Joined callers receive the same final result. Progress belongs to the
+            // leader callback; followers remain in their acquiring phase until the
+            // shared operation completes.
+            self.refresh_once(repo_type, repo_id, reference, dry_run, progress)
+        })
+    }
+
+    fn refresh_once(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        reference: &str,
+        dry_run: bool,
+        progress: &(dyn Fn(FetchProgress) + Send + Sync),
+    ) -> Result<RefreshResult, PullThroughError> {
+        let previous = self
+            .archive
+            .resolve_ref_for_type(repo_type, repo_id, reference)
+            .ok();
         let staging = self
             .archive
-            .acquire_fetch_staging(repo_id, reference, &[])
-            .map_err(|error| log_archive_failure(repo_id, reference, "stage", error))?;
+            .acquire_fetch_staging_for_type(repo_type, repo_id, reference, &[])
+            .map_err(|error| log_archive_failure(repo_type, repo_id, reference, "stage", error))?;
         progress(FetchProgress::phase(if staging.resumed {
             "resuming_snapshot"
         } else {
             "acquiring_snapshot"
         }));
-        tracing::info!(event = "upstream_fetch_started", repo_id = %repo_id, requested_revision = %reference, resumed = staging.resumed, operation = "refresh", "upstream fetch started");
+        tracing::info!(event = "upstream_fetch_started", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %reference, resumed = staging.resumed, operation = "refresh", "upstream fetch started");
         let fetched = self
             .fetcher
             .fetch_with_progress(
                 &FetchRequest {
+                    repo_type,
                     repo_id: repo_id.into(),
                     revision: reference.into(),
                     files: Vec::new(),
@@ -156,11 +226,11 @@ impl PullThrough {
                 progress,
             )
             .map_err(|error| {
-                self.handle_fetch_failure(&staging.path, repo_id, reference, &error);
-                log_fetch_failure(repo_id, reference, "refresh", &error);
+                self.handle_fetch_failure(&staging.path, repo_type, repo_id, reference, &error);
+                log_fetch_failure(repo_type, repo_id, reference, "refresh", &error);
                 PullThroughError::from(error)
             })?;
-        tracing::info!(event = "upstream_fetch_finished", repo_id = %repo_id, requested_revision = %reference, commit = %fetched.commit, operation = "refresh", "upstream fetch finished");
+        tracing::info!(event = "upstream_fetch_finished", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %reference, commit = %fetched.commit, operation = "refresh", "upstream fetch finished");
         if dry_run {
             let _ = std::fs::remove_dir_all(&staging.path);
             return Ok(RefreshResult {
@@ -169,7 +239,7 @@ impl PullThrough {
                 published: false,
             });
         }
-        if !self.revision_is_ready(repo_id, &fetched.commit, &[]) {
+        if !self.revision_is_ready(repo_type, repo_id, &fetched.commit, &[]) {
             let files = fetched
                 .files
                 .iter()
@@ -178,34 +248,41 @@ impl PullThrough {
                     source: staging.path.join(path),
                 })
                 .collect();
-            let published = match self.archive.publish_revision_from_directory_with_progress(
-                crate::SourcePublishRequest {
-                    repo_id: repo_id.into(),
-                    requested_revision: reference.into(),
-                    commit: fetched.commit.clone(),
-                    source_root: staging.path.clone(),
-                    files,
-                },
-                &|phase| progress(FetchProgress::phase(phase)),
-            ) {
+            let published = match self
+                .archive
+                .publish_revision_from_directory_with_progress_for_type(
+                    repo_type,
+                    crate::SourcePublishRequest {
+                        repo_id: repo_id.into(),
+                        requested_revision: reference.into(),
+                        commit: fetched.commit.clone(),
+                        source_root: staging.path.clone(),
+                        files,
+                    },
+                    &|phase| progress(FetchProgress::phase(phase)),
+                ) {
                 Ok(_) => true,
                 Err(ArchiveError::AlreadyPublished(_))
-                    if self.revision_is_ready(repo_id, &fetched.commit, &[]) =>
+                    if self.revision_is_ready(repo_type, repo_id, &fetched.commit, &[]) =>
                 {
                     false
                 }
                 Err(error) => {
-                    return Err(log_archive_failure(repo_id, reference, "publish", error))
+                    return Err(log_archive_failure(
+                        repo_type, repo_id, reference, "publish", error,
+                    ))
                 }
             };
             if published {
-                tracing::info!(event = "archive_published", repo_id = %repo_id, requested_revision = %reference, commit = %fetched.commit, operation = "refresh", "archive revision published");
+                tracing::info!(event = "archive_published", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %reference, commit = %fetched.commit, operation = "refresh", "archive revision published");
             }
         }
         let _ = std::fs::remove_dir_all(&staging.path);
         self.archive
-            .update_ref(repo_id, reference, &fetched.commit)
-            .map_err(|error| log_archive_failure(repo_id, reference, "update_ref", error))?;
+            .update_ref_for_type(repo_type, repo_id, reference, &fetched.commit)
+            .map_err(|error| {
+                log_archive_failure(repo_type, repo_id, reference, "update_ref", error)
+            })?;
         Ok(RefreshResult {
             previous,
             proposed: fetched.commit,
@@ -213,38 +290,53 @@ impl PullThrough {
         })
     }
 
-    fn revision_is_ready(&self, repo_id: &str, commit: &str, files: &[String]) -> bool {
+    fn revision_is_ready(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        commit: &str,
+        files: &[String],
+    ) -> bool {
         self.archive
-            .is_complete_revision(repo_id, commit)
+            .is_complete_revision_for_type(repo_type, repo_id, commit)
             .unwrap_or(false)
-            && files
-                .iter()
-                .all(|file| self.archive.resolve_file(repo_id, commit, file).is_ok())
+            && files.iter().all(|file| {
+                self.archive
+                    .resolve_file_for_type(repo_type, repo_id, commit, file)
+                    .is_ok()
+            })
     }
 
     fn fetch_and_publish(
         &self,
+        repo_type: RepositoryType,
         repo_id: &str,
         requested_revision: &str,
         files: &[String],
         progress: &(dyn Fn(FetchProgress) + Send + Sync),
     ) -> Result<String, PullThroughError> {
-        if let Ok(commit) = self.archive.resolve_ref(repo_id, requested_revision) {
-            if self.revision_is_ready(repo_id, &commit, files) {
+        if let Ok(commit) =
+            self.archive
+                .resolve_ref_for_type(repo_type, repo_id, requested_revision)
+        {
+            if self.revision_is_ready(repo_type, repo_id, &commit, files) {
                 return Ok(commit);
             }
         }
         let staging = self
             .archive
-            .acquire_fetch_staging(repo_id, requested_revision, &[])
-            .map_err(|error| log_archive_failure(repo_id, requested_revision, "stage", error))?;
+            .acquire_fetch_staging_for_type(repo_type, repo_id, requested_revision, &[])
+            .map_err(|error| {
+                log_archive_failure(repo_type, repo_id, requested_revision, "stage", error)
+            })?;
         progress(FetchProgress::phase(if staging.resumed {
             "resuming_snapshot"
         } else {
             "acquiring_snapshot"
         }));
-        tracing::info!(event = "upstream_fetch_started", repo_id = %repo_id, requested_revision = %requested_revision, resumed = staging.resumed, operation = "pull_through", "upstream fetch started");
+        tracing::info!(event = "upstream_fetch_started", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %requested_revision, resumed = staging.resumed, operation = "pull_through", "upstream fetch started");
         let request = FetchRequest {
+            repo_type,
             repo_id: repo_id.to_string(),
             revision: requested_revision.to_string(),
             files: Vec::new(),
@@ -254,12 +346,24 @@ impl PullThrough {
         let fetched = match self.fetcher.fetch_with_progress(&request, progress) {
             Ok(result) => result,
             Err(error) => {
-                self.handle_fetch_failure(&staging.path, repo_id, requested_revision, &error);
-                log_fetch_failure(repo_id, requested_revision, "pull_through", &error);
+                self.handle_fetch_failure(
+                    &staging.path,
+                    repo_type,
+                    repo_id,
+                    requested_revision,
+                    &error,
+                );
+                log_fetch_failure(
+                    repo_type,
+                    repo_id,
+                    requested_revision,
+                    "pull_through",
+                    &error,
+                );
                 return Err(error.into());
             }
         };
-        tracing::info!(event = "upstream_fetch_finished", repo_id = %repo_id, requested_revision = %requested_revision, commit = %fetched.commit, operation = "pull_through", "upstream fetch finished");
+        tracing::info!(event = "upstream_fetch_finished", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %requested_revision, commit = %fetched.commit, operation = "pull_through", "upstream fetch finished");
         let source_files = fetched
             .files
             .iter()
@@ -268,26 +372,30 @@ impl PullThrough {
                 source: fetched.staging.join(path),
             })
             .collect();
-        let publish = self.archive.publish_revision_from_directory_with_progress(
-            crate::SourcePublishRequest {
-                repo_id: repo_id.to_string(),
-                requested_revision: requested_revision.to_string(),
-                commit: fetched.commit.clone(),
-                source_root: fetched.staging.clone(),
-                files: source_files,
-            },
-            &|phase| progress(FetchProgress::phase(phase)),
-        );
+        let publish = self
+            .archive
+            .publish_revision_from_directory_with_progress_for_type(
+                repo_type,
+                crate::SourcePublishRequest {
+                    repo_id: repo_id.to_string(),
+                    requested_revision: requested_revision.to_string(),
+                    commit: fetched.commit.clone(),
+                    source_root: fetched.staging.clone(),
+                    files: source_files,
+                },
+                &|phase| progress(FetchProgress::phase(phase)),
+            );
         let _ = std::fs::remove_dir_all(&staging.path);
         let published = match publish {
             Ok(_) => true,
             Err(ArchiveError::AlreadyPublished(_))
-                if self.revision_is_ready(repo_id, &fetched.commit, files) =>
+                if self.revision_is_ready(repo_type, repo_id, &fetched.commit, files) =>
             {
                 false
             }
             Err(error) => {
                 return Err(log_archive_failure(
+                    repo_type,
                     repo_id,
                     requested_revision,
                     "publish",
@@ -296,13 +404,13 @@ impl PullThrough {
             }
         };
         if published {
-            tracing::info!(event = "archive_published", repo_id = %repo_id, requested_revision = %requested_revision, commit = %fetched.commit, operation = "pull_through", "archive revision published");
+            tracing::info!(event = "archive_published", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %requested_revision, commit = %fetched.commit, operation = "pull_through", "archive revision published");
         }
         if !is_hf_commit(requested_revision) {
             self.archive
-                .update_ref(repo_id, requested_revision, &fetched.commit)
+                .update_ref_for_type(repo_type, repo_id, requested_revision, &fetched.commit)
                 .map_err(|error| {
-                    log_archive_failure(repo_id, requested_revision, "update_ref", error)
+                    log_archive_failure(repo_type, repo_id, requested_revision, "update_ref", error)
                 })?;
         }
         Ok(fetched.commit)
@@ -311,6 +419,7 @@ impl PullThrough {
     fn handle_fetch_failure(
         &self,
         staging: &std::path::Path,
+        repo_type: RepositoryType,
         repo_id: &str,
         requested_revision: &str,
         error: &UpstreamError,
@@ -326,7 +435,7 @@ impl PullThrough {
             .preserve_fetch_staging(staging)
             .is_ok_and(|preserved| preserved)
         {
-            tracing::warn!(event = "incomplete_fetch_preserved", repo_id = %repo_id, requested_revision = %requested_revision, "preserved interrupted upstream staging for retry");
+            tracing::warn!(event = "incomplete_fetch_preserved", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %requested_revision, "preserved interrupted upstream staging for retry");
             return;
         }
         let _ = std::fs::remove_dir_all(staging);
@@ -346,6 +455,7 @@ fn upstream_error_class(error: &UpstreamError) -> &'static str {
 }
 
 fn log_fetch_failure(
+    repo_type: RepositoryType,
     repo_id: &str,
     requested_revision: &str,
     operation: &str,
@@ -353,6 +463,7 @@ fn log_fetch_failure(
 ) {
     tracing::warn!(
         event = "upstream_fetch_failed",
+        repo_type = %repo_type,
         repo_id = %repo_id,
         requested_revision = %requested_revision,
         operation,
@@ -362,6 +473,7 @@ fn log_fetch_failure(
 }
 
 fn log_archive_failure(
+    repo_type: RepositoryType,
     repo_id: &str,
     requested_revision: &str,
     operation: &str,
@@ -370,6 +482,7 @@ fn log_archive_failure(
     match &error {
         ArchiveError::IntegrityMismatch(_) => tracing::warn!(
             event = "archive_verification_failed",
+            repo_type = %repo_type,
             repo_id = %repo_id,
             requested_revision = %requested_revision,
             operation,
@@ -378,6 +491,7 @@ fn log_archive_failure(
         ),
         ArchiveError::Io(io_error) => tracing::error!(
             event = "archive_storage_failed",
+            repo_type = %repo_type,
             repo_id = %repo_id,
             requested_revision = %requested_revision,
             operation,
@@ -1056,7 +1170,7 @@ mod tests {
         let error = ArchiveError::Io(std::io::Error::from_raw_os_error(28));
 
         assert_eq!(
-            log_archive_failure("org/model", "main", "publish", error),
+            log_archive_failure(RepositoryType::Model, "org/model", "main", "publish", error,),
             PullThroughError::Storage
         );
         assert_eq!(
@@ -1109,5 +1223,153 @@ mod tests {
         assert!(output.contains("org/another"));
         assert!(output.contains("storage"));
         assert!(output.contains("other"));
+    }
+
+    #[test]
+    fn model_and_dataset_acquisitions_with_the_same_id_are_isolated() {
+        struct TypedFetcher {
+            requests: Arc<Mutex<Vec<RepositoryType>>>,
+        }
+
+        impl UpstreamFetcher for TypedFetcher {
+            fn fetch(&self, request: &FetchRequest) -> Result<FetchedRevision, UpstreamError> {
+                self.requests.lock().unwrap().push(request.repo_type);
+                let (commit, payload) = match request.repo_type {
+                    RepositoryType::Model => (
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        b"model".as_slice(),
+                    ),
+                    RepositoryType::Dataset => (
+                        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        b"dataset".as_slice(),
+                    ),
+                };
+                fs::write(request.staging.join("content.bin"), payload).unwrap();
+                Ok(FetchedRevision {
+                    commit: commit.into(),
+                    files: vec!["content.bin".into()],
+                    staging: request.staging.clone(),
+                })
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let pull = PullThrough::new(
+            archive.clone(),
+            Arc::new(TypedFetcher {
+                requests: requests.clone(),
+            }),
+        );
+
+        let model = pull
+            .ensure_for_type(RepositoryType::Model, "org/shared", "main", &[])
+            .unwrap();
+        let dataset = pull
+            .ensure_for_type(RepositoryType::Dataset, "org/shared", "main", &[])
+            .unwrap();
+
+        assert_ne!(model, dataset);
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![RepositoryType::Model, RepositoryType::Dataset]
+        );
+        assert_eq!(
+            fs::read(
+                archive
+                    .resolve_file_for_type(
+                        RepositoryType::Model,
+                        "org/shared",
+                        &model,
+                        "content.bin",
+                    )
+                    .unwrap()
+                    .path,
+            )
+            .unwrap(),
+            b"model"
+        );
+        assert_eq!(
+            fs::read(
+                archive
+                    .resolve_file_for_type(
+                        RepositoryType::Dataset,
+                        "org/shared",
+                        &dataset,
+                        "content.bin",
+                    )
+                    .unwrap()
+                    .path,
+            )
+            .unwrap(),
+            b"dataset"
+        );
+    }
+
+    #[test]
+    fn singleflight_identity_is_not_ambiguous_when_components_contain_at_signs() {
+        struct IdentityFetcher {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl UpstreamFetcher for IdentityFetcher {
+            fn fetch(&self, request: &FetchRequest) -> Result<FetchedRevision, UpstreamError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(100));
+                let commit = if request.repo_id == "org/a@b" {
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                } else {
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                };
+                fs::write(
+                    request.staging.join("content.bin"),
+                    request.repo_id.as_bytes(),
+                )
+                .unwrap();
+                Ok(FetchedRevision {
+                    commit: commit.into(),
+                    files: vec!["content.bin".into()],
+                    staging: request.staging.clone(),
+                })
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let pull = Arc::new(PullThrough::new(
+            archive,
+            Arc::new(IdentityFetcher {
+                calls: calls.clone(),
+            }),
+        ));
+        let start = Arc::new(Barrier::new(2));
+        let first = {
+            let pull = pull.clone();
+            let start = start.clone();
+            std::thread::spawn(move || {
+                start.wait();
+                pull.ensure("org/a@b", "c", &[])
+            })
+        };
+        let second = {
+            let pull = pull.clone();
+            let start = start.clone();
+            std::thread::spawn(move || {
+                start.wait();
+                pull.ensure("org/a", "b@c", &[])
+            })
+        };
+
+        assert_eq!(
+            first.join().unwrap().unwrap(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            second.join().unwrap().unwrap(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }
