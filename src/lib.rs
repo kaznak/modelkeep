@@ -316,15 +316,23 @@ impl Archive {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
+            let fetch_identity =
+                if name.starts_with("fetch-abandoned-") || name.starts_with(".fetch-active-") {
+                    read_fetch_staging_metadata(&path).ok()
+                } else {
+                    None
+                };
             if name.starts_with("fetch-abandoned-") {
-                if read_fetch_staging_metadata(&path)
-                    .is_ok_and(|metadata| metadata.resolved_commit.is_some())
+                if fetch_identity
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.resolved_commit.is_some())
                 {
                     continue;
                 }
             } else if name.starts_with(".fetch-active-")
-                && read_fetch_staging_metadata(&path)
-                    .is_ok_and(|metadata| metadata.resolved_commit.is_some())
+                && fetch_identity
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.resolved_commit.is_some())
             {
                 let abandoned = self
                     .root
@@ -332,10 +340,29 @@ impl Archive {
                     .join(format!("fetch-abandoned-{}", operation_id()));
                 fs::rename(&path, abandoned)?;
                 sync_directory(&self.root.join("tmp"))?;
+                if let Some(identity) = &fetch_identity {
+                    tracing::info!(
+                        event = "incomplete_fetch_recovered",
+                        repo_id = %identity.repo_id,
+                        requested_revision = %identity.requested_revision,
+                        commit = identity.resolved_commit.as_deref().unwrap_or(""),
+                        recovery_action = "preserved_for_resume",
+                        "recovered incomplete fetch staging"
+                    );
+                }
                 continue;
             }
             fs::remove_dir_all(path)?;
             recovered += 1;
+            if let Some(identity) = &fetch_identity {
+                tracing::info!(
+                    event = "incomplete_fetch_recovered",
+                    repo_id = %identity.repo_id,
+                    requested_revision = %identity.requested_revision,
+                    recovery_action = "discarded",
+                    "recovered incomplete fetch staging"
+                );
+            }
         }
         Ok(recovered)
     }
@@ -651,11 +678,11 @@ impl Archive {
         })
     }
 
-    pub(crate) fn preserve_fetch_staging(&self, staging: &Path) -> ArchiveResult<()> {
+    pub(crate) fn preserve_fetch_staging(&self, staging: &Path) -> ArchiveResult<bool> {
         let metadata = read_fetch_staging_metadata(staging)?;
         if metadata.resolved_commit.is_none() {
             fs::remove_dir_all(staging)?;
-            return Ok(());
+            return Ok(false);
         }
         let abandoned = self
             .root
@@ -664,7 +691,7 @@ impl Archive {
         fs::rename(staging, &abandoned)?;
         write_staging_lease_with_expiry(&abandoned, "abandoned", 0)?;
         sync_directory(&self.root.join("tmp"))?;
-        Ok(())
+        Ok(true)
     }
 
     pub fn revision_path(&self, repo_id: &str, commit: &str) -> ArchiveResult<PathBuf> {
@@ -719,6 +746,28 @@ impl Archive {
     }
 
     pub fn verify_revision(&self, repo_id: &str, commit: &str) -> ArchiveResult<usize> {
+        let result = self.verify_revision_inner(repo_id, commit);
+        if let Err(error) = &result {
+            tracing::warn!(
+                event = "archive_verification_failed",
+                repo_id,
+                commit,
+                error_class = match error {
+                    ArchiveError::IntegrityMismatch(_) => "integrity",
+                    ArchiveError::Io(io_error) if io_error.kind() == io::ErrorKind::NotFound =>
+                        "not_found",
+                    ArchiveError::Io(_) => "storage",
+                    ArchiveError::InvalidPath(_) => "unsafe_path",
+                    ArchiveError::AlreadyPublished(_) => "conflict",
+                    ArchiveError::ReferencedRevision(_) => "referenced_revision",
+                },
+                "archive verification failed"
+            );
+        }
+        result
+    }
+
+    fn verify_revision_inner(&self, repo_id: &str, commit: &str) -> ArchiveResult<usize> {
         let revision = self.revision_path(repo_id, commit)?;
         let manifest_path = revision.join(".modelkeep-manifest.json");
         let manifest: Manifest = serde_json::from_slice(&fs::read(&manifest_path)?)
@@ -1432,6 +1481,47 @@ fn sha256(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::EnvFilter;
+
+    #[derive(Clone, Default)]
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for LogWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl LogWriter {
+        fn output(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    fn capture_logs() -> (LogWriter, tracing::subscriber::DefaultGuard) {
+        let writer = LogWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(EnvFilter::new("info"))
+            .with_writer(writer.clone())
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (writer, guard)
+    }
 
     fn archive() -> (Archive, tempfile::TempDir) {
         let directory = tempfile::tempdir().unwrap();
@@ -1757,6 +1847,7 @@ mod tests {
 
     #[test]
     fn resumes_matching_expired_fetch_staging_exclusively() {
+        let (writer, _guard) = capture_logs();
         let (archive, _directory) = archive();
         let original = archive
             .acquire_fetch_staging("org/model", "main", &[])
@@ -1785,10 +1876,17 @@ mod tests {
             archive.acquire_fetch_staging("org/model", "main", &[]),
             Err(ArchiveError::AlreadyPublished(_))
         ));
+        let output = writer.output();
+        assert!(output.contains("incomplete_fetch_recovered"));
+        assert!(output.contains("preserved_for_resume"));
+        assert!(output.contains("org/model"));
+        assert!(output.contains("main"));
+        assert!(output.contains(&"a".repeat(40)));
     }
 
     #[test]
     fn recovery_discards_fetch_staging_without_a_resolved_commit() {
+        let (writer, _guard) = capture_logs();
         let (archive, _directory) = archive();
         let staging = archive
             .acquire_fetch_staging("org/model", "main", &[])
@@ -1800,6 +1898,49 @@ mod tests {
         .unwrap();
         assert_eq!(archive.recover_incomplete().unwrap(), 1);
         assert!(!staging.path.exists());
+        let output = writer.output();
+        assert!(output.contains("incomplete_fetch_recovered"));
+        assert!(output.contains("discarded"));
+        assert!(output.contains("org/model"));
+        assert!(output.contains("main"));
+        assert!(!output.contains(STAGING_LEASE_FILE));
+    }
+
+    #[test]
+    fn verification_failure_event_is_correlated_and_credential_safe() {
+        let (archive, _directory) = archive();
+        archive
+            .publish_revision(PublishRequest {
+                repo_id: "org/model".into(),
+                requested_revision: "main".into(),
+                commit: "ffffffffffffffffffffffffffffffffffffffff".into(),
+                files: vec![ArchiveFile {
+                    path: "config.json".into(),
+                    bytes: b"safe".to_vec(),
+                }],
+            })
+            .unwrap();
+        fs::write(
+            archive
+                .revision_path("org/model", "ffffffffffffffffffffffffffffffffffffffff")
+                .unwrap()
+                .join("config.json"),
+            b"Bearer credential-must-not-appear",
+        )
+        .unwrap();
+        let (writer, _guard) = capture_logs();
+
+        assert!(matches!(
+            archive.verify_revision("org/model", "ffffffffffffffffffffffffffffffffffffffff"),
+            Err(ArchiveError::IntegrityMismatch(_))
+        ));
+
+        let output = writer.output();
+        assert!(output.contains("archive_verification_failed"));
+        assert!(output.contains("org/model"));
+        assert!(output.contains("ffffffffffffffffffffffffffffffffffffffff"));
+        assert!(output.contains("integrity"));
+        assert!(!output.contains("credential-must-not-appear"));
     }
 
     #[test]

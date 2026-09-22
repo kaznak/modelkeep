@@ -134,12 +134,13 @@ impl PullThrough {
         let staging = self
             .archive
             .acquire_fetch_staging(repo_id, reference, &[])
-            .map_err(PullThroughError::from)?;
+            .map_err(|error| log_archive_failure(repo_id, reference, "stage", error))?;
         progress(FetchProgress::phase(if staging.resumed {
             "resuming_snapshot"
         } else {
             "acquiring_snapshot"
         }));
+        tracing::info!(event = "upstream_fetch_started", repo_id = %repo_id, requested_revision = %reference, resumed = staging.resumed, operation = "refresh", "upstream fetch started");
         let fetched = self
             .fetcher
             .fetch_with_progress(
@@ -153,9 +154,11 @@ impl PullThrough {
                 progress,
             )
             .map_err(|error| {
-                self.handle_fetch_failure(&staging.path, &error);
+                self.handle_fetch_failure(&staging.path, repo_id, reference, &error);
+                log_fetch_failure(repo_id, reference, "refresh", &error);
                 PullThroughError::from(error)
             })?;
+        tracing::info!(event = "upstream_fetch_finished", repo_id = %repo_id, requested_revision = %reference, commit = %fetched.commit, operation = "refresh", "upstream fetch finished");
         if dry_run {
             let _ = std::fs::remove_dir_all(&staging.path);
             return Ok(RefreshResult {
@@ -173,7 +176,7 @@ impl PullThrough {
                     source: staging.path.join(path),
                 })
                 .collect();
-            match self.archive.publish_revision_from_directory_with_progress(
+            let published = match self.archive.publish_revision_from_directory_with_progress(
                 crate::SourcePublishRequest {
                     repo_id: repo_id.into(),
                     requested_revision: reference.into(),
@@ -183,16 +186,24 @@ impl PullThrough {
                 },
                 &|phase| progress(FetchProgress::phase(phase)),
             ) {
-                Ok(_) => {}
+                Ok(_) => true,
                 Err(ArchiveError::AlreadyPublished(_))
-                    if self.revision_is_ready(repo_id, &fetched.commit, &[]) => {}
-                Err(error) => return Err(error.into()),
+                    if self.revision_is_ready(repo_id, &fetched.commit, &[]) =>
+                {
+                    false
+                }
+                Err(error) => {
+                    return Err(log_archive_failure(repo_id, reference, "publish", error))
+                }
+            };
+            if published {
+                tracing::info!(event = "archive_published", repo_id = %repo_id, requested_revision = %reference, commit = %fetched.commit, operation = "refresh", "archive revision published");
             }
         }
         let _ = std::fs::remove_dir_all(&staging.path);
         self.archive
             .update_ref(repo_id, reference, &fetched.commit)
-            .map_err(PullThroughError::from)?;
+            .map_err(|error| log_archive_failure(repo_id, reference, "update_ref", error))?;
         Ok(RefreshResult {
             previous,
             proposed: fetched.commit,
@@ -223,13 +234,14 @@ impl PullThrough {
         }
         let staging = self
             .archive
-            .acquire_fetch_staging(repo_id, requested_revision, &[])?;
+            .acquire_fetch_staging(repo_id, requested_revision, &[])
+            .map_err(|error| log_archive_failure(repo_id, requested_revision, "stage", error))?;
         progress(FetchProgress::phase(if staging.resumed {
             "resuming_snapshot"
         } else {
             "acquiring_snapshot"
         }));
-        tracing::info!(repo_id = %repo_id, requested_revision = %requested_revision, resumed = staging.resumed, "upstream fetch start");
+        tracing::info!(event = "upstream_fetch_started", repo_id = %repo_id, requested_revision = %requested_revision, resumed = staging.resumed, operation = "pull_through", "upstream fetch started");
         let request = FetchRequest {
             repo_id: repo_id.to_string(),
             revision: requested_revision.to_string(),
@@ -240,10 +252,12 @@ impl PullThrough {
         let fetched = match self.fetcher.fetch_with_progress(&request, progress) {
             Ok(result) => result,
             Err(error) => {
-                self.handle_fetch_failure(&staging.path, &error);
+                self.handle_fetch_failure(&staging.path, repo_id, requested_revision, &error);
+                log_fetch_failure(repo_id, requested_revision, "pull_through", &error);
                 return Err(error.into());
             }
         };
+        tracing::info!(event = "upstream_fetch_finished", repo_id = %repo_id, requested_revision = %requested_revision, commit = %fetched.commit, operation = "pull_through", "upstream fetch finished");
         let source_files = fetched
             .files
             .iter()
@@ -263,31 +277,111 @@ impl PullThrough {
             &|phase| progress(FetchProgress::phase(phase)),
         );
         let _ = std::fs::remove_dir_all(&staging.path);
-        match publish {
-            Ok(_) => {}
+        let published = match publish {
+            Ok(_) => true,
             Err(ArchiveError::AlreadyPublished(_))
-                if self.revision_is_ready(repo_id, &fetched.commit, files) => {}
-            Err(error) => return Err(error.into()),
+                if self.revision_is_ready(repo_id, &fetched.commit, files) =>
+            {
+                false
+            }
+            Err(error) => {
+                return Err(log_archive_failure(
+                    repo_id,
+                    requested_revision,
+                    "publish",
+                    error,
+                ))
+            }
+        };
+        if published {
+            tracing::info!(event = "archive_published", repo_id = %repo_id, requested_revision = %requested_revision, commit = %fetched.commit, operation = "pull_through", "archive revision published");
         }
-        tracing::info!(repo_id = %repo_id, commit = %fetched.commit, "archive publish complete");
         if !is_hf_commit(requested_revision) {
             self.archive
-                .update_ref(repo_id, requested_revision, &fetched.commit)?;
+                .update_ref(repo_id, requested_revision, &fetched.commit)
+                .map_err(|error| {
+                    log_archive_failure(repo_id, requested_revision, "update_ref", error)
+                })?;
         }
         Ok(fetched.commit)
     }
 
-    fn handle_fetch_failure(&self, staging: &std::path::Path, error: &UpstreamError) {
+    fn handle_fetch_failure(
+        &self,
+        staging: &std::path::Path,
+        repo_id: &str,
+        requested_revision: &str,
+        error: &UpstreamError,
+    ) {
         if matches!(
             error,
             UpstreamError::Unavailable | UpstreamError::Failed | UpstreamError::Io(_)
-        ) && self.archive.preserve_fetch_staging(staging).is_ok()
+        ) && self
+            .archive
+            .preserve_fetch_staging(staging)
+            .is_ok_and(|preserved| preserved)
         {
-            tracing::warn!(path = %staging.display(), "preserved interrupted upstream staging for retry");
+            tracing::warn!(event = "incomplete_fetch_preserved", repo_id = %repo_id, requested_revision = %requested_revision, "preserved interrupted upstream staging for retry");
             return;
         }
         let _ = std::fs::remove_dir_all(staging);
     }
+}
+
+fn upstream_error_class(error: &UpstreamError) -> &'static str {
+    match error {
+        UpstreamError::Unavailable => "unavailable",
+        UpstreamError::NotFound => "not_found",
+        UpstreamError::Unauthorized => "unauthorized",
+        UpstreamError::InvalidOutput(_) => "invalid_output",
+        UpstreamError::Failed => "failed",
+        UpstreamError::Io(_) => "io",
+    }
+}
+
+fn log_fetch_failure(
+    repo_id: &str,
+    requested_revision: &str,
+    operation: &str,
+    error: &UpstreamError,
+) {
+    tracing::warn!(
+        event = "upstream_fetch_failed",
+        repo_id = %repo_id,
+        requested_revision = %requested_revision,
+        operation,
+        error_class = upstream_error_class(error),
+        "upstream fetch failed"
+    );
+}
+
+fn log_archive_failure(
+    repo_id: &str,
+    requested_revision: &str,
+    operation: &str,
+    error: ArchiveError,
+) -> PullThroughError {
+    match &error {
+        ArchiveError::IntegrityMismatch(_) => tracing::warn!(
+            event = "archive_verification_failed",
+            repo_id = %repo_id,
+            requested_revision = %requested_revision,
+            operation,
+            error_class = "integrity",
+            "archive verification failed"
+        ),
+        ArchiveError::Io(io_error) => tracing::error!(
+            event = "archive_storage_failed",
+            repo_id = %repo_id,
+            requested_revision = %requested_revision,
+            operation,
+            error_class = "storage",
+            io_kind = if io_error.kind() == std::io::ErrorKind::StorageFull { "out_of_space" } else { "other" },
+            "archive storage operation failed"
+        ),
+        _ => {}
+    }
+    error.into()
 }
 
 impl From<UpstreamError> for PullThroughError {
@@ -318,9 +412,51 @@ mod tests {
     use super::*;
     use crate::upstream::FetchedRevision;
     use std::fs;
+    use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Barrier;
+    use std::sync::Mutex;
     use std::time::Duration;
+    use tracing_subscriber::EnvFilter;
+
+    #[derive(Clone, Default)]
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl LogWriter {
+        fn output(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    fn capture_logs() -> (LogWriter, tracing::subscriber::DefaultGuard) {
+        let writer = LogWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(EnvFilter::new("info"))
+            .with_writer(writer.clone())
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (writer, guard)
+    }
 
     struct RefreshFetcher {
         commit: String,
@@ -741,5 +877,194 @@ mod tests {
             pull.ensure("org/model", "dddddddddddddddddddddddddddddddddddddddd", &[]),
             Err(PullThroughError::Conflict)
         );
+    }
+
+    #[test]
+    fn fetch_lifecycle_and_publication_events_have_correlation_fields() {
+        let (writer, _guard) = capture_logs();
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let pull = PullThrough::new(
+            archive,
+            Arc::new(FakeFetcher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        pull.ensure("org/model", "main", &[]).unwrap();
+
+        let output = writer.output();
+        for event in [
+            "upstream_fetch_started",
+            "upstream_fetch_finished",
+            "archive_published",
+        ] {
+            assert!(output.contains(event), "missing {event}: {output}");
+        }
+        assert!(output.contains("org/model"));
+        assert!(output.contains("requested_revision"));
+        assert!(output.contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    }
+
+    struct SensitiveFailureFetcher;
+
+    impl UpstreamFetcher for SensitiveFailureFetcher {
+        fn fetch(&self, _request: &FetchRequest) -> Result<FetchedRevision, UpstreamError> {
+            Err(UpstreamError::InvalidOutput(
+                "signed-url-secret?token=bearer-secret",
+            ))
+        }
+    }
+
+    struct InterruptedResolvedFetcher;
+
+    impl UpstreamFetcher for InterruptedResolvedFetcher {
+        fn fetch(&self, request: &FetchRequest) -> Result<FetchedRevision, UpstreamError> {
+            crate::record_fetch_resolved_commit(
+                &request.staging,
+                &request.repo_id,
+                &request.revision,
+                &request.files,
+                "9999999999999999999999999999999999999999",
+            )
+            .unwrap();
+            fs::write(request.staging.join("partial.bin"), b"partial").unwrap();
+            Err(UpstreamError::Unavailable)
+        }
+    }
+
+    #[test]
+    fn interrupted_resolved_fetch_emits_safe_preservation_event() {
+        let (writer, _guard) = capture_logs();
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let pull = PullThrough::new(archive, Arc::new(InterruptedResolvedFetcher));
+
+        assert_eq!(
+            pull.ensure("org/model", "main", &[]),
+            Err(PullThroughError::UpstreamUnavailable)
+        );
+
+        let output = writer.output();
+        assert!(output.contains("incomplete_fetch_preserved"));
+        assert!(output.contains("upstream_fetch_failed"));
+        assert!(output.contains("org/model"));
+        assert!(output.contains("main"));
+        assert!(!output.contains("partial.bin"));
+    }
+
+    #[test]
+    fn fetch_failure_event_uses_safe_class_without_error_payload() {
+        let (writer, _guard) = capture_logs();
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let pull = PullThrough::new(archive, Arc::new(SensitiveFailureFetcher));
+
+        assert_eq!(
+            pull.ensure("org/model", "main", &[]),
+            Err(PullThroughError::UpstreamInvalidOutput(
+                "signed-url-secret?token=bearer-secret"
+            ))
+        );
+
+        let output = writer.output();
+        assert!(output.contains("upstream_fetch_failed"));
+        assert!(output.contains("invalid_output"));
+        assert!(!output.contains("signed-url-secret"));
+        assert!(!output.contains("bearer-secret"));
+    }
+
+    struct DuplicateOutputFetcher;
+
+    impl UpstreamFetcher for DuplicateOutputFetcher {
+        fn fetch(&self, request: &FetchRequest) -> Result<FetchedRevision, UpstreamError> {
+            fs::write(request.staging.join("config.json"), b"content").unwrap();
+            Ok(FetchedRevision {
+                commit: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into(),
+                files: vec!["config.json".into(), "config.json".into()],
+                staging: request.staging.clone(),
+            })
+        }
+    }
+
+    #[test]
+    fn publication_verification_failure_is_structured() {
+        let (writer, _guard) = capture_logs();
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let pull = PullThrough::new(archive.clone(), Arc::new(DuplicateOutputFetcher));
+
+        assert_eq!(
+            pull.ensure("org/model", "main", &[]),
+            Err(PullThroughError::Integrity)
+        );
+        assert!(archive.list_revisions("org/model").unwrap().is_empty());
+
+        let output = writer.output();
+        assert!(output.contains("archive_verification_failed"));
+        assert!(output.contains("integrity"));
+        assert!(output.contains("org/model"));
+    }
+
+    #[test]
+    fn disk_full_event_is_safe_and_does_not_change_existing_revision() {
+        let (_root, archive) = published_archive();
+        let (writer, _guard) = capture_logs();
+        let error = ArchiveError::Io(std::io::Error::from_raw_os_error(28));
+
+        assert_eq!(
+            log_archive_failure("org/model", "main", "publish", error),
+            PullThroughError::Storage
+        );
+        assert_eq!(
+            archive.resolve_ref("org/model", "main").unwrap(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            archive
+                .verify_revision("org/model", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .unwrap(),
+            1
+        );
+
+        let output = writer.output();
+        assert!(output.contains("archive_storage_failed"));
+        assert!(output.contains("out_of_space"));
+        assert!(output.contains("storage"));
+    }
+
+    #[test]
+    fn staging_io_failure_is_structured_and_preserves_existing_revision() {
+        let (root, archive) = published_archive();
+        fs::remove_dir_all(root.path().join("tmp")).unwrap();
+        fs::write(root.path().join("tmp"), b"injected non-directory").unwrap();
+        let (writer, _guard) = capture_logs();
+        let pull = PullThrough::new(
+            archive.clone(),
+            Arc::new(FakeFetcher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        assert_eq!(
+            pull.ensure("org/another", "main", &[]),
+            Err(PullThroughError::Storage)
+        );
+        assert_eq!(
+            archive.resolve_ref("org/model", "main").unwrap(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            archive
+                .verify_revision("org/model", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .unwrap(),
+            1
+        );
+
+        let output = writer.output();
+        assert!(output.contains("archive_storage_failed"));
+        assert!(output.contains("org/another"));
+        assert!(output.contains("storage"));
+        assert!(output.contains("other"));
     }
 }

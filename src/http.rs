@@ -14,7 +14,6 @@ use tokio::{
     signal, task,
 };
 use tokio_util::io::ReaderStream;
-use tracing::info;
 
 use crate::pullthrough::{PullThrough, PullThroughError};
 use crate::{is_hf_commit, parse_range, Archive, ArchiveError, ByteRange, RangeError};
@@ -142,6 +141,13 @@ async fn model_info(
     Path((namespace, repo, revision)): Path<(String, String, String)>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let repo_id = format!("{namespace}/{repo}");
+    tracing::info!(
+        event = "archive_request",
+        request_kind = "model_info",
+        repo_id = %repo_id,
+        requested_revision = %revision,
+        "archive request received"
+    );
     let commit = match if is_hf_commit(&revision) {
         state
             .archive
@@ -158,8 +164,12 @@ async fn model_info(
     } else {
         state.archive.resolve_ref(&repo_id, &revision)
     } {
-        Ok(commit) => commit,
+        Ok(commit) => {
+            tracing::info!(event = "archive_hit", request_kind = "model_info", repo_id = %repo_id, requested_revision = %revision, commit = %commit, "archive request served locally");
+            commit
+        }
         Err(ArchiveError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(event = "archive_miss", request_kind = "model_info", repo_id = %repo_id, requested_revision = %revision, "archive request requires upstream acquisition");
             let Some(pullthrough) = state.pullthrough.clone() else {
                 return Err(StatusCode::NOT_FOUND);
             };
@@ -197,6 +207,13 @@ async fn model_tree(
     Path((namespace, repo, revision)): Path<(String, String, String)>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let repo_id = format!("{namespace}/{repo}");
+    tracing::info!(
+        event = "archive_request",
+        request_kind = "model_tree",
+        repo_id = %repo_id,
+        requested_revision = %revision,
+        "archive request received"
+    );
     let commit = match if is_hf_commit(&revision) {
         state
             .archive
@@ -213,8 +230,12 @@ async fn model_tree(
     } else {
         state.archive.resolve_ref(&repo_id, &revision)
     } {
-        Ok(commit) => commit,
+        Ok(commit) => {
+            tracing::info!(event = "archive_hit", request_kind = "model_tree", repo_id = %repo_id, requested_revision = %revision, commit = %commit, "archive request served locally");
+            commit
+        }
         Err(ArchiveError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(event = "archive_miss", request_kind = "model_tree", repo_id = %repo_id, requested_revision = %revision, "archive request requires upstream acquisition");
             let Some(pullthrough) = state.pullthrough.clone() else {
                 return Err(StatusCode::NOT_FOUND);
             };
@@ -276,7 +297,7 @@ async fn file_response(
     head_only: bool,
 ) -> Result<Response, StatusCode> {
     let repo_id = format!("{namespace}/{repo}");
-    info!(repo_id = %repo_id, requested_revision = %revision, path = %path, "archive request");
+    tracing::info!(event = "archive_request", request_kind = if head_only { "head_file" } else { "get_file" }, repo_id = %repo_id, requested_revision = %revision, path = %path, "archive request received");
     let resolved_result = if is_hf_commit(&revision) {
         state
             .archive
@@ -294,9 +315,12 @@ async fn file_response(
             })
     };
     let (resolved, resolved_commit) = match resolved_result {
-        Ok(resolved) => resolved,
+        Ok((resolved, commit)) => {
+            tracing::info!(event = "archive_hit", request_kind = if head_only { "head_file" } else { "get_file" }, repo_id = %repo_id, requested_revision = %revision, commit = %commit, path = %path, "archive request served locally");
+            (resolved, commit)
+        }
         Err(ArchiveError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            info!(repo_id = %repo_id, requested_revision = %revision, path = %path, "archive miss");
+            tracing::info!(event = "archive_miss", request_kind = if head_only { "head_file" } else { "get_file" }, repo_id = %repo_id, requested_revision = %revision, path = %path, "archive request requires upstream acquisition");
             let Some(pullthrough) = state.pullthrough.clone() else {
                 return Err(StatusCode::NOT_FOUND);
             };
@@ -380,7 +404,6 @@ fn status_for_archive_error(error: ArchiveError) -> StatusCode {
 }
 
 fn status_for_pullthrough_error(error: PullThroughError) -> StatusCode {
-    tracing::warn!(error_class = ?error, "pull-through request failed");
     match error {
         PullThroughError::UpstreamNotFound => StatusCode::NOT_FOUND,
         PullThroughError::UpstreamUnauthorized => StatusCode::UNAUTHORIZED,
@@ -642,6 +665,57 @@ mod tests {
             to_bytes(response.into_body(), usize::MAX).await.unwrap(),
             "2345"
         );
+    }
+
+    #[tokio::test]
+    async fn request_and_hit_events_are_correlated_without_credentials() {
+        let (writer, _guard) = capture_logs("info");
+        let (app, _directory) = test_router();
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/org/model/resolve/main/config.json?token=signed-query-secret")
+                    .header(header::AUTHORIZATION, "Bearer bearer-header-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let output = writer.output();
+        assert!(output.contains("archive_request"));
+        assert!(output.contains("archive_hit"));
+        assert!(output.contains("org/model"));
+        assert!(output.contains("main"));
+        assert!(output.contains("config.json"));
+        assert!(output.contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert!(!output.contains("signed-query-secret"));
+        assert!(!output.contains("bearer-header-secret"));
+        assert!(!output.to_ascii_lowercase().contains("authorization"));
+    }
+
+    #[tokio::test]
+    async fn miss_event_is_correlated_without_upstream() {
+        let (writer, _guard) = capture_logs("info");
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        let response = router(archive)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/org/missing/resolve/main/config.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let output = writer.output();
+        assert!(output.contains("archive_request"));
+        assert!(output.contains("archive_miss"));
+        assert!(output.contains("org/missing"));
+        assert!(output.contains("config.json"));
     }
 
     #[tokio::test]

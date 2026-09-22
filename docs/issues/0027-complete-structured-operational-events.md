@@ -4,6 +4,7 @@ priority: P2
 related_adrs:
   - ADR-0008
   - ADR-0009
+  - ADR-0017
 created: 2026-08-21
 updated: 2026-08-21
 ---
@@ -11,7 +12,7 @@ updated: 2026-08-21
 
 - Status: Open
 - Priority: P2
-- Related ADR: ADR-0008, ADR-0009
+- Related ADR: ADR-0008, ADR-0009, ADR-0017
 
 ## Objective
 
