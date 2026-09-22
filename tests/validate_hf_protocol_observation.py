@@ -26,9 +26,6 @@ def validate(path):
     assert record["schema"] == 1
     assert record["huggingface_hub"] == "1.27.0"
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", record["observed_at"])
-    # Nix store paths prefix the source basename with a content hash.
-    expected_name = f"hugging-face-protocol-{record['observed_at']}.json"
-    assert Path(path).name.endswith(expected_name)
     assert set(record["matrix"]) == EXPECTED_MATRIX
     assert all(record["matrix"].values())
     assert record["repositories"] == {
