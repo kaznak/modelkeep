@@ -879,7 +879,7 @@ upstream を使う online test と、fixture/archive だけを使う determinist
 
 MVP 後の候補:
 
-- datasets対応 — [Issue 0029](issues/0029-add-dataset-repository-support.md)
+- datasets対応 — ~~[Issue 0029](https://github.com/kaznak/modelkeep/commit/543c534c9899e0639f3618c55a4d7557b99eebd5)~~
 - gated/private repositoryの認証policy — [Issue 0028](issues/0028-define-private-gated-credential-policy.md)
 - tailnet identity-aware authorization — [Issue 0021](issues/0021-add-tailnet-identity-aware-authorization.md)
 - ~~management control-plane contract — [Issue 0030](https://github.com/kaznak/modelkeep/commit/2e637bc)~~
