@@ -1,18 +1,34 @@
 #!/usr/bin/env python3
 import importlib.util
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
 
 SCRIPT = Path(__file__).with_name("qnap_client_acceptance.py")
+CONFIG_TEMPLATE = Path(
+    os.environ.get(
+        "MODELKEEP_QNAP_CONFIG_TEMPLATE",
+        Path(__file__).parent.parent
+        / "docs/deployment/qnap-acceptance-config.example.json",
+    )
+)
 SPEC = importlib.util.spec_from_file_location("qnap_client_acceptance", SCRIPT)
 acceptance = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(acceptance)
 
 
 class QnapClientAcceptanceTests(unittest.TestCase):
+    def test_config_template_pins_the_default_public_model(self):
+        config = json.loads(CONFIG_TEMPLATE.read_text())
+        self.assertEqual(config["repo_id"], "sshleifer/tiny-gpt2")
+        self.assertRegex(config["revision"], acceptance.COMMIT_PATTERN)
+        self.assertEqual(
+            config["revision"], "5f91d94bd9cd7190a9f3216ff93cd1dd95f2c7be"
+        )
+
     def complete_record(self):
         return {
             "schema_version": 1,

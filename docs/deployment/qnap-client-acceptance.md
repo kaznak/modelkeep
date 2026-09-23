@@ -38,10 +38,12 @@ cp docs/deployment/qnap-acceptance-config.example.json qnap-acceptance.config.js
 ```
 
 Edit `qnap-acceptance.config.json` with the actual site values. It must not contain
-credentials. In particular, set distinct download and administration HTTPS origins,
-an actual small public repository and immutable commit, and the deployed image
-digest. The repository root ignores both this local config and generated acceptance
-records so private hostnames and site details cannot be committed accidentally.
+credentials. In particular, set distinct download and administration HTTPS origins
+and the deployed image digest. The template already pins the small public
+`sshleifer/tiny-gpt2` repository to an immutable commit; replace those two fields
+only when that revision is already present in the archive. The repository root
+ignores both this local config and generated acceptance records so private hostnames
+and site details cannot be committed accidentally.
 
 Initialize the evidence record from that file:
 

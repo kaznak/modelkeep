@@ -270,7 +270,8 @@
           } ''
             cp ${./tests/qnap_client_acceptance.py} qnap_client_acceptance.py
             cp ${./tests/test_qnap_client_acceptance.py} test_qnap_client_acceptance.py
-            python3 test_qnap_client_acceptance.py -v
+            MODELKEEP_QNAP_CONFIG_TEMPLATE=${./docs/deployment/qnap-acceptance-config.example.json} \
+              python3 test_qnap_client_acceptance.py -v
             touch $out
           '';
 
