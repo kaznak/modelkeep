@@ -1,5 +1,5 @@
 ---
-status: open
+status: done
 priority: P2
 related_adrs:
   - ADR-0011
@@ -10,7 +10,7 @@ updated: 2026-09-24
 ---
 # Issue 0073: Check archive self-consistency at startup
 
-- Status: Open
+- Status: Done
 - Priority: P2
 - Related ADR: ADR-0011, ADR-0001, ADR-0007
 
@@ -83,7 +83,9 @@ and produce a job record.
 - A deliberately damaged fixture archive — missing file, size mismatch, dangling ref,
   unsafe path, orphaned staging — is detected, and a healthy fixture reports no
   findings.
-- The check runs from the packaged image, not only from a development shell.
+- The check runs from the packaged binary that the image ships, not only from a
+  development shell. The image itself is covered separately by the `modelkeep-image`
+  check.
 
 ## Verification
 
@@ -104,3 +106,24 @@ The cost of the check grows with the number of revisions, so it must read metada
 and must not become a reason to delay serving. If the measured startup cost is material
 on the QNAP deployment, the check should run concurrently with serving and report when
 it completes, rather than being reduced to a sample.
+
+## Implementation status
+
+Implemented on 2026-09-24. Verified on x86_64-linux with `cargo fmt --check`,
+`cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`,
+and `nix flake check`, each with its exit status taken directly rather than through a
+pipe. An independent reviewer checked each acceptance criterion against the code.
+
+`Archive::self_check` runs off the serving path, reads manifests and file metadata only,
+contacts no upstream, and repairs nothing. Findings appear as structured events and as
+an Admin status summary that distinguishes a clean result from never having run.
+Measured at 14-20 ms over 402 revisions. The `archive-startup-self-check` flake check
+exercises it through the packaged binary.
+
+While adding it, the client integration harness was found to hold the server's stderr in
+a pipe it read only at teardown, with the baseline already using 61,076 of the 61,920
+available bytes. One more startup log line would have blocked the server on its next
+write. The harness now drains stderr continuously.
+
+`nix flake check` omits aarch64-linux as an incompatible system, so the QNAP release
+architecture is covered by the native GitHub Actions jobs, not by this run.

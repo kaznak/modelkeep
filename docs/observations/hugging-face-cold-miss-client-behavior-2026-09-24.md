@@ -33,6 +33,7 @@ Retry behavior by status on this route:
 | `504` | retries | retries |
 | `429` | does not retry | retries |
 | `425` | does not retry | does not retry |
+| `500` | not measured | retries |
 
 ### The metadata routes
 
@@ -61,9 +62,23 @@ protocol alone:
 
 ## Reproducing
 
-The retry matrix is pinned by the regression tests in `src/http.rs` and exercised
-end to end by the `hf-client-integration-0-36` and `hf-client-integration-1-27` flake
-checks. Run them with the exit status taken directly:
+The matrix above was measured by hand against both pinned clients while implementing
+Issue 0069. Be precise about what is pinned and what is not:
+
+- the ModelKeep side of the contract — which status is answered, within which deadline,
+  and that the acquisition keeps running and is joined by a retry — is held by the
+  regression tests in `src/http.rs`. Those drive ModelKeep with a stub, not a real
+  client, so they pin ModelKeep's behavior and not the client's.
+- the client side is pinned for the row that the contract depends on: the
+  `hf-client-integration-0-36` and `hf-client-integration-1-27` checks drive a real
+  client through a deadline-exceeded `503` and require it to retry on its own and
+  complete the download, having caused exactly one upstream acquisition. The remaining
+  rows of the matrix are not pinned by any check; they were measured by hand for this
+  record.
+
+Treat every row above as an observation that can go stale, and re-measure before relying
+on it. The supported-client checks are run with the exit status taken directly, not
+through a pipe:
 
 ```sh
 nix build --no-link '.#checks.x86_64-linux.hf-client-integration-1-27' > log 2>&1; echo $?

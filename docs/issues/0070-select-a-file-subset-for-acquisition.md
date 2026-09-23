@@ -152,9 +152,10 @@ The manifest format does not change, and neither do the four serving gates that 
   and no file absent from the live manifest is ever served.
 - A request for a file a previously imported revision does not hold extends that
   revision rather than re-acquiring the repository.
-- Interrupting a filtered acquisition publishes nothing partial; a retry adopts only
-  staging whose recorded selection matches, and staging under a different selection is
-  discarded rather than resumed.
+- Interrupting a filtered acquisition publishes nothing partial; a retry adopts staging
+  only under the rule in ADR-0020 decision 5, and staging it may not adopt is left for
+  the ordinary lease-expiry path rather than deleted by the acquisition that declined
+  it.
 - `docs/admin-api.md` and `docs/modelkeep-api.md` no longer state that patterns are
   unsupported, and state that the archive holds what it holds and asserts nothing about
   upstream completeness.
@@ -185,3 +186,40 @@ behavior; that must be observed against a supported client rather than assumed. 
 extension operation is the material risk: it introduces the first write into an already
 published revision directory, so its crash safety must be proven by test rather than by
 argument, and it must never touch a path the live manifest already lists.
+
+## Implementation status
+
+Implemented on 2026-09-24. Verified on x86_64-linux with `cargo fmt --check`,
+`cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`,
+and `nix flake check`, each with its exit status taken directly rather than through a
+pipe. An independent reviewer checked each acceptance criterion against the code and
+confirmed that the load-bearing tests fail when the behavior they guard is broken.
+
+All three work items are implemented: `include` / `exclude` on a prefetch job, with
+pattern validation delegated to the existing selection type and the normalized selection
+in the idempotency key; pull-through honouring the requested path; and monotonic
+extension of a published revision. An unrestricted request keeps its previous
+idempotency hash input byte for byte, which a golden-value test now pins.
+
+A published revision is reconciled against the requested selection through a
+resolve-only helper invocation, so only the missing difference is transferred and an
+empty difference is recorded as a real no-op.
+
+Putting the selection into the fetch staging identity initially broke resumption of an
+interrupted repository-wide acquisition, which `archive-crash-upgrade` caught. ADR-0020
+decision 5 now states the adoption rule and why requiring equal selections would be
+wrong.
+
+Measured limitation, documented in `modelkeep-api.md`: a client's own `--include` does
+not narrow a *first* acquisition, because the client reads repository metadata first and
+that route acquires the whole repository. Archiving a subset requires a filtered
+prefetch, or a revision that is already published. Issue 0074 tracks removing that
+limitation.
+
+`nix flake check` omits aarch64-linux as an incompatible system, so the QNAP release
+architecture is covered by the native GitHub Actions jobs, not by this run.
+
+**Remaining before this issue can close**: record one sanitized QNAP measurement of a
+filtered prefetch against a representative repository, including transferred bytes and
+peak staging usage. That was not done in this work and cannot be done away from the
+deployment.

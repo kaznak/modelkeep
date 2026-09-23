@@ -1,5 +1,5 @@
 ---
-status: open
+status: done
 priority: P2
 related_adrs:
   - ADR-0018
@@ -8,7 +8,7 @@ updated: 2026-09-24
 ---
 # Issue 0071: Distinguish a no-op prefetch from an empty transfer in the job record
 
-- Status: Open
+- Status: Done
 - Priority: P2
 - Related ADR: ADR-0018
 
@@ -70,3 +70,19 @@ transfers files, and reconstruction of both records from durable state.
 
 None material. The change is confined to reported job metadata; it must not alter when
 a revision is considered ready or published.
+
+## Implementation status
+
+Implemented on 2026-09-24. Verified on x86_64-linux with `cargo fmt --check`,
+`cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`,
+and `nix flake check`, each with its exit status taken directly rather than through a
+pipe. An independent reviewer checked each acceptance criterion against the code and
+confirmed that the load-bearing tests fail when the behavior they guard is broken.
+
+The terminal job record carries `outcome`, which is `already_archived`, `published` or
+`extended`. Records written before this change stay readable because the field defaults
+when absent. Implemented together with Issue 0070 so the outcome vocabulary was designed
+once, against the three results an acquisition can actually produce.
+
+`nix flake check` omits aarch64-linux as an incompatible system, so the QNAP release
+architecture is covered by the native GitHub Actions jobs, not by this run.

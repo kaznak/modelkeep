@@ -2134,6 +2134,86 @@ mod tests {
         );
     }
 
+    /// A request that carries no selection must hash exactly what deployments
+    /// already recorded before selections existed, or every live idempotency
+    /// entry silently stops matching its own request.
+    ///
+    /// The expectations are fixed digests rather than a second call into
+    /// `hash_idempotency_request`, so changing the hash input — for example by
+    /// dropping the unrestricted-selection guard and appending an empty
+    /// selection component — fails here instead of agreeing with itself.
+    #[test]
+    fn an_unrestricted_selection_keeps_the_recorded_idempotency_hash() {
+        let bearer = PrincipalView {
+            auth_method: "bearer".into(),
+            login: None,
+            name: None,
+        };
+        let tailnet = PrincipalView {
+            auth_method: "tailscale".into(),
+            login: Some("operator@example.com".into()),
+            name: None,
+        };
+        let prefetch = JobRequest {
+            kind: JobKind::Prefetch,
+            repo_type: RepositoryType::Model,
+            repo_id: Some("org/model".into()),
+            revision: Some("main".into()),
+            include: None,
+            exclude: None,
+        };
+        let dataset = JobRequest {
+            repo_type: RepositoryType::Dataset,
+            ..prefetch.clone()
+        };
+        let audit = JobRequest {
+            kind: JobKind::Audit,
+            repo_type: RepositoryType::Model,
+            repo_id: None,
+            revision: None,
+            include: None,
+            exclude: None,
+        };
+        // SHA-256 of "Prefetch\0model\0org/model\0main\0bearer\0",
+        // "Prefetch\0dataset\0org/model\0main\0bearer\0" and
+        // "Audit\0model\0\0\0tailscale\0operator@example.com".
+        let recorded = [
+            (
+                &prefetch,
+                &bearer,
+                "9fb5ddc3a1b01e473ecb7a68e13cc574af58f8f64b855a5e57f880152d1bd3ac",
+            ),
+            (
+                &dataset,
+                &bearer,
+                "669702d1e7ff044f473e629bd5ec3efe8502079ba8b415e48d7cd0d122ffe9d7",
+            ),
+            (
+                &audit,
+                &tailnet,
+                "e10fa3bc6614452cec14928156c44c77c8f6c62fbc1e662a52176e5526b57b2a",
+            ),
+        ];
+        let unrestricted = FileSelection::all();
+        assert!(unrestricted.is_unrestricted());
+        // An explicitly empty include/exclude pair normalizes to the same
+        // unrestricted selection, so it must hash the same way too.
+        let normalized_empty = FileSelection::new(&[], &[]).unwrap();
+        assert!(normalized_empty.is_unrestricted());
+        for (request, principal, expected) in recorded {
+            assert_eq!(
+                hash_idempotency_request(request, &unrestricted, principal),
+                expected,
+                "unrestricted idempotency hash input changed for {:?}",
+                request.kind
+            );
+            assert_eq!(
+                hash_idempotency_request(request, &normalized_empty, principal),
+                expected
+            );
+        }
+    }
+
     #[test]
     fn active_job_deduplication_is_scoped_by_repository_type() {
         let mut active = stored_job("active-shared", 1);

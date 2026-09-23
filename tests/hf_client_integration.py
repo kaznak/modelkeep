@@ -12,13 +12,36 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from huggingface_hub import HfApi, snapshot_download
+from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 from huggingface_hub import __version__ as huggingface_hub_version
 from huggingface_hub.errors import HfHubHTTPError
 
 
 COMMIT = "a" * 40
 REPO_ID = "org/model"
+COLD_MISS_REPO_ID = "org/cold-miss"
+METADATA_REPO_ID = "org/metadata-wait"
+ADMIN_TOKEN = "modelkeep-hf-client-integration-admin-token"
+
+# An upstream helper that records every invocation and delays the transfer, so a
+# real client meets ModelKeep's cold-miss deadline (Issue 0069) instead of the
+# stub used by the Rust unit tests. The payload itself is delegated to the same
+# fixture the rest of this test uses, so the acquisition contract stays in one
+# place; only timing and an invocation journal are added.
+SLOW_UPSTREAM_HELPER = r'''#!/usr/bin/env python3
+import json
+import os
+import runpy
+import sys
+import time
+from pathlib import Path
+
+with Path(os.environ["MODELKEEP_SLOW_HELPER_JOURNAL"]).open("a") as journal:
+    journal.write(json.dumps(sys.argv[1:]) + "\n")
+if "--resolve-only" not in sys.argv:
+    time.sleep(float(os.environ["MODELKEEP_SLOW_HELPER_DELAY"]))
+runpy.run_path(os.environ["MODELKEEP_SLOW_HELPER_FIXTURE"], run_name="__main__")
+'''
 
 
 def unused_port():
@@ -28,7 +51,15 @@ def unused_port():
 
 
 @contextlib.contextmanager
-def server(binary, archive, helper=None, captured_logs=None, upstream_endpoint=None):
+def server(
+    binary,
+    archive,
+    helper=None,
+    captured_logs=None,
+    upstream_endpoint=None,
+    admin_endpoints=None,
+    extra_environment=None,
+):
     port = unused_port()
     endpoint = f"http://127.0.0.1:{port}"
     environment = os.environ.copy()
@@ -42,6 +73,16 @@ def server(binary, archive, helper=None, captured_logs=None, upstream_endpoint=N
         environment["HF_ENDPOINT"] = upstream_endpoint
     else:
         environment.pop("HF_ENDPOINT", None)
+    environment.pop("MODELKEEP_ADMIN_ADDRESS", None)
+    environment.pop("MODELKEEP_ADMIN_TOKEN", None)
+    if admin_endpoints is not None:
+        admin_port = unused_port()
+        environment["MODELKEEP_ADMIN_ADDRESS"] = f"127.0.0.1:{admin_port}"
+        environment["MODELKEEP_ADMIN_TOKEN"] = ADMIN_TOKEN
+        admin_endpoints.append(f"http://127.0.0.1:{admin_port}")
+    environment.pop("MODELKEEP_COLD_MISS_DEADLINE_SECONDS", None)
+    if extra_environment:
+        environment.update(extra_environment)
     process = subprocess.Popen(
         [str(binary), "serve", str(archive), f"127.0.0.1:{port}"],
         env=environment,
@@ -110,6 +151,159 @@ def download(endpoint, destination, revision, repo_type="model"):
         endpoint=endpoint,
         local_dir=str(destination),
     )
+
+
+def admin_call(admin_endpoint, path, body=None, idempotency_key=None):
+    request = urllib.request.Request(
+        f"{admin_endpoint}{path}",
+        method="GET" if body is None else "POST",
+        data=None if body is None else json.dumps(body).encode(),
+    )
+    request.add_header("Authorization", f"Bearer {ADMIN_TOKEN}")
+    if body is not None:
+        request.add_header("Content-Type", "application/json")
+        request.add_header("X-ModelKeep-CSRF", "1")
+        request.add_header("Idempotency-Key", idempotency_key)
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return json.loads(response.read())
+
+
+def await_job(admin_endpoint, job_id, timeout=180):
+    limit = time.monotonic() + timeout
+    while True:
+        job = admin_call(admin_endpoint, f"/api/admin/v1/jobs/{job_id}")
+        if job["state"] not in ("queued", "running"):
+            return job
+        assert time.monotonic() < limit, f"job did not finish: {job}"
+        time.sleep(0.25)
+
+
+def assert_cold_miss_deadline_is_retried_by_the_client(binary, fixture, root):
+    """Issue 0069, black-box against a real supported client.
+
+    The Rust unit tests pin the bounded `503` against an in-process stub. This
+    pins what the client actually does with it: a cold-miss `resolve` whose
+    acquisition outlasts `MODELKEEP_COLD_MISS_DEADLINE_SECONDS` is retried by
+    the client itself and completes, and the retry joins the running flight
+    instead of starting a second upstream transfer. The metadata route waits by
+    default, so the same slow acquisition must not fail a client there.
+    """
+    journal = root / "cold-miss-helper-journal.jsonl"
+    journal.write_text("")
+    slow_helper = root / "slow-upstream-helper.py"
+    slow_helper.write_text(SLOW_UPSTREAM_HELPER)
+    logs = []
+    with server(
+        binary,
+        root / "cold-miss-archive",
+        slow_helper,
+        logs,
+        extra_environment={
+            "MODELKEEP_COLD_MISS_DEADLINE_SECONDS": "1",
+            "MODELKEEP_SLOW_HELPER_JOURNAL": str(journal),
+            "MODELKEEP_SLOW_HELPER_DELAY": "3",
+            "MODELKEEP_SLOW_HELPER_FIXTURE": str(fixture),
+        },
+    ) as endpoint:
+        downloaded = Path(
+            hf_hub_download(
+                repo_id=COLD_MISS_REPO_ID,
+                filename="config.json",
+                revision="main",
+                endpoint=endpoint,
+                local_dir=str(root / "cold-miss-client"),
+            )
+        )
+        assert downloaded.read_bytes() == b'{"model_type":"modelkeep-fixture"}'
+
+        metadata = HfApi(endpoint=endpoint).repo_info(METADATA_REPO_ID, revision="main")
+        assert metadata.sha == COMMIT
+
+    # The deadline really was reached, so the client saw the bounded answer
+    # rather than one uninterrupted wait.
+    bounded = [
+        line
+        for line in logs[0].splitlines()
+        if '"event":"acquisition_deadline_exceeded"' in line
+        and f'"repo_id":"{COLD_MISS_REPO_ID}"' in line
+    ]
+    assert bounded, logs[0]
+
+    # ... and the retries joined it: exactly one upstream transfer, for the one
+    # requested path.
+    invocations = [json.loads(line) for line in journal.read_text().splitlines()]
+    transfers = [
+        argv
+        for argv in invocations
+        if "--output" in argv and COLD_MISS_REPO_ID in argv
+    ]
+    assert len(transfers) == 1, invocations
+    assert "config.json" in transfers[0], transfers
+
+
+def assert_selected_subset_is_acquired_and_served(binary, root, actual_helper, populated):
+    """Issue 0070, black-box against a real supported client.
+
+    A filtered prefetch archives a subset of a revision; a real client then
+    downloads that subset with `allow_patterns` while upstream is unavailable,
+    and repository metadata reports exactly what the archive holds rather than
+    what upstream has. The already populated archive acts as the local upstream,
+    and the production helper performs the filtered acquisition.
+    """
+    selected_archive = root / "selection-archive"
+    admin_endpoints = []
+    with server(binary, populated) as upstream_endpoint:
+        with server(
+            binary,
+            selected_archive,
+            actual_helper,
+            upstream_endpoint=upstream_endpoint,
+            admin_endpoints=admin_endpoints,
+        ):
+            admin_endpoint = admin_endpoints[0]
+            submitted = admin_call(
+                admin_endpoint,
+                "/api/admin/v1/jobs",
+                body={
+                    "kind": "prefetch",
+                    "repo_type": "model",
+                    "repo_id": REPO_ID,
+                    "revision": COMMIT,
+                    "include": ["config.json", "tokenizer.json"],
+                },
+                idempotency_key="hf-client-integration-selection",
+            )
+            assert submitted["include"] == ["config.json", "tokenizer.json"]
+            job = await_job(admin_endpoint, submitted["id"])
+            assert job["state"] == "completed", job
+            assert job["outcome"] == "published", job
+            assert job["total_files"] == 2, job
+
+    # Upstream is unavailable from here on: no helper and no HF_ENDPOINT.
+    with server(binary, selected_archive) as endpoint:
+        info = HfApi(endpoint=endpoint).repo_info(REPO_ID, revision=COMMIT)
+        assert sorted(sibling.rfilename for sibling in info.siblings) == [
+            "config.json",
+            "tokenizer.json",
+        ]
+        subset = Path(
+            snapshot_download(
+                repo_id=REPO_ID,
+                revision=COMMIT,
+                endpoint=endpoint,
+                local_dir=str(root / "selected-subset-client"),
+                allow_patterns=["config.json"],
+            )
+        )
+        assert (subset / "config.json").read_bytes() == (
+            b'{"model_type":"modelkeep-fixture"}'
+        )
+        assert not (subset / "tokenizer.json").exists()
+        whole = Path(download(endpoint, root / "selected-whole-client", COMMIT))
+        assert sorted(
+            entry.name for entry in whole.iterdir() if not entry.name.startswith(".")
+        ) == ["config.json", "tokenizer.json"]
+        assert (whole / "tokenizer.json").read_bytes() == b'{"version":"1.0"}'
 
 
 def main():
@@ -252,6 +446,11 @@ def main():
                     )
                     for relative, expected in expected_payloads.items():
                         assert (actual / relative).read_bytes() == expected
+
+            assert_cold_miss_deadline_is_retried_by_the_client(binary, helper, root)
+            assert_selected_subset_is_acquired_and_served(
+                binary, root, actual_helper, archive
+            )
 
             # Released archives can outlive the writer that created their manifest.
             # Simulate an old manifest that accidentally listed transient downloader

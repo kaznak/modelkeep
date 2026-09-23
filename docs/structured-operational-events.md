@@ -12,7 +12,7 @@ headers, bearer tokens, signed URLs, or upstream error payloads.
 | `archive_request` | INFO | `request_kind`, `repo_id`, `requested_revision`; file requests also have `path` |
 | `archive_hit` | INFO | request fields plus immutable `commit` |
 | `archive_miss` | INFO | request fields |
-| `upstream_fetch_started` | INFO | `repo_id`, `requested_revision`, `operation`, `resumed` |
+| `upstream_fetch_started` | INFO | `repo_id`, `requested_revision`, `operation`, `resumed`, `selected` |
 | `upstream_fetch_finished` | INFO | fetch fields plus immutable `commit` |
 | `upstream_fetch_failed` | WARN | fetch fields plus credential-safe `error_class` |
 | `archive_verification_failed` | WARN | `repo_id` and immutable `commit`, or `requested_revision` and `operation`; credential-safe `error_class` |

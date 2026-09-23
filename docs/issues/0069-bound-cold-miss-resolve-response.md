@@ -1,5 +1,5 @@
 ---
-status: open
+status: in-progress
 priority: P0
 related_adrs:
   - ADR-0005
@@ -10,7 +10,7 @@ updated: 2026-09-24
 ---
 # Issue 0069: Return a bounded, observable response for a cold-miss resolve
 
-- Status: Open
+- Status: In Progress
 - Priority: P0
 - Related ADR: ADR-0005, ADR-0008, ADR-0017
 
@@ -132,3 +132,33 @@ an in-flight acquisition on client disconnect can discard hours of transfer, so 
 interaction with ADR-0010 and ADR-0017 staging reuse must be decided deliberately. The
 bound does not by itself make large cold misses usable; that depends on acquisition
 granularity, tracked in Issue 0070.
+
+## Implementation status
+
+Implemented on 2026-09-24. Verified on x86_64-linux with `cargo fmt --check`,
+`cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`,
+and `nix flake check`, each with its exit status taken directly rather than through a
+pipe.
+
+A cold-miss resolve answers `503` with `Retry-After` after a configurable deadline,
+default eight seconds, while the acquisition continues on its own thread and a retry
+joins it instead of starting a second one. Both pinned clients retry that status and
+complete the download; the supported-client checks drive a real client through the
+deadline and require exactly one upstream acquisition.
+
+The metadata routes deliberately keep waiting by default. Measurement showed the
+supported clients retry no status there and do not time out, so bounding them would have
+turned a slow first download into an immediate failure for most repositories. An
+operator can bound them with `MODELKEEP_METADATA_COLD_MISS_DEADLINE_SECONDS`, and the
+documentation states the cost. The measurements are recorded in
+[`hugging-face-cold-miss-client-behavior-2026-09-24.md`](../observations/hugging-face-cold-miss-client-behavior-2026-09-24.md).
+
+The reported symptom had two causes. The larger one was that a single-file miss acquired
+the whole repository, which Issue 0070 fixed.
+
+`nix flake check` omits aarch64-linux as an incompatible system, so the QNAP release
+architecture is covered by the native GitHub Actions jobs, not by this run.
+
+**Remaining before this issue can close**: repeat the original reproduction on a
+quiescent QNAP instance, with no restart test in flight, and record the sanitized result
+here. That was not done in this work and cannot be done away from the deployment.

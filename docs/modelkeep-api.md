@@ -66,6 +66,17 @@ obtain authorization appropriate to that cost. Repository metadata for a revisio
 archive has never seen acquires the whole repository; a request for a single file the
 archive does not hold acquires that file.
 
+A client's own `--include` / `allow_patterns` does **not** narrow a first acquisition.
+The client reads repository metadata before it requests any file, and metadata for a
+revision the archive has never seen acquires the whole repository, so the filtering
+happens after ModelKeep has already paid for everything. Measured against both pinned
+clients: a filtered download of an unseen repository archives the full snapshot.
+
+To archive a subset, submit a filtered `prefetch` through the [Admin API](admin-api.md)
+and read it warm afterwards. Once a revision is published, a request for a path it does
+not hold acquires that path alone and adds it to the same revision, so filtering works
+from then on.
+
 The archive records what it holds and asserts nothing about upstream completeness
 ([`ADR-0020`](adr/0020-selection-scoped-revision-acquisition.md)). A revision may
 therefore hold a subset of the upstream repository — from a filtered prefetch through
