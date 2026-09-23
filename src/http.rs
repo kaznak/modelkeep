@@ -1,5 +1,9 @@
 use std::io::SeekFrom;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+use std::time::{Duration, Instant};
 
 use axum::{
     body::Body,
@@ -16,14 +20,74 @@ use tokio::{
 use tokio_util::io::ReaderStream;
 
 use crate::pullthrough::{PullThrough, PullThroughError};
+use crate::upstream::FetchProgress;
 use crate::{
     is_hf_commit, parse_range, Archive, ArchiveError, ByteRange, RangeError, RepositoryType,
 };
+
+/// Default bound on a cold-miss `resolve` response (Issue 0069).
+///
+/// Both supported clients abandon a `resolve` metadata request after ten
+/// seconds of silence: measured against `huggingface_hub` 0.36.0 and 1.27.0, a
+/// `HEAD` held for eleven seconds raises `ReadTimeoutError (read timeout=10)`
+/// in the client rather than delivering any status ModelKeep chose. Eight
+/// seconds keeps ModelKeep's documented answer inside that window with margin
+/// for a reverse proxy, while still letting a small file finish and stream
+/// normally.
+pub const DEFAULT_COLD_MISS_DEADLINE: Duration = Duration::from_secs(8);
+
+const COLD_MISS_PENDING_BODY: &str = "{\"error\":\"acquisition in progress\"}";
+
+/// How long a cold-miss `resolve` waits for acquisition before answering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColdMissPolicy {
+    /// `None` restores an unbounded wait, which holds the connection open with
+    /// no headers for the whole transfer.
+    pub deadline: Option<Duration>,
+}
+
+impl Default for ColdMissPolicy {
+    fn default() -> Self {
+        Self {
+            deadline: Some(DEFAULT_COLD_MISS_DEADLINE),
+        }
+    }
+}
+
+impl ColdMissPolicy {
+    pub fn from_env() -> Result<Self, String> {
+        Self::from_value(std::env::var("MODELKEEP_COLD_MISS_DEADLINE_SECONDS"))
+    }
+
+    fn from_value(value: Result<String, std::env::VarError>) -> Result<Self, String> {
+        match value {
+            Err(std::env::VarError::NotPresent) => Ok(Self::default()),
+            Err(error) => Err(format!(
+                "invalid MODELKEEP_COLD_MISS_DEADLINE_SECONDS: {error}"
+            )),
+            Ok(value) => {
+                let seconds = value.trim().parse::<u64>().map_err(|_| {
+                    "invalid MODELKEEP_COLD_MISS_DEADLINE_SECONDS: expected whole seconds"
+                        .to_string()
+                })?;
+                Ok(Self {
+                    deadline: (seconds > 0).then(|| Duration::from_secs(seconds)),
+                })
+            }
+        }
+    }
+
+    fn retry_after_seconds(&self) -> u64 {
+        self.deadline
+            .map_or(1, |deadline| deadline.as_secs().max(1))
+    }
+}
 
 #[derive(Clone)]
 pub struct HttpState {
     archive: Arc<Archive>,
     pullthrough: Option<Arc<PullThrough>>,
+    cold_miss: ColdMissPolicy,
 }
 pub async fn serve(archive: Archive, address: std::net::SocketAddr) -> std::io::Result<()> {
     serve_router(router(archive), address).await
@@ -34,7 +98,21 @@ pub async fn serve_with_pullthrough(
     pullthrough: Arc<PullThrough>,
     address: std::net::SocketAddr,
 ) -> std::io::Result<()> {
-    serve_router(router_with_pullthrough(archive, pullthrough), address).await
+    serve_with_pullthrough_and_policy(archive, pullthrough, ColdMissPolicy::default(), address)
+        .await
+}
+
+pub async fn serve_with_pullthrough_and_policy(
+    archive: Archive,
+    pullthrough: Arc<PullThrough>,
+    cold_miss: ColdMissPolicy,
+    address: std::net::SocketAddr,
+) -> std::io::Result<()> {
+    serve_router(
+        router_with_pullthrough_and_policy(archive, pullthrough, cold_miss),
+        address,
+    )
+    .await
 }
 
 async fn serve_router(router: Router, address: std::net::SocketAddr) -> std::io::Result<()> {
@@ -83,13 +161,23 @@ pub fn router(archive: Archive) -> Router {
     router_with_state(HttpState {
         archive: Arc::new(archive),
         pullthrough: None,
+        cold_miss: ColdMissPolicy::default(),
     })
 }
 
 pub fn router_with_pullthrough(archive: Archive, pullthrough: Arc<PullThrough>) -> Router {
+    router_with_pullthrough_and_policy(archive, pullthrough, ColdMissPolicy::default())
+}
+
+pub fn router_with_pullthrough_and_policy(
+    archive: Archive,
+    pullthrough: Arc<PullThrough>,
+    cold_miss: ColdMissPolicy,
+) -> Router {
     router_with_state(HttpState {
         archive: Arc::new(archive),
         pullthrough: Some(pullthrough),
+        cold_miss,
     })
 }
 
@@ -443,15 +531,49 @@ async fn file_response(
             let Some(pullthrough) = state.pullthrough.clone() else {
                 return Err(StatusCode::NOT_FOUND);
             };
+            let request_kind = if head_only { "head_file" } else { "get_file" };
             let requested = revision.clone();
             let requested_file = path.clone();
             let repo = repo_id.clone();
+            let deadline = state.cold_miss.deadline.map(|bound| Instant::now() + bound);
+            // The acquisition runs on its own thread inside the flight. This
+            // wait is bounded, so giving up here neither cancels the transfer
+            // nor holds the Tokio runtime open past the deadline.
+            let acquired_bytes = Arc::new(AtomicU64::new(0));
+            let observed_bytes = Arc::clone(&acquired_bytes);
+            let progress_repo_id = repo_id.clone();
+            let progress_revision = revision.clone();
+            let progress_path = path.clone();
             let commit = task::spawn_blocking(move || {
-                pullthrough.ensure_for_type(repo_type, &repo, &requested, &[requested_file])
+                let progress = move |event: FetchProgress| {
+                    let Some(acquired) = advanced_bytes(&event, &observed_bytes) else {
+                        return;
+                    };
+                    tracing::info!(event = "acquisition_progress", request_kind, repo_type = %repo_type, repo_id = %progress_repo_id, requested_revision = %progress_revision, path = %progress_path, phase = %event.phase, acquired_bytes = acquired, total_bytes = event.total, "cold-miss acquisition is transferring bytes");
+                };
+                pullthrough.ensure_bounded_for_type(
+                    repo_type,
+                    &repo,
+                    &requested,
+                    &[requested_file],
+                    deadline,
+                    &progress,
+                )
             })
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
             .map_err(status_for_pullthrough_error)?;
+            let Some(commit) = commit else {
+                let deadline_seconds = state
+                    .cold_miss
+                    .deadline
+                    .map_or(0, |deadline| deadline.as_secs());
+                tracing::warn!(event = "acquisition_deadline_exceeded", request_kind, repo_type = %repo_type, repo_id = %repo_id, requested_revision = %revision, path = %path, deadline_seconds, acquired_bytes = acquired_bytes.load(Ordering::Relaxed), "cold-miss acquisition exceeded the response deadline and continues in the background");
+                return cold_miss_pending_response(
+                    head_only,
+                    state.cold_miss.retry_after_seconds(),
+                );
+            };
             let resolved = state
                 .archive
                 .resolve_file_for_type(repo_type, &repo_id, &commit, &path)
@@ -509,6 +631,44 @@ async fn file_response(
     };
     response
         .body(body)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// The byte count to report when an acquisition event shows real movement.
+///
+/// A repeated or lower counter says the acquisition is alive, not that it is
+/// advancing; reporting it as progress is the defect Issue 0068 names, so only
+/// a strictly higher byte count than anything seen before is progress.
+fn advanced_bytes(event: &FetchProgress, observed: &AtomicU64) -> Option<u64> {
+    if event.unit.as_deref() != Some("bytes") {
+        return None;
+    }
+    let completed = event.completed?;
+    (completed > observed.fetch_max(completed, Ordering::Relaxed)).then_some(completed)
+}
+
+/// The documented cold-miss answer once the deadline passes.
+///
+/// `503` with `Retry-After` is the only candidate both supported clients retry
+/// on their own: measured against `huggingface_hub` 0.36.0 and 1.27.0, both
+/// repeat the `resolve` request after `503`, only 1.27.0 retries `429`, and
+/// neither retries `425`. Each retry joins the acquisition that is still
+/// running, so no retry starts a second download.
+fn cold_miss_pending_response(
+    head_only: bool,
+    retry_after_seconds: u64,
+) -> Result<Response, StatusCode> {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(header::RETRY_AFTER, retry_after_seconds.to_string())
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_LENGTH, COLD_MISS_PENDING_BODY.len())
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(if head_only {
+            Body::empty()
+        } else {
+            Body::from(COLD_MISS_PENDING_BODY)
+        })
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
@@ -1383,5 +1543,459 @@ mod tests {
             status_for_pullthrough_error(PullThroughError::UnsafePath),
             StatusCode::BAD_REQUEST
         );
+    }
+
+    const COLD_MISS_COMMIT: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    struct Gate {
+        open: Mutex<bool>,
+        changed: std::sync::Condvar,
+    }
+
+    impl Gate {
+        fn new() -> Self {
+            Self {
+                open: Mutex::new(false),
+                changed: std::sync::Condvar::new(),
+            }
+        }
+
+        fn wait(&self) {
+            let mut open = self.open.lock().unwrap();
+            while !*open {
+                open = self.changed.wait(open).unwrap();
+            }
+        }
+
+        fn release(&self) {
+            *self.open.lock().unwrap() = true;
+            self.changed.notify_all();
+        }
+    }
+
+    /// An upstream that reports byte movement and then blocks until released,
+    /// standing in for a transfer that cannot finish inside a response.
+    struct GatedFetcher {
+        gate: Arc<Gate>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::upstream::UpstreamFetcher for GatedFetcher {
+        fn fetch(
+            &self,
+            request: &crate::upstream::FetchRequest,
+        ) -> Result<crate::upstream::FetchedRevision, crate::upstream::UpstreamError> {
+            self.fetch_with_progress(request, &|_| {})
+        }
+
+        fn fetch_with_progress(
+            &self,
+            request: &crate::upstream::FetchRequest,
+            progress: &(dyn Fn(FetchProgress) + Send + Sync),
+        ) -> Result<crate::upstream::FetchedRevision, crate::upstream::UpstreamError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let bytes = |completed: u64| FetchProgress {
+                version: 1,
+                phase: "downloading_files".into(),
+                unit: Some("bytes".into()),
+                completed: Some(completed),
+                total: Some(9),
+            };
+            progress(bytes(0));
+            progress(bytes(4));
+            // A counter that does not move is liveness, never progress.
+            progress(bytes(4));
+            self.gate.wait();
+            std::fs::write(request.staging.join("config.json"), b"cold-http").unwrap();
+            Ok(crate::upstream::FetchedRevision {
+                commit: COLD_MISS_COMMIT.into(),
+                files: vec!["config.json".into()],
+                staging: request.staging.clone(),
+            })
+        }
+    }
+
+    struct ColdMissFixture {
+        directory: tempfile::TempDir,
+        archive: Archive,
+        pullthrough: Arc<PullThrough>,
+        gate: Arc<Gate>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ColdMissFixture {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let archive = Archive::new(directory.path()).unwrap();
+            let gate = Arc::new(Gate::new());
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let pullthrough = Arc::new(PullThrough::new(
+                archive.clone(),
+                Arc::new(GatedFetcher {
+                    gate: Arc::clone(&gate),
+                    calls: Arc::clone(&calls),
+                }),
+            ));
+            Self {
+                directory,
+                archive,
+                pullthrough,
+                gate,
+                calls,
+            }
+        }
+
+        fn router(&self, deadline: Duration) -> Router {
+            router_with_pullthrough_and_policy(
+                self.archive.clone(),
+                Arc::clone(&self.pullthrough),
+                ColdMissPolicy {
+                    deadline: Some(deadline),
+                },
+            )
+        }
+
+        fn acquisitions(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        /// How many acquisitions ran, once the flight has reached upstream.
+        ///
+        /// The flight starts on its own thread, so a loaded machine can answer
+        /// the bounded request before that thread gets there; waiting for it
+        /// keeps "exactly one acquisition" an assertion about the flight rather
+        /// than about scheduling.
+        fn started_acquisitions(&self) -> usize {
+            for _ in 0..3000 {
+                if self.acquisitions() > 0 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            self.acquisitions()
+        }
+
+        fn staging_directories(&self) -> Vec<String> {
+            std::fs::read_dir(self.directory.path().join("tmp"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with(".fetch-active-"))
+                .collect()
+        }
+
+        /// Lets the acquisition finish and waits until it has published.
+        fn settle(&self) {
+            self.gate.release();
+            for _ in 0..3000 {
+                if self
+                    .archive
+                    .is_complete_revision("org/model", COLD_MISS_COMMIT)
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("the acquisition did not publish after being released");
+        }
+    }
+
+    fn cold_miss_request(method: Method, uri: &str) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_cold_miss_resolve_answers_within_the_deadline_and_keeps_acquiring() {
+        let (logs, _guard) = capture_logs("info");
+        let fixture = ColdMissFixture::new();
+        let app = fixture.router(Duration::from_millis(200));
+        let started = Instant::now();
+        let response = app
+            .oneshot(cold_miss_request(
+                Method::GET,
+                "/org/model/resolve/main/config.json",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the cold miss was not bounded: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(fixture.started_acquisitions(), 1);
+        let output = logs.output();
+        assert!(output.contains("archive_miss"), "{output}");
+        assert!(output.contains("acquisition_deadline_exceeded"), "{output}");
+
+        // The acquisition was never cancelled, so it still publishes.
+        fixture.settle();
+        assert_eq!(fixture.acquisitions(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_retry_joins_the_running_acquisition_and_is_served_once_it_finishes() {
+        let fixture = ColdMissFixture::new();
+        let impatient = fixture.router(Duration::from_millis(100));
+        let patient = fixture.router(Duration::from_secs(30));
+
+        let bounded = impatient
+            .oneshot(cold_miss_request(
+                Method::GET,
+                "/org/model/resolve/main/config.json",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(bounded.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(fixture.started_acquisitions(), 1);
+
+        let gate = Arc::clone(&fixture.gate);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            gate.release();
+        });
+        let served = patient
+            .oneshot(cold_miss_request(
+                Method::GET,
+                "/org/model/resolve/main/config.json",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(served.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(served.into_body(), usize::MAX).await.unwrap(),
+            "cold-http"
+        );
+        // The retry joined the flight rather than starting a second download.
+        assert_eq!(fixture.acquisitions(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_cold_misses_are_all_bounded_and_share_one_acquisition() {
+        let fixture = ColdMissFixture::new();
+        let app = fixture.router(Duration::from_millis(200));
+        let started = Instant::now();
+        let mut requests = Vec::new();
+        for _ in 0..4 {
+            let app = app.clone();
+            requests.push(tokio::spawn(async move {
+                app.oneshot(cold_miss_request(
+                    Method::GET,
+                    "/org/model/resolve/main/config.json",
+                ))
+                .await
+                .unwrap()
+                .status()
+            }));
+        }
+        for request in requests {
+            assert_eq!(
+                request.await.unwrap(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "every concurrent cold miss must be bounded"
+            );
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "concurrent cold misses were not bounded: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(fixture.started_acquisitions(), 1);
+        fixture.settle();
+        assert_eq!(fixture.acquisitions(), 1);
+    }
+
+    #[tokio::test]
+    async fn head_obeys_the_same_cold_miss_deadline_as_get() {
+        let fixture = ColdMissFixture::new();
+        let app = fixture.router(Duration::from_millis(200));
+        let response = app
+            .oneshot(cold_miss_request(
+                Method::HEAD,
+                "/org/model/resolve/main/config.json",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(fixture.started_acquisitions(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_cold_miss_that_reaches_its_deadline_publishes_nothing_and_keeps_staging() {
+        let fixture = ColdMissFixture::new();
+        let app = fixture.router(Duration::from_millis(200));
+        let response = app
+            .clone()
+            .oneshot(cold_miss_request(
+                Method::GET,
+                "/org/model/resolve/main/config.json",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Nothing partial became observable as a completed object.
+        assert!(fixture
+            .archive
+            .list_revisions("org/model")
+            .unwrap()
+            .is_empty());
+        assert!(fixture
+            .archive
+            .resolve_file("org/model", COLD_MISS_COMMIT, "config.json")
+            .is_err());
+        assert!(!fixture
+            .archive
+            .is_complete_revision("org/model", COLD_MISS_COMMIT)
+            .unwrap_or(false));
+        // The transfer keeps its identified staging (ADR-0017) rather than
+        // being orphaned by the caller giving up.
+        assert_eq!(fixture.started_acquisitions(), 1);
+        assert_eq!(
+            fixture.staging_directories().len(),
+            1,
+            "the interrupted request must leave exactly one resumable staging directory"
+        );
+
+        fixture.settle();
+        let served = app
+            .oneshot(cold_miss_request(
+                Method::GET,
+                "/org/model/resolve/main/config.json",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(served.status(), StatusCode::OK);
+        assert!(fixture.staging_directories().is_empty());
+    }
+
+    /// Fixes the measured reaction of the supported clients to the candidate
+    /// statuses (`huggingface_hub` 0.36.0 and 1.27.0, 2026-09-24):
+    ///
+    /// - `503`: both clients repeat the `resolve` request on their own. 0.36.0
+    ///   backs off 1s, 2s, 4s, 8s, 8s; 1.27.0 follows `Retry-After` instead of
+    ///   its own backoff.
+    /// - `429`: only 1.27.0 retries; 0.36.0 fails on the first response.
+    /// - `425`: neither client retries.
+    /// - holding the request open instead: both clients abandon the `resolve`
+    ///   `HEAD` after 10 s with `ReadTimeoutError (read timeout=10)`, which is
+    ///   the `status=000` the issue reports.
+    ///
+    /// So the answer is `503` with `Retry-After`, produced inside the client's
+    /// 10-second window.
+    #[test]
+    fn the_cold_miss_deadline_answers_with_the_status_supported_clients_retry() {
+        assert!(
+            DEFAULT_COLD_MISS_DEADLINE < Duration::from_secs(10),
+            "the default deadline must answer inside the clients' 10-second resolve timeout"
+        );
+        assert_eq!(
+            ColdMissPolicy::default().retry_after_seconds(),
+            DEFAULT_COLD_MISS_DEADLINE.as_secs()
+        );
+        for head_only in [false, true] {
+            let response = cold_miss_pending_response(head_only, 8).unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()[header::RETRY_AFTER], "8");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_archived_file_is_served_without_entering_the_acquisition_path() {
+        let fixture = ColdMissFixture::new();
+        fixture
+            .archive
+            .publish_revision(crate::PublishRequest {
+                repo_id: "org/model".into(),
+                requested_revision: "main".into(),
+                commit: COLD_MISS_COMMIT.into(),
+                files: vec![crate::ArchiveFile {
+                    path: "config.json".into(),
+                    bytes: b"already-archived".to_vec(),
+                }],
+            })
+            .unwrap();
+        fixture
+            .archive
+            .update_ref("org/model", "main", COLD_MISS_COMMIT)
+            .unwrap();
+        // The gate is never released: a warm read that entered the miss path
+        // would block instead of answering.
+        let app = fixture.router(Duration::from_secs(30));
+        let started = Instant::now();
+        let response = app
+            .oneshot(cold_miss_request(
+                Method::GET,
+                "/org/model/resolve/main/config.json",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+            "already-archived"
+        );
+        assert_eq!(fixture.acquisitions(), 0);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a warm read must not wait on acquisition: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn only_byte_movement_counts_as_acquisition_progress() {
+        let observed = AtomicU64::new(0);
+        let bytes = |completed: Option<u64>| FetchProgress {
+            version: 1,
+            phase: "downloading_files".into(),
+            unit: Some("bytes".into()),
+            completed,
+            total: Some(16),
+        };
+        assert_eq!(advanced_bytes(&bytes(Some(0)), &observed), None);
+        assert_eq!(advanced_bytes(&bytes(Some(8)), &observed), Some(8));
+        assert_eq!(advanced_bytes(&bytes(Some(8)), &observed), None);
+        assert_eq!(advanced_bytes(&bytes(Some(3)), &observed), None);
+        assert_eq!(advanced_bytes(&bytes(None), &observed), None);
+        assert_eq!(advanced_bytes(&bytes(Some(9)), &observed), Some(9));
+        assert_eq!(
+            advanced_bytes(&FetchProgress::phase("acquiring_snapshot"), &observed),
+            None
+        );
+    }
+
+    #[test]
+    fn the_cold_miss_deadline_is_configured_in_whole_seconds() {
+        assert_eq!(
+            ColdMissPolicy::from_value(Err(std::env::VarError::NotPresent)).unwrap(),
+            ColdMissPolicy::default()
+        );
+        assert_eq!(
+            ColdMissPolicy::from_value(Ok("30".into()))
+                .unwrap()
+                .deadline,
+            Some(Duration::from_secs(30))
+        );
+        // Zero restores the unbounded wait for an operator who wants it.
+        assert_eq!(
+            ColdMissPolicy::from_value(Ok("0".into())).unwrap().deadline,
+            None
+        );
+        assert!(ColdMissPolicy::from_value(Ok("soon".into())).is_err());
+        assert!(ColdMissPolicy::from_value(Ok("-1".into())).is_err());
     }
 }

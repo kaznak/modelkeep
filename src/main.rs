@@ -357,16 +357,32 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 _ => None,
             };
             let admin_config = admin::Config::from_env()?;
+            let cold_miss = http::ColdMissPolicy::from_env().map_err(|error| {
+                tracing::error!(
+                    event = "configuration_failed",
+                    field = "cold_miss_deadline",
+                    error = %error,
+                    "invalid cold-miss deadline"
+                );
+                error
+            })?;
             tracing::info!(
                 event = "startup_configuration",
                 pullthrough_enabled = upstream.is_some(),
                 management_enabled = admin_config.is_some(),
+                cold_miss_deadline_seconds =
+                    cold_miss.deadline.map_or(0, |deadline| deadline.as_secs()),
                 "startup configuration loaded"
             );
             match (upstream, admin_config) {
                 (Some(pullthrough), Some(config)) => {
                     tokio::try_join!(
-                        http::serve_with_pullthrough(archive.clone(), pullthrough.clone(), bind),
+                        http::serve_with_pullthrough_and_policy(
+                            archive.clone(),
+                            pullthrough.clone(),
+                            cold_miss,
+                            bind
+                        ),
                         admin::serve(archive, Some(pullthrough), config)
                     )?;
                 }
@@ -377,7 +393,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     )?;
                 }
                 (Some(pullthrough), None) => {
-                    http::serve_with_pullthrough(archive, pullthrough, bind).await?
+                    http::serve_with_pullthrough_and_policy(archive, pullthrough, cold_miss, bind)
+                        .await?
                 }
                 (None, None) => http::serve(archive, bind).await?,
             }

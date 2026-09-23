@@ -1,7 +1,8 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Instant;
 
-use crate::singleflight::SingleFlight;
+use crate::singleflight::{Joined, SingleFlight};
 use crate::upstream::{
     FetchProgress, FetchRequest, FileSelection, InvalidOutputReason, InventoryRequest,
     UpstreamError, UpstreamFetcher,
@@ -16,12 +17,17 @@ use crate::{is_hf_commit, Archive, ArchiveError, RepositoryType, SourceFile};
 /// whose revision does not hold the file they asked for.
 type FlightKey = (RepositoryType, String, String, String);
 
+type AcquisitionFlights =
+    SingleFlight<FlightKey, AcquisitionResult, PullThroughError, FetchProgress>;
+type RefreshFlights =
+    SingleFlight<(String, String, bool), RefreshResult, PullThroughError, FetchProgress>;
+
 #[derive(Clone)]
 pub struct PullThrough {
     archive: Archive,
     fetcher: Arc<dyn UpstreamFetcher>,
-    flights: Arc<SingleFlight<FlightKey, AcquisitionResult, PullThroughError>>,
-    refresh_flights: Arc<SingleFlight<(String, String, bool), RefreshResult, PullThroughError>>,
+    flights: Arc<AcquisitionFlights>,
+    refresh_flights: Arc<RefreshFlights>,
 }
 
 /// What one acquisition did to the archive.
@@ -149,6 +155,36 @@ impl PullThrough {
         files: &[String],
         progress: &(dyn Fn(FetchProgress) + Send + Sync),
     ) -> Result<String, PullThroughError> {
+        self.ensure_bounded_for_type(
+            repo_type,
+            repo_id,
+            requested_revision,
+            files,
+            None,
+            progress,
+        )
+        .map(|commit| commit.expect("an acquisition joined without a deadline cannot time out"))
+    }
+
+    /// Serve-driven acquisition that gives up waiting at `deadline`.
+    ///
+    /// `Ok(None)` means the deadline elapsed while the acquisition was still
+    /// running (Issue 0069). Nothing is published and nothing is cancelled: the
+    /// flight keeps running on its own thread, so already transferred bytes
+    /// survive the caller giving up and a later request joins the same flight
+    /// instead of starting a second download.
+    ///
+    /// `deadline: None` waits for the result, which is what a management job
+    /// needs in order to record a terminal state.
+    pub fn ensure_bounded_for_type(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        requested_revision: &str,
+        files: &[String],
+        deadline: Option<Instant>,
+        progress: &(dyn Fn(FetchProgress) + Send + Sync),
+    ) -> Result<Option<String>, PullThroughError> {
         let selection =
             FileSelection::from_paths(files).map_err(|_| PullThroughError::UnsafePath)?;
         let required = selection.required_paths();
@@ -157,11 +193,11 @@ impl PullThrough {
                 .resolve_ref_for_type(repo_type, repo_id, requested_revision)
         {
             if self.revision_is_ready(repo_type, repo_id, &commit, &required) {
-                return Ok(commit);
+                return Ok(Some(commit));
             }
         }
         if self.revision_is_ready(repo_type, repo_id, requested_revision, &required) {
-            return Ok(requested_revision.to_string());
+            return Ok(Some(requested_revision.to_string()));
         }
         self.run_acquisition(
             repo_type,
@@ -169,9 +205,10 @@ impl PullThrough {
             requested_revision,
             &selection,
             false,
+            deadline,
             progress,
         )
-        .map(|result| result.commit)
+        .map(|result| result.map(|result| result.commit))
     }
 
     /// Selection-driven acquisition (ADR-0020 decision 1).
@@ -210,10 +247,19 @@ impl PullThrough {
             requested_revision,
             selection,
             true,
+            None,
             progress,
         )
+        .map(|result| result.expect("an acquisition joined without a deadline cannot time out"))
     }
 
+    /// Starts or joins the acquisition for this selection.
+    ///
+    /// The acquisition body runs on the flight's own thread and reports through
+    /// the sink the flight provides; the caller's `progress` callback is
+    /// invoked by this thread as it observes those events, so a borrowed
+    /// callback never outlives its caller.
+    #[allow(clippy::too_many_arguments)]
     fn run_acquisition(
         &self,
         repo_type: RepositoryType,
@@ -221,8 +267,9 @@ impl PullThrough {
         requested_revision: &str,
         selection: &FileSelection,
         reconcile: bool,
+        deadline: Option<Instant>,
         progress: &(dyn Fn(FetchProgress) + Send + Sync),
-    ) -> Result<AcquisitionResult, PullThroughError> {
+    ) -> Result<Option<AcquisitionResult>, PullThroughError> {
         let key = (
             repo_type,
             repo_id.to_string(),
@@ -231,29 +278,50 @@ impl PullThrough {
             // join cannot make two different selections share one key.
             selection.identity().join("\n"),
         );
-        let repo_id = repo_id.to_string();
-        let requested_revision = requested_revision.to_string();
+        let owned_repo_id = repo_id.to_string();
+        let owned_revision = requested_revision.to_string();
         let selection = selection.clone();
         let this = self.clone();
-        self.flights.run(key, move || {
-            if reconcile {
-                this.acquire_reconciled(
-                    repo_type,
-                    &repo_id,
-                    &requested_revision,
-                    &selection,
-                    progress,
-                )
-            } else {
-                this.fetch_and_publish(
-                    repo_type,
-                    &repo_id,
-                    &requested_revision,
-                    &selection,
-                    progress,
-                )
+        // The acquisition keeps the starting caller's log destination: its
+        // lifecycle events are the operational record of the transfer and must
+        // not disappear because it moved off the request thread.
+        let dispatch = tracing::dispatcher::get_default(tracing::Dispatch::clone);
+        let joined = self.flights.join(
+            key,
+            move |sink| {
+                tracing::dispatcher::with_default(&dispatch, || {
+                    if reconcile {
+                        this.acquire_reconciled(
+                            repo_type,
+                            &owned_repo_id,
+                            &owned_revision,
+                            &selection,
+                            sink,
+                        )
+                    } else {
+                        this.fetch_and_publish(
+                            repo_type,
+                            &owned_repo_id,
+                            &owned_revision,
+                            &selection,
+                            sink,
+                        )
+                    }
+                })
+            },
+            deadline,
+            &|event| progress(event),
+        );
+        match joined {
+            Joined::Completed(result) => result.map(Some),
+            Joined::Pending => Ok(None),
+            Joined::Abandoned => {
+                // Only a bug in the acquisition body can reach this. It is an
+                // internal failure, never a miss and never a partial result.
+                tracing::error!(event = "acquisition_abandoned", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %requested_revision, "acquisition thread ended without a result");
+                Err(PullThroughError::Conflict)
             }
-        })
+        }
     }
 
     /// Acquires a selection against a revision that may already be published.
@@ -433,12 +501,32 @@ impl PullThrough {
             reference.to_string(),
             dry_run,
         );
-        self.refresh_flights.run(key, || {
-            // Joined callers receive the same final result. Progress belongs to the
-            // leader callback; followers remain in their acquiring phase until the
-            // shared operation completes.
-            self.refresh_once(repo_type, repo_id, reference, dry_run, progress)
-        })
+        let owned_repo_id = repo_id.to_string();
+        let owned_reference = reference.to_string();
+        let this = self.clone();
+        let dispatch = tracing::dispatcher::get_default(tracing::Dispatch::clone);
+        // A refresh always waits for its result: it is driven by a management
+        // job whose record must reach a terminal state.
+        let joined = self.refresh_flights.join(
+            key,
+            move |sink| {
+                tracing::dispatcher::with_default(&dispatch, || {
+                    this.refresh_once(repo_type, &owned_repo_id, &owned_reference, dry_run, sink)
+                })
+            },
+            None,
+            &|event| progress(event),
+        );
+        match joined {
+            Joined::Completed(result) => result,
+            Joined::Pending => {
+                unreachable!("a refresh joined without a deadline cannot time out")
+            }
+            Joined::Abandoned => {
+                tracing::error!(event = "acquisition_abandoned", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %reference, "refresh thread ended without a result");
+                Err(PullThroughError::Conflict)
+            }
+        }
     }
 
     fn refresh_once(
@@ -2003,6 +2091,51 @@ mod tests {
             );
         }
         assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_bounded_acquisition_gives_up_waiting_without_cancelling_the_transfer() {
+        let commit = "cccccccccccccccccccccccccccccccccccccccc";
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let mut fetcher = SelectiveFetcher::new(commit, &[("config.json", b"config")]);
+        fetcher.delay = Duration::from_millis(300);
+        let fetcher = Arc::new(fetcher);
+        let requests = fetcher.requests.clone();
+        let pull = PullThrough::new(archive.clone(), fetcher);
+        let files = ["config.json".to_string()];
+
+        // The deadline elapses first, and nothing is published yet.
+        assert_eq!(
+            pull.ensure_bounded_for_type(
+                RepositoryType::Model,
+                "org/model",
+                "main",
+                &files,
+                Some(Instant::now() + Duration::from_millis(20)),
+                &|_| {},
+            ),
+            Ok(None)
+        );
+        assert!(archive.list_revisions("org/model").unwrap().is_empty());
+
+        // A retry joins the transfer that is still running rather than starting
+        // a second one, and is answered once it completes.
+        assert_eq!(
+            pull.ensure_bounded_for_type(
+                RepositoryType::Model,
+                "org/model",
+                "main",
+                &files,
+                Some(Instant::now() + Duration::from_secs(30)),
+                &|_| {},
+            ),
+            Ok(Some(commit.to_string()))
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert!(archive
+            .resolve_file("org/model", commit, "config.json")
+            .is_ok());
     }
 
     #[test]
