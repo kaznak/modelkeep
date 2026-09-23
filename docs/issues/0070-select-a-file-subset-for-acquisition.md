@@ -73,7 +73,8 @@ transfers the whole repository and then fails at publication, because
 `revisions/<commit>` already exists and the publication path refuses it
 (`src/lib.rs:1121`), while `revision_is_ready` cannot short-circuit it either, since the
 requested file is absent. The result is a full transfer that archives nothing and
-returns an error.
+returns an error. The same trap already exists today for any revision that does not hold
+every upstream file, such as one produced by `import-hf-cache`.
 
 Honouring the requested path in pull-through therefore requires adding files to an
 already published revision, which requires the monotonic extension operation. The four
@@ -83,10 +84,11 @@ work items below are one reviewable unit.
 
 ADR-0008 forbade a file filter and deferred per-file acquisition. ADR-0020 (proposed)
 specifies the deferred semantics and partially supersedes it: a manifest records
-`coverage: "snapshot" | "selection"` plus the normalized selection; `complete` keeps its
-existing publication-integrity meaning, so the four serving gates are unchanged;
-coverage is consulted by acquisition; and a selection-scoped revision's file set may
-grow but never change.
+`coverage: "snapshot" | "partial"` plus the normalized selection as provenance;
+`complete` keeps its existing publication-integrity meaning, so the four serving gates
+are unchanged; a revision's file set may grow but never change; and extension is
+unconditional, so a revision that wrongly claims snapshot coverage is corrected the
+first time a missing file is requested rather than by an upstream audit.
 
 **This issue is blocked on ADR-0020 being accepted.** If a decision there changes, this
 issue changes with it.
@@ -117,8 +119,9 @@ issue changes with it.
 
 4. **Monotonic extension.** Adding files to an already published revision: write the new
    files durably, then atomically replace the manifest with a superset. The existing
-   `fs::rename`-onto-`revisions/<commit>` publication cannot be reused. Extending a
-   `coverage: "snapshot"` revision is refused.
+   `fs::rename`-onto-`revisions/<commit>` publication cannot be reused. Extension is
+   never refused on the basis of recorded coverage; extending a `coverage: "snapshot"`
+   revision re-records it as `partial` and emits a structured event.
 
 ## Write scope
 
@@ -143,8 +146,8 @@ issue changes with it.
   jobs.
 - A filtered prefetch transfers only matching files, and `total_bytes` / `total_files`
   describe the filtered set, so progress is measured against what is being transferred.
-- The published revision records `coverage: "selection"` with the normalized selection
-  and `complete: true`, and is served through the unchanged serving gates.
+- The published revision records `coverage: "partial"` with the normalized selection as
+  provenance and `complete: true`, and is served through the unchanged serving gates.
 - A real supported client downloads the archived subset while upstream is unavailable,
   and repository metadata reports the archived set and the selection scope.
 - A resolve for a path outside the selection acquires that path only, extends the
@@ -152,8 +155,9 @@ issue changes with it.
   overwrites or removes a published path.
 - An induced crash during an extension leaves either the old or the new manifest live,
   and no file absent from the live manifest is ever served.
-- Extending a `coverage: "snapshot"` revision is refused with an operationally
-  meaningful error.
+- Extending a revision recorded as `coverage: "snapshot"` succeeds, re-records it as
+  `partial`, and emits a structured event; a legacy revision that does not hold every
+  upstream file is corrected by that path without an upstream audit.
 - Interrupting a filtered acquisition publishes nothing partial; a retry adopts only
   staging whose recorded selection matches, and staging under a different selection is
   discarded rather than resumed.
@@ -170,11 +174,12 @@ nix flake check
 ```
 
 Unit tests for selection normalization, unsafe-pattern rejection, idempotency-key
-derivation, manifest coverage round-tripping, legacy manifests with no `coverage` field,
-and refusal to extend a snapshot-coverage revision. Integration tests with both
+derivation, manifest coverage round-tripping, and legacy manifests with no `coverage`
+field. Integration tests with both
 supported real `hf` / `huggingface_hub` versions for filtered cold acquisition, warm and
 offline retrieval of the subset, metadata listing, a resolve for a path outside the
-selection, crash during an extension, and staging-selection mismatch. Run the supported
+selection, extension of a legacy snapshot-coverage revision, crash during an extension,
+and staging-selection mismatch. Run the supported
 real-client suite, since this changes the compatibility surface. Before closing, record
 one sanitized QNAP measurement of a filtered prefetch against the same repository,
 including transferred bytes and peak staging usage.

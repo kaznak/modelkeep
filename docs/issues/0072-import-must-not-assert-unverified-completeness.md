@@ -22,20 +22,18 @@ snapshot.
 
 `import_hf_cache` walks each `snapshots/<commit>` directory of a local Hugging Face
 cache and publishes exactly the files it finds (`src/importer.rs`), and `write_manifest`
-emits `"complete":true` unconditionally (`src/lib.rs:1625`). Nothing compares the
-imported file set against upstream repository metadata for that commit.
+emits `"complete":true` unconditionally (`src/lib.rs:1625`). Nothing establishes that
+the cache held every upstream file for that commit, and nothing could: the import reads
+a local directory, and the files it is missing are exactly the ones it has no record of.
 
 A cache produced by `hf download <repo> --include '<pattern>'`, or any cache whose
 download was interrupted, therefore becomes a revision that claims to be a complete
-snapshot. ModelKeep then serves it as complete, and `is_complete_revision_for_type`
-reports it as complete to the pull-through readiness check.
+snapshot. ModelKeep then reports that coverage to clients, so an unfiltered client
+download retrieves the subset while the archive asserts it holds the repository.
 
-This is the exact failure ADR-0008 was written to prevent — "publishing the requested
-file as the revision would make later requests mistake a partial acquisition for a
-complete archive" — occurring at the import boundary rather than the acquisition
-boundary. It also interacts with Issue 0070: a mislabeled import claims
-`coverage: "snapshot"`, and ADR-0020 refuses to extend such a revision, so a later
-request for a file the cache never held cannot be satisfied by extension.
+This is the failure ADR-0008 was written to prevent — "publishing the requested file as
+the revision would make later requests mistake a partial acquisition for a complete
+archive" — occurring at the import boundary rather than the acquisition boundary.
 
 ## Reproduction (executed 2026-09-24, v0.4.7 debug binary)
 
@@ -64,28 +62,25 @@ at it.
 
 ## Write scope
 
-- `src/importer.rs` completeness determination;
-- `src/lib.rs` manifest scope emission, shared with Issue 0070;
-- an explicit administrative path for re-labelling already imported revisions;
+- `src/importer.rs` coverage determination;
+- `src/lib.rs` manifest coverage emission, shared with Issue 0070;
 - `docs/admin-api.md` or the deployment documentation that owns the import procedure.
 
 ## Do not touch
 
 - imported bytes; no re-download and no rewrite of archived files;
-- automatic correction of existing revisions. Re-labelling is an explicit
-  administrative action, per core invariant 4 and ADR-0007.
+- revisions imported before this change. Under ADR-0020 extension is unconditional, so a
+  legacy revision is corrected when a missing file is first requested; no migration pass
+  and no upstream audit is required.
 
 ## Acceptance criteria
 
-- An import that cannot verify the file set against upstream metadata for the commit
-  records the revision with `coverage: "selection"` under ADR-0020, not as a snapshot.
-- An import that does verify the file set records `coverage: "snapshot"`, and the check
-  is exercised by a test.
-- Import remains possible with upstream unavailable; it records the weaker scope rather
-  than failing, and says so in its report.
-- Revisions imported before this change keep their recorded value. An explicit
-  administrative command can re-evaluate and re-label them, and it is documented.
-- `ImportReport` distinguishes verified-snapshot from selection-scoped imports.
+- An import records `coverage: "partial"` under ADR-0020. It never asserts a snapshot.
+- `ImportReport` states that imported revisions are recorded as partial.
+- Import remains possible with upstream unavailable, because it never contacts upstream.
+- A later request for a file an imported revision does not hold extends that revision
+  rather than re-acquiring the repository.
+- The import procedure documentation states what coverage an import records and why.
 
 ## Verification
 
@@ -96,16 +91,12 @@ nix develop -c cargo test --all-features
 nix flake check
 ```
 
-Add tests importing a cache produced with `--include` against fixture upstream
-metadata, an interrupted cache, a verified complete cache, and an import with upstream
-unavailable. Confirm that a selection-scoped imported revision is served for the paths
-it holds and triggers acquisition for the paths it does not.
+Add tests importing a cache produced with `--include`, an interrupted cache, and a cache
+holding a full repository; all are recorded as partial. Add a test that a request for a
+file the imported revision lacks extends it and serves the result.
 
 ## Risks and assumptions
 
-Verification requires upstream repository metadata for the commit, which may be
-unavailable exactly when an import is most useful. The decision above therefore
-degrades the recorded scope instead of refusing the import. This issue depends on
-ADR-0020 for the coverage representation; if ADR-0020 is rejected, the fallback is to
-define a separate honest representation for an unverified import rather than to keep
-asserting a snapshot.
+This issue depends on ADR-0020 for the coverage representation and for unconditional
+extension. If ADR-0020 is rejected, the fallback is to define a separate honest
+representation for an unverified import rather than to keep asserting a snapshot.
