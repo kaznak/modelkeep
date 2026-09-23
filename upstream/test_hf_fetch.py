@@ -1,3 +1,4 @@
+import contextlib
 import io
 import json
 import tempfile
@@ -24,6 +25,51 @@ class MovingRefApi:
 
 
 class HfFetchTests(unittest.TestCase):
+    def test_resumed_client_stdout_cannot_corrupt_helper_event_channel(self):
+        api = MovingRefApi()
+        protocol = io.StringIO()
+        diagnostics = io.StringIO()
+
+        def noisy_download(**kwargs):
+            partial = Path(
+                kwargs["local_dir"],
+                ".cache",
+                "huggingface",
+                "download",
+                "model.incomplete",
+            )
+            self.assertEqual(partial.read_bytes(), b"retained-partial")
+            print('{"resumed":true,"transport":"diagnostic"}')
+            Path(kwargs["local_dir"], "config.json").write_bytes(b"12345678")
+            Path(kwargs["local_dir"], "model.bin").write_bytes(b"0123456789")
+
+        with tempfile.TemporaryDirectory() as output:
+            partial = Path(
+                output, ".cache", "huggingface", "download", "model.incomplete"
+            )
+            partial.parent.mkdir(parents=True)
+            partial.write_bytes(b"retained-partial")
+            with contextlib.redirect_stdout(protocol), contextlib.redirect_stderr(diagnostics):
+                result = hf_fetch.acquire(
+                    "org/model",
+                    COMMIT_A,
+                    output,
+                    api=api,
+                    download=noisy_download,
+                    progress=hf_fetch.ProgressReporter(stream=protocol),
+                )
+
+        events = [json.loads(line) for line in protocol.getvalue().splitlines()]
+        self.assertTrue(events)
+        self.assertTrue(
+            all(event.get("type") in ("progress", "resolved") for event in events)
+        )
+        self.assertNotIn("transport", protocol.getvalue())
+        self.assertIn('"transport":"diagnostic"', diagnostics.getvalue())
+        self.assertEqual(
+            result, {"commit": COMMIT_A, "files": ["config.json", "model.bin"]}
+        )
+
     def test_progress_reporter_emits_machine_readable_bounded_progress(self):
         stream = io.StringIO()
         reporter = hf_fetch.ProgressReporter(stream=stream, minimum_interval=0)

@@ -2,6 +2,7 @@
 """Official huggingface_hub based upstream acquisition helper for ModelKeep."""
 
 import argparse
+import contextlib
 import fnmatch
 import json
 import re
@@ -165,12 +166,17 @@ def acquire(
 
     if progress is not None:
         progress.phase("resolving_revision")
-    info = api.repo_info(
-        repo_id,
-        revision=requested_revision,
-        repo_type=repo_type,
-        files_metadata=True,
-    )
+    # stdout is the machine-readable ModelKeep event channel. Official client and
+    # transport implementations may write diagnostics to stdout, especially while
+    # recovering an interrupted transfer. Keep that output away from the protocol;
+    # the Rust parent deliberately discards helper stderr to avoid credential leaks.
+    with contextlib.redirect_stdout(sys.stderr):
+        info = api.repo_info(
+            repo_id,
+            revision=requested_revision,
+            repo_type=repo_type,
+            files_metadata=True,
+        )
     commit = info.sha
     if not isinstance(commit, str) or not COMMIT_PATTERN.fullmatch(commit):
         raise ValueError("upstream returned malformed commit identity")
@@ -191,7 +197,8 @@ def acquire(
     )
     if progress is not None:
         download_kwargs["tqdm_class"] = progress.tqdm_class()
-    download(**download_kwargs)
+    with contextlib.redirect_stdout(sys.stderr):
+        download(**download_kwargs)
     archived_files = safe_relative_files(output)
     if files:
         requested = set(files)

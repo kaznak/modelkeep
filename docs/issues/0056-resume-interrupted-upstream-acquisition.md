@@ -99,3 +99,13 @@ Implemented on 2026-09-23 with versioned fetch identity, commit-pinned helper re
 atomic expired-lease claiming, persisted `resumed` job state, and a black-box
 SIGKILL/recreation test. The issue remains open until the required representative
 QNAP recreation drill and both GitHub Actions architectures have completed.
+
+The first QNAP drill confirmed that restart marks the original job interrupted and a
+new job atomically adopts the retained staging with `resumed: true`. The resumed
+official client then emitted a JSON diagnostic on stdout; the strict parser treated
+that untyped object as a legacy result and rejected it as malformed. The helper now
+reserves stdout for ModelKeep protocol events and redirects official client/transport
+stdout to its discarded diagnostic stream. A regression test starts with retained
+partial metadata and proves an untyped JSON diagnostic cannot enter the protocol
+channel. Repeat the completion portion of the QNAP drill with an image containing
+this fix before closing the issue.

@@ -245,11 +245,12 @@
 
           archive-crash-upgrade = pkgs.runCommand "modelkeep-archive-crash-upgrade" {
             nativeBuildInputs = [
-              pkgs.python3
+              python
               oldModelkeep
               self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep
             ];
           } ''
+            export PYTHONPATH=${./upstream}
             python3 ${./tests/archive_crash_upgrade.py} \
               ${self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep}/bin/modelkeep \
               ${oldModelkeep}/bin/modelkeep \
