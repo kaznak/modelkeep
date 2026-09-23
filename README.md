@@ -88,6 +88,9 @@ HTTP port only on QNAP host loopback. Configure the host's official Tailscale ap
 provide separate tailnet-only HTTPS endpoints for downloads and administration; do
 not expose ports 8090 or 8091 directly on the LAN. The management UI is served at
 `/admin/` on the `svc:modelkeep-admin` hostname.
+Automation and AI agents should use the versioned
+[`Admin API`](docs/admin-api.md); the repository also includes a portable
+[`modelkeep-admin` skill](.agents/skills/modelkeep-admin/SKILL.md).
 See [`docs/deployment/qnap-permissions.md`](docs/deployment/qnap-permissions.md) for the host-side UID/GID and permission preflight.
 See [`docs/deployment/qnap-tailscale-serve.md`](docs/deployment/qnap-tailscale-serve.md)
 for Service Proxy approval, the required `tag:service` application-capability Policy,
