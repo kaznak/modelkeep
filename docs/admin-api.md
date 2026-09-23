@@ -4,6 +4,9 @@ The versioned Admin API is the supported automation interface for inventory and
 asynchronous management jobs. Browser UI actions use the same API. The management
 origin is separate from the Hugging Face-compatible download origin.
 
+For ordinary model or dataset downloads and guidance on choosing between the two
+interfaces, see the [`ModelKeep client and API guide`](modelkeep-api.md).
+
 Do not put a deployment hostname, bearer token, or operator identity in tracked
 commands or agent instructions. Obtain the origin from an ignored site configuration
 or an explicitly supplied environment variable:

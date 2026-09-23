@@ -77,9 +77,10 @@ QNAP の archive share が別の場所にある場合も、両方のファイル
 新しい archive share ごとに `compose.init.yaml` を別の一時的な Container Station Application として実行し、正常終了後にその Application を削除してから `compose.yaml` をデプロイします。通常運用の Application には ModelKeep 本体だけが含まれます。本体コンテナは UID/GID `10001:10001`、read-only root filesystem、capability drop で動作し、永続データは `/data` のみに書き込みます。HTTP port は QNAP host の loopback のみに公開されます。host の公式 Tailscale app で tailnet 限定 HTTPS endpoint を構成し、port 8090 を LAN に直接公開しないでください。
 ホスト側の UID/GID と権限 preflight は [`docs/deployment/qnap-permissions.md`](docs/deployment/qnap-permissions.md) を参照してください。
 Tailscale Serve の設定と境界確認は [`docs/deployment/qnap-tailscale-serve.md`](docs/deployment/qnap-tailscale-serve.md) を参照してください。
-自動化や AI エージェントからの管理操作には、バージョン化された
-[`Admin API`](docs/admin-api.md)を使用します。リポジトリには移植可能な
-[`modelkeep-admin` skill](.agents/skills/modelkeep-admin/SKILL.md)も含まれます。
+自動化や AI エージェントは、通常のダウンロードに
+[`ModelKeep client and API guide`](docs/modelkeep-api.md)、管理操作にバージョン化された
+[`Admin API`](docs/admin-api.md)を使用できます。リポジトリには両方の interface を扱う
+移植可能な [`modelkeep` skill](.agents/skills/modelkeep/SKILL.md)も含まれます。
 実運用開始前には GX10 から段階実行型の
 [`QNAP client acceptance suite`](docs/deployment/qnap-client-acceptance.md) を実行し、cold、warm、
 offline、再起動、QNAP reboot、restore 後の動作を確認してください。

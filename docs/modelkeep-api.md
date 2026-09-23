@@ -1,0 +1,130 @@
+# ModelKeep client and API guide
+
+ModelKeep exposes two separate interfaces with different trust and operational
+boundaries:
+
+| Interface | Purpose | Preferred client |
+|---|---|---|
+| Download endpoint | Read model or dataset metadata and files; archive a missing snapshot through pull-through | supported `hf` or `huggingface_hub` client |
+| Admin endpoint | Inspect inventory and run explicit prefetch, refresh, verify, or audit jobs | versioned Admin API |
+
+The download endpoint is a supported subset of the Hugging Face Hub protocol, not a
+general-purpose management API. The Admin endpoint must never be used as
+`HF_ENDPOINT`. See [`admin-api.md`](admin-api.md) for its routes and authorization
+rules.
+
+Do not put a deployment hostname, token, or operator identity in tracked commands or
+agent instructions. Obtain both origins from an ignored site configuration or
+explicitly supplied environment variables:
+
+```sh
+MODELKEEP_ENDPOINT=${MODELKEEP_ENDPOINT:-$(
+  jq -er '.endpoint' qnap-acceptance.config.json
+)}
+MODELKEEP_ADMIN_ENDPOINT=${MODELKEEP_ADMIN_ENDPOINT:-$(
+  jq -er '.admin_endpoint' qnap-acceptance.config.json
+)}
+export MODELKEEP_ENDPOINT MODELKEEP_ADMIN_ENDPOINT
+```
+
+## Download models and datasets
+
+Use a supported official client rather than constructing compatibility requests by
+hand. This preserves the same behavior covered by ModelKeep's client integration
+tests.
+
+```sh
+HF_ENDPOINT="$MODELKEEP_ENDPOINT" hf download org/model --revision <revision>
+HF_ENDPOINT="$MODELKEEP_ENDPOINT" hf download org/dataset \
+  --repo-type dataset --revision <revision>
+```
+
+For Python, either set `HF_ENDPOINT` before starting the process or pass the endpoint
+explicitly:
+
+```python
+import os
+from huggingface_hub import snapshot_download
+
+snapshot_download(
+    repo_id="org/model",
+    revision="<revision>",
+    endpoint=os.environ["MODELKEEP_ENDPOINT"],
+)
+```
+
+Use `repo_type="dataset"` for a dataset. Prefer an immutable 40-character commit SHA
+when the caller needs a reproducible snapshot. A mutable ref such as `main` is
+resolved and recorded separately; advancing it does not replace an already published
+immutable revision.
+
+A request for an archived snapshot is a warm read. A request for a missing ref or file
+can start upstream acquisition and publish a complete snapshot to durable storage.
+Consequently, an apparently read-only client command can consume substantial network
+and archive capacity. Before requesting an unknown large repository, establish its
+likely size and obtain authorization appropriate to that cost. ModelKeep currently
+acquires the complete snapshot and does not support allow/ignore patterns.
+
+ModelKeep serves payloads itself and does not redirect a client to Hugging Face or
+Xet. Do not add fallback logic that silently changes `HF_ENDPOINT` or follows a
+payload path around ModelKeep. A warm archived revision is expected to remain
+downloadable while upstream access is unavailable.
+
+## Health and compatibility routes
+
+The download origin provides unauthenticated service probes:
+
+```http
+GET /healthz
+GET /readyz
+```
+
+`healthz` shows that the process is alive. `readyz` indicates whether it can serve
+requests; check both when diagnosing connectivity, but use the Admin status route for
+inventory and management readiness details.
+
+Supported client-facing routes include:
+
+```http
+GET /api/models/{namespace}/{repo}/revision/{revision}
+GET /api/models/{namespace}/{repo}/tree/{revision}
+GET /api/datasets/{namespace}/{repo}/revision/{revision}
+GET /api/datasets/{namespace}/{repo}/tree/{revision}
+GET|HEAD /{namespace}/{repo}/resolve/{revision}/{path}
+GET|HEAD /datasets/{namespace}/{repo}/resolve/{revision}/{path}
+```
+
+Tree requests accept the query fields used by supported clients. File responses
+support `HEAD`, byte ranges, and conditional requests needed by those clients. These
+routes are documented for diagnosis and interoperability; ordinary automation should
+still use the official client.
+
+## Choose the correct interface
+
+- Use the download endpoint for a requested model or dataset download, metadata
+  lookup performed by an HF client, and warm/offline retrieval.
+- Use the Admin API for inventory, explicit prefetch or refresh, integrity
+  verification, full archive audit, and asynchronous job monitoring.
+- Use neither interface for deployment changes or archive deletion unless a separate,
+  explicitly authorized procedure covers that action.
+
+An Admin API `202 Accepted` response means that a job was queued, not that it
+completed. Follow [`admin-api.md`](admin-api.md) through terminal job status.
+
+## Failure interpretation
+
+Client-facing status codes distinguish common failure classes:
+
+- `400`: unsafe or malformed archive path;
+- `401`: upstream authorization failed during a cold acquisition;
+- `404`: the requested upstream object or revision does not exist;
+- `416`: a requested byte range is unsatisfiable;
+- `502`: upstream is unavailable or acquisition failed;
+- `507`: archive storage failure;
+- `500`: integrity, helper-contract, publication conflict, or another internal
+  failure.
+
+Do not turn integrity or storage errors into cache misses, and do not bypass the
+mirror after a failure. For an explicit management job, report the Admin API's safe
+structured `error_class` and `message`; never expose raw upstream output or
+credentials.
