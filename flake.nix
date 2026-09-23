@@ -187,6 +187,15 @@
             cargo clippy --offline --all-targets --all-features -- -D warnings
           '';
 
+          structured-event-reference = pkgs.runCommand "modelkeep-structured-event-reference" {
+            nativeBuildInputs = [ pkgs.python3 ];
+          } ''
+            python3 ${./tests/structured_event_reference_check.py} \
+              ${./src} \
+              ${./docs/structured-operational-events.md}
+            touch $out
+          '';
+
           tests = cargoValidation pkgs "tests" ''
             cargo test --offline --all-features
           '';

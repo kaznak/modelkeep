@@ -21,6 +21,14 @@ headers, bearer tokens, signed URLs, or upstream error payloads.
 | `archive_selection_satisfied` | INFO | `repo_id`, `requested_revision`, immutable `commit`, `covered` |
 | `archive_storage_failed` | ERROR | `repo_id`, `requested_revision`, `operation`, `error_class=storage`, `io_kind` |
 | `admin_job_failed` | WARN | `job_id`, `job_kind`, job target (`repo_id`, `revision`), `error_class`, credential-safe `safe_reason` |
+| `admin_server_ready` | INFO | `listen_address` |
+| `admin_server_bind_failed` | ERROR | `listen_address`, `error` |
+| `admin_active_job_skipped` | WARN | `job_id`; an unreadable marker also has `error` |
+| `admin_job_progress` | INFO | `job_id`, `repo_type`, `repo_id`, `progress_bytes`, `total_bytes`, `progress_files`, `total_files` |
+| `admin_job_persist_failed` | ERROR | `job_id`, `error` |
+| `admin_job_index_skipped` | WARN | `path`; a malformed (as opposed to misidentified) job record also has `error` |
+| `admin_job_index_update_failed` | ERROR | `job_id`, `index` (one of `by_created`, `idempotency`, `active`), `error` |
+| `admin_archive_error` | WARN | `error` |
 | `incomplete_fetch_preserved` | WARN | `repo_id`, `requested_revision` |
 | `incomplete_fetch_recovered` | INFO | `repo_id`, `requested_revision`, `recovery_action`; resumable staging also has immutable `commit` |
 | `acquisition_progress` | INFO | `request_kind`, `repo_id`, `requested_revision`, `path`, `phase`, `acquired_bytes`, `total_bytes` |
@@ -28,6 +36,20 @@ headers, bearer tokens, signed URLs, or upstream error payloads.
 | `acquisition_abandoned` | ERROR | `repo_id`, `requested_revision` |
 | `server_ready` | INFO | `listen_address` |
 | `server_bind_failed` | ERROR | `listen_address`, `error` |
+| `process_failed` | ERROR | `error` |
+| `ownership_initialization_started` | INFO | `target`, `owner` |
+| `ownership_initialization_failed` | ERROR | `target`, plus `error` when the ownership command could not run or `exit_status` when it ran and exited non-zero |
+| `ownership_initialization_completed` | INFO | `target`, `owner` |
+| `configuration_failed` | ERROR | `field`, `error`; `field=listen_address` also has `value` |
+| `startup_started` | INFO | `version`, `archive_root`, `listen_address` |
+| `archive_initialization_started` | INFO | `archive_root` |
+| `archive_initialization_failed` | ERROR | `error` |
+| `archive_initialization_completed` | INFO | none |
+| `archive_recovery_started` | INFO | none |
+| `archive_recovery_failed` | ERROR | `error` |
+| `archive_recovery_completed` | INFO | `recovered_staging_directories` |
+| `archive_readiness_failed` | ERROR | `error` |
+| `startup_configuration` | INFO | `pullthrough_enabled`, `management_enabled`, `cold_miss_deadline_seconds`, `metadata_cold_miss_deadline_seconds` |
 | `shutdown_started` | INFO | none |
 | `shutdown_completed` | INFO | none |
 | `health_probe_succeeded` | DEBUG | `endpoint` |
@@ -137,6 +159,92 @@ download is retained for a later retry, and `recovery_action=discarded` when an
 identified incomplete staging directory cannot be resumed and is removed. Invalid
 or unidentifiable staging remains governed by the conservative recovery rules in
 ADR-0017 and cannot safely supply repository correlation fields.
+
+## `serve` startup sequence
+
+`modelkeep serve` emits a fixed sequence of events before it starts accepting
+connections; each step either emits its "started"/success event and continues, or
+emits a failure event and aborts, so an operator can tell how far startup got.
+Every event below except `startup_started` requires the previous step to have
+succeeded (or, for the initial parse, is emitted instead of it):
+
+1. The listen address is parsed. An invalid address emits `configuration_failed`
+   with `field=listen_address` and aborts; a valid address does not emit a success
+   event of its own and startup proceeds directly to step 2.
+2. `startup_started` — guaranteed once the listen address parses.
+3. `archive_initialization_started`, then either `archive_initialization_failed`
+   (aborts) or `archive_initialization_completed`.
+4. `archive_recovery_started`, then either `archive_recovery_failed` (aborts) or
+   `archive_recovery_completed` with `recovered_staging_directories`.
+5. Archive readiness is checked; failure emits `archive_readiness_failed` and
+   aborts. Success emits no dedicated event; the archive self-check is spawned in
+   the background at this point (see "Archive self-check" above) and startup
+   continues without waiting for it.
+6. Management (admin) configuration is read from the environment. An invalid
+   management configuration aborts startup but is **not** reported through
+   `configuration_failed` or any other event documented here — only the top-level
+   `process_failed` below is emitted for it.
+7. The cold-miss deadline configuration is read; failure emits
+   `configuration_failed` with `field=cold_miss_deadline` and aborts.
+8. `startup_configuration` — guaranteed once every prior step has succeeded;
+   `pullthrough_enabled` and `management_enabled` report which optional
+   subsystems are active for this process, and the two `*_deadline_seconds`
+   fields are `0` when the corresponding deadline is unconfigured.
+9. The HTTP listener(s) then emit `server_ready`/`server_bind_failed` (and, when
+   the management API is enabled, `admin_server_ready`/`admin_server_bind_failed`
+   from a separate listener) as documented in the event table.
+
+Any error returned by a `modelkeep` subcommand — `serve` as above, or any other
+subcommand (`list`, `show`, `import-hf-cache`, `init-ownership`, `refresh`,
+`verify`, `remove`, `audit`, `self-check`, `health`, `ready`) — is reported once
+at the top level as `process_failed` before the process exits with a non-zero
+status. `process_failed` is therefore not specific to `serve` and can be the only
+event a failing invocation of any subcommand produces.
+
+`modelkeep init-ownership` emits `ownership_initialization_started`, then either
+`ownership_initialization_completed` or `ownership_initialization_failed`.
+`ownership_initialization_failed` carries `error` when the ownership command
+(`/bin/chown`) could not be executed at all, or `exit_status` when it ran and
+exited with a non-zero status; the two are mutually exclusive outcomes of the
+same event.
+
+## Management API job lifecycle
+
+These events come from the management (admin) HTTP API's job manager
+(`src/admin.rs`) and are only emitted when the management API is enabled
+(`management_enabled=true` in `startup_configuration`).
+
+`admin_server_ready` and `admin_server_bind_failed` mirror `server_ready` and
+`server_bind_failed` for the management listener specifically.
+
+At management-API startup, the job manager scans previously recorded job
+markers. `admin_active_job_skipped` (WARN) is conditional: it appears once per
+marker that names an invalid job ID, or once per marker whose job record could
+not be read (in which case it also carries `error`); a startup with no such
+markers emits neither. Separately, a one-time index migration emits
+`admin_job_index_skipped` (WARN) once per pre-existing job record that is either
+malformed JSON (carries `error`) or has an identity mismatch between its file
+name and its recorded ID (no `error`); this only fires for archives migrating
+from before the by-created/idempotency index existed, and is otherwise never
+emitted.
+
+`admin_job_progress` (INFO) is conditional on progress updates arriving for a
+job that is still tracked as active; it is not emitted for every progress
+update, only ones where the job manager could locate the job's in-memory state.
+
+Persisting a job's state to disk is attempted on every state transition.
+Failure to write the primary job record emits `admin_job_persist_failed`
+(ERROR) and the in-memory state is rolled back. Even when the primary record is
+persisted successfully, updating a secondary index (`by_created`,
+`idempotency`, or `active`) can fail independently; each such failure emits its
+own `admin_job_index_update_failed` (ERROR) with `index` naming which one, and
+does not roll back the already-persisted primary record.
+
+`admin_archive_error` (WARN) is emitted by several management API read routes
+(status, repository listing, repository detail, job listing) whenever the
+underlying archive query fails; the route then answers with HTTP 500. It carries
+only `error` and no request-identifying fields beyond what the surrounding HTTP
+access log (if any) provides.
 
 ## Operator examples
 

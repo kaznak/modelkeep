@@ -4,6 +4,7 @@ priority: P2
 related_adrs:
   - ADR-0020
   - ADR-0005
+  - ADR-0006
 created: 2026-09-24
 updated: 2026-09-24
 ---
@@ -39,6 +40,19 @@ of 48.41 GB.
 Answer metadata for an unarchived revision from upstream repository information rather
 than from an acquisition, and let the per-file requests that follow acquire only what
 the client asks for.
+
+Record the upstream file list for a commit when one is obtained. A commit is immutable,
+so its file list is a fact that does not go stale, and recording it is not the kind of
+unverifiable claim about our own state that ADR-0020 refused. A revision that knows its
+upstream file list can report it while offline, so a partially archived revision stops
+presenting its subset as the whole repository — which for a sharded model means handing
+back a model with shards missing and calling it a successful download.
+
+The cost is the mirror image: a client that downloads without a filter then asks for
+every file the archive does not hold. That is acceptable only because Issue 0076 makes a
+running acquisition cancellable, which turns a forgotten `--include` from days of
+saturated uplink into the minutes before someone notices. **This issue depends on Issue
+0076.**
 
 Points to settle before implementing:
 
