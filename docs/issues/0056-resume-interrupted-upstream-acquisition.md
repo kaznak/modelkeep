@@ -81,6 +81,11 @@ behavior. Run the native amd64 and arm64 GitHub Actions checks. Before closing t
 issue, record one QNAP container recreation during a representative large prefetch
 and confirm that transferred bytes and temporary capacity behave as designed.
 
+Use the operator procedure in
+[`qnap-resume-drill.md`](../deployment/qnap-resume-drill.md). Keep site endpoints,
+operator identity, and raw job records in the ignored/private deployment record; add
+only sanitized measurements and the outcome here.
+
 ## Risks and assumptions
 
 The supported Hugging Face client may change its partial-download metadata or resume

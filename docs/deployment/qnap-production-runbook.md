@@ -26,6 +26,11 @@ not a requirement for each ModelKeep release.
 CI runs the filesystem-independent restore drill on native amd64 and arm64 Linux. It
 does not certify unrecorded QNAP firmware, ACL, snapshot, or filesystem behavior.
 
+The optional [interrupted-prefetch resume drill](qnap-resume-drill.md) deliberately
+stops an in-progress acquisition to validate retained staging on the actual QNAP
+filesystem. Run it in a maintenance window when first enabling resumable acquisition
+or after changing storage/container behavior; it is not required for every release.
+
 ## First deployment
 
 1. Apply [qnap-permissions.md](qnap-permissions.md).
@@ -151,7 +156,7 @@ rollback.
   unreferenced revision. Never run automatic GC.
 - Mount loss/read-only mount: stop the container and repair mount/ACL; do not accept a
   newly created empty `/data` as production.
-- Interrupted acquisition: restart after storage repair; lease recovery removes only
-  expired staging.
+- Interrupted acquisition: restart after storage repair; identified expired fetch
+  staging can be resumed, while other recovery removes only safe expired staging.
 - Failed upgrade: retain logs, restore the previous image, run readiness and verify.
 - Suspected corruption: stop writes, snapshot, verify read-only, and restore separately.
