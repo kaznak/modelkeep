@@ -140,6 +140,10 @@ struct Manifest {
     complete: bool,
     #[serde(default)]
     repo_type: RepositoryType,
+    #[serde(default)]
+    repo_id: String,
+    #[serde(default)]
+    requested_revision: String,
     files: Vec<ManifestFile>,
 }
 
@@ -177,6 +181,27 @@ pub struct SourcePublishRequest {
     pub commit: String,
     pub source_root: PathBuf,
     pub files: Vec<SourceFile>,
+}
+
+/// Request to add absent files to an already published revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevisionExtensionRequest {
+    pub repo_id: String,
+    pub commit: String,
+    pub source_root: PathBuf,
+    pub files: Vec<SourceFile>,
+}
+
+/// Outcome of one monotonic revision extension.
+///
+/// `added` lists the paths this extension published; `skipped` lists the
+/// requested paths the live manifest already held, which are never rewritten.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevisionExtension {
+    pub commit: String,
+    pub path: PathBuf,
+    pub added: Vec<String>,
+    pub skipped: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1151,6 +1176,215 @@ impl Archive {
         Ok(published)
     }
 
+    /// Adds absent files to an already published model revision.
+    pub fn extend_revision_from_directory(
+        &self,
+        request: RevisionExtensionRequest,
+    ) -> ArchiveResult<RevisionExtension> {
+        self.extend_revision_from_directory_for_type(RepositoryType::Model, request)
+    }
+
+    /// Extends a published revision with files its manifest does not list.
+    ///
+    /// Extension is additive. A requested path the live manifest already lists is
+    /// reported as skipped, and neither its bytes nor its recorded size and digest
+    /// are touched; recorded entries are carried over as they stand rather than
+    /// rehashed. New files are staged, validated, and made durable inside the
+    /// revision directory before the manifest is atomically replaced with a
+    /// superset, so an interruption leaves either the old or the new manifest live
+    /// and a file the live manifest does not list is never served.
+    pub fn extend_revision_from_directory_for_type(
+        &self,
+        repo_type: RepositoryType,
+        request: RevisionExtensionRequest,
+    ) -> ArchiveResult<RevisionExtension> {
+        self.extend_revision_from_directory_inner(repo_type, &request, &|| Ok(()))
+    }
+
+    fn extend_revision_from_directory_inner(
+        &self,
+        repo_type: RepositoryType,
+        request: &RevisionExtensionRequest,
+        before_manifest_swap: &(dyn Fn() -> ArchiveResult<()> + Sync),
+    ) -> ArchiveResult<RevisionExtension> {
+        let (namespace, name) = validate_repo_id(&request.repo_id)?;
+        validate_revision(&request.commit)?;
+        let revisions = self
+            .root
+            .join(repo_type.archive_directory())
+            .join(namespace)
+            .join(name)
+            .join("revisions");
+        let revision = revisions.join(&request.commit);
+        if !revision.is_dir() {
+            return Err(
+                io::Error::new(io::ErrorKind::NotFound, "revision is not published").into(),
+            );
+        }
+
+        let mut skipped = BTreeSet::new();
+        let mut requested = BTreeSet::new();
+        let mut candidates = Vec::new();
+        let listed = self
+            .read_extendable_manifest(repo_type, request)?
+            .files
+            .into_iter()
+            .map(|file| file.path)
+            .collect::<BTreeSet<_>>();
+        for source_file in &request.files {
+            validate_relative_file_path(&source_file.path)?;
+            if !requested.insert(source_file.path.clone()) {
+                return Err(ArchiveError::IntegrityMismatch(format!(
+                    "duplicate archive path: {}",
+                    source_file.path
+                )));
+            }
+            if listed.contains(&source_file.path) {
+                skipped.insert(source_file.path.clone());
+            } else {
+                candidates.push(source_file);
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(RevisionExtension {
+                commit: request.commit.clone(),
+                path: revision,
+                added: Vec::new(),
+                skipped: skipped.into_iter().collect(),
+            });
+        }
+
+        let source_root = fs::canonicalize(&request.source_root)?;
+        if !source_root.is_dir() {
+            return Err(ArchiveError::InvalidPath(
+                request.source_root.display().to_string(),
+            ));
+        }
+        let staging = StagingGuard(self.create_staging("extend")?);
+        let staged = Self::stage_extension_files(&staging.0, &source_root, &candidates)?;
+
+        // The manifest is re-read under the lock: a concurrent extension may have
+        // published one of these paths since the candidate set was computed.
+        let _lock = lock_revision_extension(&revisions, &request.commit)?;
+        let manifest = self.read_extendable_manifest(repo_type, request)?;
+        let published = manifest
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut entries = manifest
+            .files
+            .iter()
+            .map(|file| (file.path.as_str(), file.size, file.sha256.clone()))
+            .collect::<Vec<_>>();
+        let mut added = Vec::new();
+        let mut directories = BTreeSet::new();
+        for (path, size, digest) in &staged {
+            if published.contains(path.as_str()) {
+                skipped.insert(path.clone());
+                continue;
+            }
+            let relative = validate_relative_file_path(path)?;
+            let destination = revision.join(relative);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+                directories.insert(parent.to_path_buf());
+            }
+            fs::rename(staging.0.join(relative), &destination)?;
+            added.push(path.clone());
+            entries.push((path.as_str(), *size, digest.clone()));
+        }
+        added.sort();
+
+        if !added.is_empty() {
+            for directory in &directories {
+                sync_directory(directory)?;
+            }
+            sync_directory(&revision)?;
+            before_manifest_swap()?;
+            replace_revision_manifest(
+                &revisions, &revision, repo_type, request, &manifest, &entries,
+            )?;
+        }
+        Ok(RevisionExtension {
+            commit: request.commit.clone(),
+            path: revision,
+            added,
+            skipped: skipped.into_iter().collect(),
+        })
+    }
+
+    /// Reads the manifest of a revision an extension is about to grow.
+    fn read_extendable_manifest(
+        &self,
+        repo_type: RepositoryType,
+        request: &RevisionExtensionRequest,
+    ) -> ArchiveResult<Manifest> {
+        let manifest = self.read_manifest_for(repo_type, &request.repo_id, &request.commit)?;
+        if !manifest.complete {
+            return Err(ArchiveError::IntegrityMismatch(
+                "revision is not complete".into(),
+            ));
+        }
+        if !manifest.repo_id.is_empty() && manifest.repo_id != request.repo_id {
+            return Err(ArchiveError::IntegrityMismatch(format!(
+                "manifest repository {} does not match {}",
+                manifest.repo_id, request.repo_id
+            )));
+        }
+        Ok(manifest)
+    }
+
+    /// Copies extension sources into staging and records their size and digest.
+    fn stage_extension_files(
+        staging: &Path,
+        source_root: &Path,
+        candidates: &[&SourceFile],
+    ) -> ArchiveResult<Vec<(String, u64, String)>> {
+        let mut staged = Vec::with_capacity(candidates.len());
+        for source_file in candidates {
+            let relative = validate_relative_file_path(&source_file.path)?;
+            if !fs::symlink_metadata(&source_file.source)?
+                .file_type()
+                .is_file()
+            {
+                return Err(ArchiveError::InvalidPath(source_file.path.clone()));
+            }
+            let source = fs::canonicalize(&source_file.source)?;
+            if !source.starts_with(source_root) || !source.is_file() {
+                return Err(ArchiveError::InvalidPath(source_file.path.clone()));
+            }
+            let destination = staging.join(relative);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut input = File::open(source)?;
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(destination)?;
+            let mut hasher = Sha256::new();
+            let mut buffer = [0u8; 1024 * 1024];
+            let mut size = 0u64;
+            loop {
+                let read = input.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                output.write_all(&buffer[..read])?;
+                hasher.update(&buffer[..read]);
+                size += read as u64;
+            }
+            output.sync_all()?;
+            staged.push((
+                source_file.path.clone(),
+                size,
+                hex_digest(hasher.finalize().as_slice()),
+            ));
+        }
+        Ok(staged)
+    }
+
     fn create_staging(&self, prefix: &str) -> ArchiveResult<PathBuf> {
         for _ in 0..16 {
             let operation = operation_id();
@@ -1477,6 +1711,85 @@ fn remove_unlisted_staging_entries(
         }
     }
     Ok(())
+}
+
+/// Removes an extension staging directory once the operation leaves scope.
+struct StagingGuard(PathBuf);
+
+impl Drop for StagingGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Serializes manifest replacement for one published revision.
+///
+/// The lock file lives beside the revision directories rather than inside a
+/// revision, so an extension never adds an internal file to a published
+/// revision. `flock` is released when the descriptor closes, including on
+/// process death, so an interrupted extension leaves no lock to break.
+fn lock_revision_extension(revisions: &Path, commit: &str) -> ArchiveResult<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(revisions.join(format!(".modelkeep-extend-{commit}.lock")))?;
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)
+        .map_err(|error| ArchiveError::Io(io::Error::from(error)))?;
+    Ok(file)
+}
+
+/// Atomically replaces a published revision's manifest with a superset.
+///
+/// The replacement is written outside the revision directory and renamed into
+/// place, so a crash leaves either the old or the new manifest live and never a
+/// partially written one.
+fn replace_revision_manifest(
+    revisions: &Path,
+    revision: &Path,
+    repo_type: RepositoryType,
+    request: &RevisionExtensionRequest,
+    manifest: &Manifest,
+    entries: &[(&str, u64, String)],
+) -> ArchiveResult<()> {
+    let repo_id = if manifest.repo_id.is_empty() {
+        request.repo_id.as_str()
+    } else {
+        manifest.repo_id.as_str()
+    };
+    let requested_revision = if manifest.requested_revision.is_empty() {
+        request.commit.as_str()
+    } else {
+        manifest.requested_revision.as_str()
+    };
+    let temporary = revisions.join(format!(
+        ".modelkeep-manifest-{}-{}.part",
+        request.commit,
+        operation_id()
+    ));
+    let result = (|| -> io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        write_manifest(
+            &mut file,
+            repo_type,
+            repo_id,
+            requested_revision,
+            &request.commit,
+            entries,
+        )?;
+        file.sync_all()?;
+        fs::rename(&temporary, revision.join(".modelkeep-manifest.json"))?;
+        sync_directory(revision)?;
+        sync_directory(revisions)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map_err(ArchiveError::from)
 }
 
 fn operation_id() -> String {
@@ -2601,5 +2914,411 @@ mod tests {
         let missing = directory.path().join("missing");
         assert!(Archive::open_read_only(&missing).is_err());
         assert!(!missing.exists());
+    }
+
+    fn published_revision_for_extension(
+        archive: &Archive,
+        directory: &Path,
+        commit: &str,
+    ) -> PathBuf {
+        let source = directory.join(format!("published-{commit}"));
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("config.json"), b"{\"base\":true}").unwrap();
+        fs::write(source.join("nested/first.bin"), b"first").unwrap();
+        archive
+            .publish_revision_from_directory(SourcePublishRequest {
+                repo_id: "org/model".into(),
+                requested_revision: "main".into(),
+                commit: commit.into(),
+                source_root: source.clone(),
+                files: vec![
+                    SourceFile {
+                        path: "config.json".into(),
+                        source: source.join("config.json"),
+                    },
+                    SourceFile {
+                        path: "nested/first.bin".into(),
+                        source: source.join("nested/first.bin"),
+                    },
+                ],
+            })
+            .unwrap()
+    }
+
+    fn extension_source(directory: &Path, name: &str, files: &[(&str, &[u8])]) -> PathBuf {
+        let root = directory.join(name);
+        fs::create_dir_all(&root).unwrap();
+        for (path, bytes) in files {
+            let destination = root.join(path);
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::write(destination, bytes).unwrap();
+        }
+        root
+    }
+
+    fn extension_request(commit: &str, root: &Path, paths: &[&str]) -> RevisionExtensionRequest {
+        RevisionExtensionRequest {
+            repo_id: "org/model".into(),
+            commit: commit.into(),
+            source_root: root.to_path_buf(),
+            files: paths
+                .iter()
+                .map(|path| SourceFile {
+                    path: (*path).into(),
+                    source: root.join(path),
+                })
+                .collect(),
+        }
+    }
+
+    fn manifest_files(archive: &Archive, commit: &str) -> serde_json::Value {
+        let manifest: serde_json::Value =
+            serde_json::from_str(&archive.manifest("org/model", commit).unwrap()).unwrap();
+        manifest["files"].clone()
+    }
+
+    fn manifest_paths(archive: &Archive, commit: &str) -> BTreeSet<String> {
+        manifest_files(archive, commit)
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["path"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn manifest_entry(archive: &Archive, commit: &str, path: &str) -> serde_json::Value {
+        manifest_files(archive, commit)
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["path"] == path)
+            .cloned()
+            .unwrap()
+    }
+
+    #[test]
+    fn extension_publishes_a_manifest_superset() {
+        let (archive, directory) = archive();
+        let commit = "a".repeat(40);
+        published_revision_for_extension(&archive, directory.path(), &commit);
+        let before = manifest_paths(&archive, &commit);
+
+        let source = extension_source(
+            directory.path(),
+            "extend-superset",
+            &[
+                ("nested/second.bin", b"second".as_slice()),
+                ("extra.txt", b"extra".as_slice()),
+            ],
+        );
+        let outcome = archive
+            .extend_revision_from_directory(extension_request(
+                &commit,
+                &source,
+                &["nested/second.bin", "extra.txt"],
+            ))
+            .unwrap();
+
+        assert_eq!(outcome.added, vec!["extra.txt", "nested/second.bin"]);
+        assert!(outcome.skipped.is_empty());
+        let after = manifest_paths(&archive, &commit);
+        assert!(before.is_subset(&after));
+        assert_eq!(after.len(), before.len() + 2);
+        assert_eq!(
+            manifest_entry(&archive, &commit, "extra.txt")["size"]
+                .as_u64()
+                .unwrap(),
+            5
+        );
+        // The manifest and the revision directory still agree exactly, so the
+        // extension left no internal file inside the published revision.
+        assert_eq!(archive.verify_revision("org/model", &commit).unwrap(), 4);
+        assert_eq!(archive.list_revisions("org/model").unwrap(), vec![commit]);
+    }
+
+    #[test]
+    fn extension_resolves_added_paths_for_serving() {
+        let (archive, directory) = archive();
+        let commit = "7".repeat(40);
+        published_revision_for_extension(&archive, directory.path(), &commit);
+        let source = extension_source(
+            directory.path(),
+            "extend-serving",
+            &[("quant/model.gguf", b"quantised".as_slice())],
+        );
+        assert!(matches!(
+            archive.resolve_file("org/model", &commit, "quant/model.gguf"),
+            Err(ArchiveError::Io(error)) if error.kind() == io::ErrorKind::NotFound
+        ));
+
+        archive
+            .extend_revision_from_directory(extension_request(
+                &commit,
+                &source,
+                &["quant/model.gguf"],
+            ))
+            .unwrap();
+
+        let resolved = archive
+            .resolve_file("org/model", &commit, "quant/model.gguf")
+            .unwrap();
+        assert_eq!(resolved.size, 9);
+        assert_eq!(fs::read(resolved.path).unwrap(), b"quantised");
+        let inventory = archive.repository_inventory("org/model").unwrap();
+        assert_eq!(inventory.revisions[0].file_count, 3);
+    }
+
+    #[test]
+    fn extension_does_not_rewrite_published_files() {
+        let (archive, directory) = archive();
+        let commit = "1".repeat(40);
+        let revision = published_revision_for_extension(&archive, directory.path(), &commit);
+        let published_bytes = [
+            fs::read(revision.join("config.json")).unwrap(),
+            fs::read(revision.join("nested/first.bin")).unwrap(),
+        ];
+        let published_entries = [
+            manifest_entry(&archive, &commit, "config.json"),
+            manifest_entry(&archive, &commit, "nested/first.bin"),
+        ];
+
+        let source = extension_source(
+            directory.path(),
+            "extend-untouched",
+            &[("added.bin", b"added".as_slice())],
+        );
+        archive
+            .extend_revision_from_directory(extension_request(&commit, &source, &["added.bin"]))
+            .unwrap();
+
+        assert_eq!(
+            [
+                fs::read(revision.join("config.json")).unwrap(),
+                fs::read(revision.join("nested/first.bin")).unwrap(),
+            ],
+            published_bytes
+        );
+        assert_eq!(
+            [
+                manifest_entry(&archive, &commit, "config.json"),
+                manifest_entry(&archive, &commit, "nested/first.bin"),
+            ],
+            published_entries
+        );
+    }
+
+    #[test]
+    fn extension_skips_paths_the_manifest_already_lists() {
+        let (archive, directory) = archive();
+        let commit = "2".repeat(40);
+        let revision = published_revision_for_extension(&archive, directory.path(), &commit);
+        let source = extension_source(
+            directory.path(),
+            "extend-collision",
+            &[
+                ("config.json", b"REPLACED".as_slice()),
+                ("fresh.bin", b"fresh".as_slice()),
+            ],
+        );
+
+        let outcome = archive
+            .extend_revision_from_directory(extension_request(
+                &commit,
+                &source,
+                &["config.json", "fresh.bin"],
+            ))
+            .unwrap();
+
+        assert_eq!(outcome.skipped, vec!["config.json"]);
+        assert_eq!(outcome.added, vec!["fresh.bin"]);
+        assert_eq!(
+            fs::read(revision.join("config.json")).unwrap(),
+            b"{\"base\":true}"
+        );
+        assert_eq!(manifest_paths(&archive, &commit).len(), 3);
+        assert_eq!(archive.verify_revision("org/model", &commit).unwrap(), 3);
+    }
+
+    #[test]
+    fn interrupted_extension_keeps_the_old_manifest_live() {
+        let (archive, directory) = archive();
+        let commit = "d".repeat(40);
+        let revision = published_revision_for_extension(&archive, directory.path(), &commit);
+        let source = extension_source(
+            directory.path(),
+            "extend-interrupted",
+            &[("late.bin", b"late".as_slice())],
+        );
+        let request = extension_request(&commit, &source, &["late.bin"]);
+
+        let error = archive
+            .extend_revision_from_directory_inner(RepositoryType::Model, &request, &|| {
+                Err(ArchiveError::Io(io::Error::other(
+                    "interrupted before manifest swap",
+                )))
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, ArchiveError::Io(_)));
+        // The new file is already durable, and the live manifest is still the old one.
+        assert_eq!(fs::read(revision.join("late.bin")).unwrap(), b"late");
+        assert!(!manifest_paths(&archive, &commit).contains("late.bin"));
+        assert!(matches!(
+            archive.resolve_file("org/model", &commit, "late.bin"),
+            Err(ArchiveError::Io(error)) if error.kind() == io::ErrorKind::NotFound
+        ));
+
+        let outcome = archive.extend_revision_from_directory(request).unwrap();
+        assert_eq!(outcome.added, vec!["late.bin"]);
+        assert_eq!(
+            fs::read(
+                archive
+                    .resolve_file("org/model", &commit, "late.bin")
+                    .unwrap()
+                    .path
+            )
+            .unwrap(),
+            b"late"
+        );
+        assert_eq!(archive.verify_revision("org/model", &commit).unwrap(), 3);
+    }
+
+    #[test]
+    fn concurrent_extensions_keep_every_entry() {
+        let (archive, directory) = archive();
+        let commit = "c".repeat(40);
+        published_revision_for_extension(&archive, directory.path(), &commit);
+        let sources = [
+            extension_source(
+                directory.path(),
+                "extend-parallel-a",
+                &[("parallel/a.bin", b"aaa".as_slice())],
+            ),
+            extension_source(
+                directory.path(),
+                "extend-parallel-b",
+                &[("parallel/b.bin", b"bbbb".as_slice())],
+            ),
+        ];
+        let barrier = Arc::new(std::sync::Barrier::new(sources.len()));
+
+        let threads = sources
+            .iter()
+            .zip(["parallel/a.bin", "parallel/b.bin"])
+            .map(|(root, path)| {
+                let archive = archive.clone();
+                let commit = commit.clone();
+                let root = root.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    archive.extend_revision_from_directory(extension_request(
+                        &commit,
+                        &root,
+                        &[path],
+                    ))
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            let outcome = thread.join().unwrap().unwrap();
+            assert_eq!(outcome.added.len(), 1);
+        }
+
+        let paths = manifest_paths(&archive, &commit);
+        assert!(paths.contains("parallel/a.bin"), "lost entry: {paths:?}");
+        assert!(paths.contains("parallel/b.bin"), "lost entry: {paths:?}");
+        assert_eq!(paths.len(), 4);
+        assert_eq!(archive.verify_revision("org/model", &commit).unwrap(), 4);
+    }
+
+    #[test]
+    fn extension_rejects_paths_and_sources_outside_the_archive() {
+        let (archive, directory) = archive();
+        let commit = "e".repeat(40);
+        let revision = published_revision_for_extension(&archive, directory.path(), &commit);
+        let source = extension_source(
+            directory.path(),
+            "extend-unsafe",
+            &[("escape.bin", b"escape".as_slice())],
+        );
+
+        for path in [
+            "../escape.bin",
+            "nested/../../escape.bin",
+            "/etc/passwd",
+            ".modelkeep-manifest.json",
+            ".cache/huggingface/download.json",
+        ] {
+            let mut request = extension_request(&commit, &source, &["escape.bin"]);
+            request.files[0].path = path.into();
+            assert!(
+                matches!(
+                    archive.extend_revision_from_directory(request),
+                    Err(ArchiveError::InvalidPath(_))
+                ),
+                "unsafe path must be rejected: {path}"
+            );
+        }
+
+        let outside = directory.path().join("outside.bin");
+        fs::write(&outside, b"outside").unwrap();
+        let mut request = extension_request(&commit, &source, &["escape.bin"]);
+        request.files[0].source = outside;
+        assert!(matches!(
+            archive.extend_revision_from_directory(request),
+            Err(ArchiveError::InvalidPath(_))
+        ));
+
+        assert_eq!(manifest_paths(&archive, &commit).len(), 2);
+        assert!(!revision.join("escape.bin").exists());
+        assert!(!directory.path().join("escape.bin").exists());
+        assert_eq!(archive.verify_revision("org/model", &commit).unwrap(), 2);
+    }
+
+    #[test]
+    fn extending_an_absent_revision_is_not_a_cache_miss() {
+        let (archive, directory) = archive();
+        let commit = "f".repeat(40);
+        published_revision_for_extension(&archive, directory.path(), &commit);
+        let source = extension_source(
+            directory.path(),
+            "extend-absent",
+            &[("late.bin", b"late".as_slice())],
+        );
+
+        let absent = "b".repeat(40);
+        assert!(matches!(
+            archive.extend_revision_from_directory(extension_request(&absent, &source, &["late.bin"])),
+            Err(ArchiveError::Io(error)) if error.kind() == io::ErrorKind::NotFound
+        ));
+        assert!(matches!(
+            archive.extend_revision_from_directory(extension_request(
+                "../escape",
+                &source,
+                &["late.bin"]
+            )),
+            Err(ArchiveError::InvalidPath(_))
+        ));
+
+        let mut request = extension_request(&commit, &source, &["late.bin"]);
+        request.repo_id = "org/absent".into();
+        assert!(matches!(
+            archive.extend_revision_from_directory(request),
+            Err(ArchiveError::Io(error)) if error.kind() == io::ErrorKind::NotFound
+        ));
+
+        // A revision whose manifest cannot be parsed is an integrity failure,
+        // not an absent path.
+        let revision = archive.revision_path("org/model", &commit).unwrap();
+        fs::write(revision.join(".modelkeep-manifest.json"), b"{not json").unwrap();
+        assert!(matches!(
+            archive.extend_revision_from_directory(extension_request(
+                &commit,
+                &source,
+                &["late.bin"]
+            )),
+            Err(ArchiveError::IntegrityMismatch(_))
+        ));
     }
 }
