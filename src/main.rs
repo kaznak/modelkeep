@@ -136,6 +136,18 @@ fn probe_endpoint(endpoint: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Starts the archive self-check beside serving.
+///
+/// The check is detached deliberately: its cost grows with the number of
+/// revisions, and a healthy revision must never wait behind it. Nothing in the
+/// serving path joins this task, and its outcome never fails startup — it is a
+/// report, read back through the Admin status route and the event stream.
+fn spawn_startup_self_check(archive: Archive) {
+    tokio::task::spawn_blocking(move || {
+        archive.self_check();
+    });
+}
+
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
@@ -223,6 +235,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(())
             } else {
                 Err("archive audit failed".into())
+            }
+        }
+        Some("self-check") => {
+            let root = args
+                .next()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/data"));
+            if args.next().is_some() {
+                return Err("self-check accepts only archive-root".into());
+            }
+            // The same read-only walk startup runs, exposed so an operator can
+            // ask the deployed image the question outside a restart.
+            let report = Archive::open_read_only(root)?.self_check();
+            let mut document = serde_json::to_value(&report)?;
+            if let Some(object) = document.as_object_mut() {
+                object.insert("status".into(), report.status().into());
+            }
+            println!("{document}");
+            if report.findings.is_empty() {
+                Ok(())
+            } else {
+                Err("archive self-check reported findings".into())
             }
         }
         Some("remove") => {
@@ -342,6 +376,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 error
             })?;
+            spawn_startup_self_check(archive.clone());
             let upstream = match (
                 env::var("MODELKEEP_HF_PYTHON"),
                 env::var("MODELKEEP_HF_HELPER"),
@@ -422,6 +457,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
        modelkeep health
        modelkeep ready
        modelkeep audit [archive-root]
+       modelkeep self-check [archive-root]
        modelkeep refresh [archive-root] <repo-id> <ref> [--repo-type model|dataset] [--dry-run]
        modelkeep verify [archive-root] <repo-id> <commit> [--repo-type model|dataset]
        modelkeep remove [archive-root] <repo-id> <commit> [--repo-type model|dataset] [--dry-run]"

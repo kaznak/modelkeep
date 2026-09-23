@@ -13,7 +13,7 @@ use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -250,10 +250,176 @@ pub struct RepositoryInventory {
     pub revisions: Vec<RevisionSummary>,
 }
 
+/// Class of durable inconsistency reported by the startup self-check.
+///
+/// The set is closed so operational automation can select on it. It never
+/// carries a repair action: the self-check reports and changes nothing
+/// (core invariant 4, ADR-0007).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelfCheckFindingKind {
+    /// The revision manifest is absent, unparseable, incomplete, or declares a
+    /// repository type that disagrees with its location in the archive.
+    InvalidManifest,
+    /// A path the manifest lists is not present in the revision directory.
+    MissingFile,
+    /// A path the manifest lists exists with a size other than the recorded one.
+    SizeMismatch,
+    /// An archive component or manifest path is unsafe or leaves the archive root.
+    UnsafePath,
+    /// A mutable ref names a revision that is absent or not servable.
+    DanglingRef,
+    /// Fetch staging survived recovery and still occupies the temporary area.
+    OrphanedStaging,
+    /// A part of the archive could not be read at all.
+    UnreadableArchive,
+}
+
+impl SelfCheckFindingKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidManifest => "invalid_manifest",
+            Self::MissingFile => "missing_file",
+            Self::SizeMismatch => "size_mismatch",
+            Self::UnsafePath => "unsafe_path",
+            Self::DanglingRef => "dangling_ref",
+            Self::OrphanedStaging => "orphaned_staging",
+            Self::UnreadableArchive => "unreadable_archive",
+        }
+    }
+}
+
+/// One finding of the startup self-check.
+///
+/// `detail` is ModelKeep's own description of the inconsistency and of archive
+/// state only. It never carries request headers, tokens, or upstream output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SelfCheckFinding {
+    pub finding: SelfCheckFindingKind,
+    pub repo_type: Option<RepositoryType>,
+    pub repo_id: Option<String>,
+    pub commit: Option<String>,
+    pub path: Option<String>,
+    pub reference: Option<String>,
+    pub age_seconds: Option<u64>,
+    pub detail: String,
+}
+
+impl SelfCheckFinding {
+    fn new(finding: SelfCheckFindingKind, detail: impl Into<String>) -> Self {
+        Self {
+            finding,
+            repo_type: None,
+            repo_id: None,
+            commit: None,
+            path: None,
+            reference: None,
+            age_seconds: None,
+            detail: detail.into(),
+        }
+    }
+
+    fn in_repository(mut self, repo_type: RepositoryType, repo_id: &str) -> Self {
+        self.repo_type = Some(repo_type);
+        self.repo_id = Some(repo_id.to_string());
+        self
+    }
+
+    fn at_commit(mut self, commit: &str) -> Self {
+        self.commit = Some(commit.to_string());
+        self
+    }
+
+    fn at_path(mut self, path: &str) -> Self {
+        self.path = Some(path.to_string());
+        self
+    }
+
+    fn at_ref(mut self, reference: &str) -> Self {
+        self.reference = Some(reference.to_string());
+        self
+    }
+
+    fn aged(mut self, age_seconds: u64) -> Self {
+        self.age_seconds = Some(age_seconds);
+        self
+    }
+}
+
+/// Result of one archive self-consistency check.
+///
+/// A report with an empty `findings` list is a positive statement that the
+/// archive was walked and nothing was found, which is what distinguishes
+/// "checked and clean" from "never checked".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SelfCheckReport {
+    pub completed_at: u64,
+    pub duration_ms: u64,
+    pub repositories_checked: usize,
+    pub revisions_checked: usize,
+    pub files_checked: usize,
+    pub refs_checked: usize,
+    pub staging_directories: usize,
+    pub orphaned_staging_directories: usize,
+    pub oldest_orphaned_staging_age_seconds: u64,
+    /// Manifest entries naming ModelKeep's own internal archive paths.
+    ///
+    /// An old writer could list transient downloader metadata such as
+    /// `.cache/huggingface/download.json`. Serving already filters those paths,
+    /// so a client can neither see nor request one, which makes them a counted
+    /// observation rather than a finding an operator has to act on.
+    pub filtered_internal_paths: usize,
+    pub findings: Vec<SelfCheckFinding>,
+}
+
+impl SelfCheckReport {
+    fn empty() -> Self {
+        Self {
+            completed_at: 0,
+            duration_ms: 0,
+            repositories_checked: 0,
+            revisions_checked: 0,
+            files_checked: 0,
+            refs_checked: 0,
+            staging_directories: 0,
+            orphaned_staging_directories: 0,
+            oldest_orphaned_staging_age_seconds: 0,
+            filtered_internal_paths: 0,
+            findings: Vec::new(),
+        }
+    }
+
+    pub fn status(&self) -> &'static str {
+        if self.findings.is_empty() {
+            "clean"
+        } else {
+            "findings"
+        }
+    }
+
+    /// Findings grouped by class, for a bounded operational summary.
+    pub fn findings_by_kind(&self) -> BTreeMap<&'static str, usize> {
+        let mut counts = BTreeMap::new();
+        for finding in &self.findings {
+            *counts.entry(finding.finding.as_str()).or_insert(0) += 1;
+        }
+        counts
+    }
+}
+
+/// Whether the archive self-check has run in this process, and its last result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelfCheckState {
+    NeverRun,
+    Running,
+    Completed(Box<SelfCheckReport>),
+}
+
 #[derive(Debug, Clone)]
 pub struct Archive {
     pub(crate) root: PathBuf,
     readiness: Arc<Mutex<Option<bool>>>,
+    self_check: Arc<Mutex<SelfCheckState>>,
 }
 
 impl Archive {
@@ -265,6 +431,7 @@ impl Archive {
         Ok(Self {
             root,
             readiness: Arc::new(Mutex::new(None)),
+            self_check: Arc::new(Mutex::new(SelfCheckState::NeverRun)),
         })
     }
 
@@ -277,6 +444,7 @@ impl Archive {
         Ok(Self {
             root,
             readiness: Arc::new(Mutex::new(None)),
+            self_check: Arc::new(Mutex::new(SelfCheckState::NeverRun)),
         })
     }
 
@@ -716,6 +884,543 @@ impl Archive {
     /// Returns the last active readiness-probe result without touching durable state.
     pub fn last_readiness(&self) -> Option<bool> {
         self.readiness.lock().ok().and_then(|value| *value)
+    }
+
+    /// Returns whether the self-check has run in this process and its last report.
+    pub fn self_check_state(&self) -> SelfCheckState {
+        self.self_check
+            .lock()
+            .map(|state| state.clone())
+            .unwrap_or(SelfCheckState::NeverRun)
+    }
+
+    /// Walks the archive for inconsistencies it can answer about itself.
+    ///
+    /// The check is read-only and offline by construction: it opens manifests
+    /// and file metadata, never file contents, never upstream, and never
+    /// repairs, deletes, or re-acquires anything it finds. Digest verification
+    /// stays in the `verify` and `audit` management jobs, which is why this can
+    /// run at every start on a multi-terabyte archive.
+    ///
+    /// It never fails: an unreadable part of the archive is itself a finding,
+    /// so the walk always reaches a reported outcome.
+    pub fn self_check(&self) -> SelfCheckReport {
+        // The start is a DEBUG event on purpose. One completed check must cost
+        // a bounded and very small number of log lines at the default level,
+        // because every restart pays it; "a check is in flight" is answered by
+        // the Admin status route, which reports `running` without any logging.
+        tracing::debug!(
+            event = "archive_self_check_started",
+            archive_root = %self.root.display(),
+            "archive self-check started"
+        );
+        if let Ok(mut state) = self.self_check.lock() {
+            *state = SelfCheckState::Running;
+        }
+        let started = Instant::now();
+        let mut report = SelfCheckReport::empty();
+        for repo_type in RepositoryType::ALL {
+            self.self_check_repository_type(repo_type, &mut report);
+        }
+        self.self_check_staging(&mut report);
+        report.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        report.completed_at = unix_timestamp();
+        for finding in &report.findings {
+            let repo_type = finding
+                .repo_type
+                .map(|repo_type| repo_type.to_string())
+                .unwrap_or_default();
+            tracing::warn!(
+                event = "archive_self_check_finding",
+                finding = finding.finding.as_str(),
+                repo_type = %repo_type,
+                repo_id = finding.repo_id.as_deref().unwrap_or(""),
+                commit = finding.commit.as_deref().unwrap_or(""),
+                path = finding.path.as_deref().unwrap_or(""),
+                reference = finding.reference.as_deref().unwrap_or(""),
+                age_seconds = finding.age_seconds.unwrap_or(0),
+                detail = %finding.detail,
+                "archive self-check finding"
+            );
+        }
+        // Every restart pays for this line, so it carries the result and the
+        // measurement and nothing else. The full counts are on the Admin status
+        // route and in `modelkeep self-check`, which no restart writes to a log.
+        tracing::info!(
+            event = "archive_self_check_completed",
+            status = report.status(),
+            finding_count = report.findings.len(),
+            revisions_checked = report.revisions_checked,
+            duration_ms = report.duration_ms,
+            "archive self-check completed"
+        );
+        if let Ok(mut state) = self.self_check.lock() {
+            *state = SelfCheckState::Completed(Box::new(report.clone()));
+        }
+        report
+    }
+
+    fn self_check_repository_type(&self, repo_type: RepositoryType, report: &mut SelfCheckReport) {
+        let root = self.root.join(repo_type.archive_directory());
+        if !root.is_dir() {
+            return;
+        }
+        let namespaces = match fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) => {
+                report.findings.push(SelfCheckFinding::new(
+                    SelfCheckFindingKind::UnreadableArchive,
+                    format!("cannot read {}: {}", repo_type.archive_directory(), error),
+                ));
+                return;
+            }
+        };
+        for namespace in namespaces {
+            let Some(namespace) = self.self_check_directory(namespace, repo_type, report) else {
+                continue;
+            };
+            let namespace_name = namespace.file_name().to_string_lossy().into_owned();
+            if validate_component(&namespace_name).is_err() {
+                report.findings.push(
+                    SelfCheckFinding::new(
+                        SelfCheckFindingKind::UnsafePath,
+                        "namespace directory name is not a safe archive component",
+                    )
+                    .in_repository(repo_type, &namespace_name),
+                );
+                continue;
+            }
+            let repositories = match fs::read_dir(namespace.path()) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    report.findings.push(
+                        SelfCheckFinding::new(
+                            SelfCheckFindingKind::UnreadableArchive,
+                            format!("cannot read namespace directory: {error}"),
+                        )
+                        .in_repository(repo_type, &namespace_name),
+                    );
+                    continue;
+                }
+            };
+            for repository in repositories {
+                let Some(repository) = self.self_check_directory(repository, repo_type, report)
+                else {
+                    continue;
+                };
+                let repository_name = repository.file_name().to_string_lossy().into_owned();
+                let repo_id = format!("{namespace_name}/{repository_name}");
+                if validate_repo_id(&repo_id).is_err() {
+                    report.findings.push(
+                        SelfCheckFinding::new(
+                            SelfCheckFindingKind::UnsafePath,
+                            "repository directory name is not a safe archive component",
+                        )
+                        .in_repository(repo_type, &repo_id),
+                    );
+                    continue;
+                }
+                report.repositories_checked += 1;
+                let servable = self.self_check_revisions(
+                    repo_type,
+                    &repo_id,
+                    &repository.path().join("revisions"),
+                    report,
+                );
+                self.self_check_refs(
+                    repo_type,
+                    &repo_id,
+                    &repository.path().join("refs"),
+                    &servable,
+                    report,
+                );
+            }
+        }
+    }
+
+    /// Keeps only directory entries, recording anything that cannot be classified.
+    fn self_check_directory(
+        &self,
+        entry: io::Result<fs::DirEntry>,
+        repo_type: RepositoryType,
+        report: &mut SelfCheckReport,
+    ) -> Option<fs::DirEntry> {
+        match entry {
+            Ok(entry) => match entry.file_type() {
+                Ok(kind) if kind.is_dir() => Some(entry),
+                Ok(_) => None,
+                Err(error) => {
+                    report.findings.push(
+                        SelfCheckFinding::new(
+                            SelfCheckFindingKind::UnreadableArchive,
+                            format!("cannot classify archive entry: {error}"),
+                        )
+                        .in_repository(repo_type, &entry.file_name().to_string_lossy()),
+                    );
+                    None
+                }
+            },
+            Err(error) => {
+                report.findings.push(SelfCheckFinding::new(
+                    SelfCheckFindingKind::UnreadableArchive,
+                    format!("cannot read archive entry: {error}"),
+                ));
+                None
+            }
+        }
+    }
+
+    /// Returns the commits a ref may resolve to.
+    ///
+    /// Membership means the revision exists and its manifest is usable, which
+    /// is what a ref resolution needs. A per-file inconsistency inside the
+    /// revision is reported as its own finding and is deliberately not
+    /// cascaded into every ref that names the revision.
+    fn self_check_revisions(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        revisions: &Path,
+        report: &mut SelfCheckReport,
+    ) -> BTreeSet<String> {
+        let mut servable = BTreeSet::new();
+        if !revisions.is_dir() {
+            return servable;
+        }
+        let entries = match fs::read_dir(revisions) {
+            Ok(entries) => entries,
+            Err(error) => {
+                report.findings.push(
+                    SelfCheckFinding::new(
+                        SelfCheckFindingKind::UnreadableArchive,
+                        format!("cannot read revisions directory: {error}"),
+                    )
+                    .in_repository(repo_type, repo_id),
+                );
+                return servable;
+            }
+        };
+        for entry in entries {
+            let Some(entry) = self.self_check_directory(entry, repo_type, report) else {
+                continue;
+            };
+            let commit = entry.file_name().to_string_lossy().into_owned();
+            if validate_revision(&commit).is_err() {
+                report.findings.push(
+                    SelfCheckFinding::new(
+                        SelfCheckFindingKind::UnsafePath,
+                        "revision directory name is not a commit id",
+                    )
+                    .in_repository(repo_type, repo_id)
+                    .at_commit(&commit),
+                );
+                continue;
+            }
+            report.revisions_checked += 1;
+            if self.self_check_revision(repo_type, repo_id, &commit, &entry.path(), report) {
+                servable.insert(commit);
+            }
+        }
+        servable
+    }
+
+    /// Checks one revision's manifest and the metadata of every path it lists.
+    ///
+    /// Returns whether a ref may resolve to this revision, which depends on the
+    /// manifest alone. File contents are never read: that is what keeps the
+    /// check affordable at every start, and digest verification stays in the
+    /// `verify` and `audit` jobs.
+    fn self_check_revision(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        commit: &str,
+        revision: &Path,
+        report: &mut SelfCheckReport,
+    ) -> bool {
+        let finding = |kind: SelfCheckFindingKind, detail: String| {
+            SelfCheckFinding::new(kind, detail)
+                .in_repository(repo_type, repo_id)
+                .at_commit(commit)
+        };
+        let manifest = match fs::read(revision.join(".modelkeep-manifest.json")) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                report.findings.push(finding(
+                    SelfCheckFindingKind::InvalidManifest,
+                    format!("cannot read revision manifest: {error}"),
+                ));
+                return false;
+            }
+        };
+        let manifest: Manifest = match serde_json::from_slice(&manifest) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                report.findings.push(finding(
+                    SelfCheckFindingKind::InvalidManifest,
+                    format!("revision manifest does not parse: {error}"),
+                ));
+                return false;
+            }
+        };
+        if manifest.repo_type != repo_type {
+            report.findings.push(finding(
+                SelfCheckFindingKind::InvalidManifest,
+                format!(
+                    "manifest repository type {} does not match archive root {repo_type}",
+                    manifest.repo_type
+                ),
+            ));
+            return false;
+        }
+        if !manifest.complete {
+            report.findings.push(finding(
+                SelfCheckFindingKind::InvalidManifest,
+                "revision manifest is not marked complete".into(),
+            ));
+            return false;
+        }
+        let revision_root = fs::canonicalize(revision).ok();
+        for (index, entry) in manifest.files.iter().enumerate() {
+            report.files_checked += 1;
+            let Ok(relative) = validate_relative_file_path(&entry.path) else {
+                if is_internal_archive_path(&entry.path) {
+                    // Serving filters ModelKeep's own internal paths, so a
+                    // manifest that lists one is a counted observation, not an
+                    // inconsistency a client can ever run into.
+                    report.filtered_internal_paths += 1;
+                    continue;
+                }
+                // A path that failed validation is untrusted input ModelKeep
+                // refuses everywhere else, so it is never echoed back into a
+                // report. The manifest entry is identified by position, which
+                // locates it without repeating it.
+                report.findings.push(finding(
+                    SelfCheckFindingKind::UnsafePath,
+                    format!("manifest entry {index} is not a safe archive path"),
+                ));
+                continue;
+            };
+            let candidate = revision.join(relative);
+            let metadata = match fs::symlink_metadata(&candidate) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    report.findings.push(
+                        finding(
+                            SelfCheckFindingKind::MissingFile,
+                            "manifest lists a path that is absent from the revision".into(),
+                        )
+                        .at_path(&entry.path),
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    report.findings.push(
+                        finding(
+                            SelfCheckFindingKind::UnreadableArchive,
+                            format!("cannot read archived file metadata: {error}"),
+                        )
+                        .at_path(&entry.path),
+                    );
+                    continue;
+                }
+            };
+            // A symbolic link is the one way a manifest path with safe syntax
+            // can still leave the revision, so its target is resolved and
+            // confined here rather than trusted.
+            if metadata.is_symlink() {
+                let escapes = match (&revision_root, fs::canonicalize(&candidate)) {
+                    (Some(root), Ok(target)) => !target.starts_with(root),
+                    _ => true,
+                };
+                if escapes {
+                    report.findings.push(
+                        finding(
+                            SelfCheckFindingKind::UnsafePath,
+                            "archived path resolves outside the revision directory".into(),
+                        )
+                        .at_path(&entry.path),
+                    );
+                    continue;
+                }
+            }
+            let size = match fs::metadata(&candidate) {
+                Ok(metadata) if metadata.is_file() => metadata.len(),
+                Ok(_) => {
+                    report.findings.push(
+                        finding(
+                            SelfCheckFindingKind::MissingFile,
+                            "archived path is not a regular file".into(),
+                        )
+                        .at_path(&entry.path),
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    report.findings.push(
+                        finding(
+                            SelfCheckFindingKind::MissingFile,
+                            format!("archived path cannot be resolved for serving: {error}"),
+                        )
+                        .at_path(&entry.path),
+                    );
+                    continue;
+                }
+            };
+            if size != entry.size {
+                report.findings.push(
+                    finding(
+                        SelfCheckFindingKind::SizeMismatch,
+                        format!(
+                            "manifest records {} bytes, archive holds {size}",
+                            entry.size
+                        ),
+                    )
+                    .at_path(&entry.path),
+                );
+            }
+        }
+        true
+    }
+
+    fn self_check_refs(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        refs: &Path,
+        servable: &BTreeSet<String>,
+        report: &mut SelfCheckReport,
+    ) {
+        if !refs.is_dir() {
+            return;
+        }
+        let entries = match fs::read_dir(refs) {
+            Ok(entries) => entries,
+            Err(error) => {
+                report.findings.push(
+                    SelfCheckFinding::new(
+                        SelfCheckFindingKind::UnreadableArchive,
+                        format!("cannot read refs directory: {error}"),
+                    )
+                    .in_repository(repo_type, repo_id),
+                );
+                return;
+            }
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                report.findings.push(
+                    SelfCheckFinding::new(
+                        SelfCheckFindingKind::UnreadableArchive,
+                        "cannot read a ref entry",
+                    )
+                    .in_repository(repo_type, repo_id),
+                );
+                continue;
+            };
+            if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                continue;
+            }
+            let reference = entry.file_name().to_string_lossy().into_owned();
+            if reference.starts_with('.') {
+                // An interrupted ref update leaves `.<ref>.<id>.part` behind;
+                // it is never resolved and is not a ref of its own.
+                continue;
+            }
+            report.refs_checked += 1;
+            let finding = |kind: SelfCheckFindingKind, detail: String| {
+                SelfCheckFinding::new(kind, detail)
+                    .in_repository(repo_type, repo_id)
+                    .at_ref(&reference)
+            };
+            if validate_component(&reference).is_err() {
+                report.findings.push(finding(
+                    SelfCheckFindingKind::UnsafePath,
+                    "ref name is not a safe archive component".into(),
+                ));
+                continue;
+            }
+            let commit = match fs::read_to_string(entry.path()) {
+                Ok(commit) => commit.trim().to_string(),
+                Err(error) => {
+                    report.findings.push(finding(
+                        SelfCheckFindingKind::DanglingRef,
+                        format!("cannot read ref: {error}"),
+                    ));
+                    continue;
+                }
+            };
+            if validate_revision(&commit).is_err() {
+                report.findings.push(finding(
+                    SelfCheckFindingKind::DanglingRef,
+                    "ref does not hold a commit id".into(),
+                ));
+                continue;
+            }
+            if !servable.contains(&commit) {
+                report.findings.push(
+                    finding(
+                        SelfCheckFindingKind::DanglingRef,
+                        "ref resolves to a revision that is absent or not servable".into(),
+                    )
+                    .at_commit(&commit),
+                );
+            }
+        }
+    }
+
+    fn self_check_staging(&self, report: &mut SelfCheckReport) {
+        let tmp = self.root.join("tmp");
+        let entries = match fs::read_dir(&tmp) {
+            Ok(entries) => entries,
+            Err(error) => {
+                report.findings.push(SelfCheckFinding::new(
+                    SelfCheckFindingKind::UnreadableArchive,
+                    format!("cannot read temporary staging area: {error}"),
+                ));
+                return;
+            }
+        };
+        let now = unix_timestamp();
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            report.staging_directories += 1;
+            // A staging directory whose lease is still in the future belongs to
+            // a live operation, so only an expired or absent lease is left-behind
+            // state. Nothing here reclaims it; recovery owns that decision.
+            let expired = match read_lease_expiry(&entry.path()) {
+                Ok(expires_at) => expires_at <= now,
+                Err(_) => true,
+            };
+            if !expired {
+                continue;
+            }
+            let age_seconds = entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+                .map_or(0, |age| age.as_secs());
+            report.orphaned_staging_directories += 1;
+            report.oldest_orphaned_staging_age_seconds =
+                report.oldest_orphaned_staging_age_seconds.max(age_seconds);
+            let identity = read_fetch_staging_metadata(&entry.path()).ok();
+            let mut finding = SelfCheckFinding::new(
+                SelfCheckFindingKind::OrphanedStaging,
+                "fetch staging is left behind in the temporary area".to_string(),
+            )
+            .at_path(&entry.file_name().to_string_lossy())
+            .aged(age_seconds);
+            if let Some(identity) = identity {
+                finding = finding.in_repository(identity.repo_type, &identity.repo_id);
+                if let Some(commit) = identity.resolved_commit.as_deref() {
+                    finding = finding.at_commit(commit);
+                }
+            }
+            report.findings.push(finding);
+        }
     }
 
     pub fn create_fetch_staging(&self) -> ArchiveResult<PathBuf> {
@@ -3417,5 +4122,359 @@ mod tests {
             )),
             Err(ArchiveError::IntegrityMismatch(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod self_check_tests {
+    use super::*;
+
+    const COMMIT: &str = "1111111111111111111111111111111111111111";
+
+    fn healthy_archive() -> (Archive, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        archive
+            .publish_revision(PublishRequest {
+                repo_id: "org/model".into(),
+                requested_revision: "main".into(),
+                commit: COMMIT.into(),
+                files: vec![
+                    ArchiveFile {
+                        path: "config.json".into(),
+                        bytes: b"{}".to_vec(),
+                    },
+                    ArchiveFile {
+                        path: "weights/model.bin".into(),
+                        bytes: b"payload".to_vec(),
+                    },
+                ],
+            })
+            .unwrap();
+        archive.update_ref("org/model", "main", COMMIT).unwrap();
+        (archive, directory)
+    }
+
+    fn kinds(report: &SelfCheckReport) -> Vec<SelfCheckFindingKind> {
+        report
+            .findings
+            .iter()
+            .map(|finding| finding.finding)
+            .collect()
+    }
+
+    /// Content-addressed snapshot of the whole archive tree, used to prove the
+    /// check repairs nothing and publishes nothing.
+    fn tree_digest(root: &Path) -> String {
+        fn walk(root: &Path, directory: &Path, entries: &mut BTreeMap<String, String>) {
+            let mut listing = fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>();
+            listing.sort();
+            for path in listing {
+                let relative = path.strip_prefix(root).unwrap().display().to_string();
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                if metadata.is_symlink() {
+                    let target = fs::read_link(&path).unwrap();
+                    entries.insert(relative, format!("link:{}", target.display()));
+                } else if metadata.is_dir() {
+                    entries.insert(relative, "dir".into());
+                    walk(root, &path, entries);
+                } else {
+                    entries.insert(relative, sha256(&fs::read(&path).unwrap()));
+                }
+            }
+        }
+        let mut entries = BTreeMap::new();
+        walk(root, root, &mut entries);
+        let rendered = entries
+            .iter()
+            .map(|(path, digest)| format!("{path}\u{0}{digest}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        sha256(rendered.as_bytes())
+    }
+
+    fn manifest_path(archive: &Archive) -> PathBuf {
+        archive
+            .revision_path("org/model", COMMIT)
+            .unwrap()
+            .join(".modelkeep-manifest.json")
+    }
+
+    fn rewrite_manifest(archive: &Archive, from: &str, to: &str) {
+        let path = manifest_path(archive);
+        let contents = fs::read_to_string(&path).unwrap().replace(from, to);
+        fs::write(path, contents).unwrap();
+    }
+
+    fn leave_staging_behind(root: &Path, name: &str) {
+        let staging = root.join("tmp").join(name);
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(
+            staging.join(FETCH_STAGING_FILE),
+            serde_json::to_vec(&FetchStagingMetadata {
+                version: 1,
+                repo_type: RepositoryType::Model,
+                repo_id: "org/model".into(),
+                requested_revision: "main".into(),
+                files: Vec::new(),
+                resolved_commit: Some(COMMIT.into()),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        write_staging_lease_with_expiry(&staging, "abandoned", 0).unwrap();
+    }
+
+    #[test]
+    fn healthy_archive_reports_a_zero_finding_result() {
+        let (archive, _directory) = healthy_archive();
+        assert_eq!(archive.self_check_state(), SelfCheckState::NeverRun);
+
+        let report = archive.self_check();
+
+        assert_eq!(report.findings, Vec::new());
+        assert_eq!(report.status(), "clean");
+        assert_eq!(report.repositories_checked, 1);
+        assert_eq!(report.revisions_checked, 1);
+        assert_eq!(report.files_checked, 2);
+        assert_eq!(report.refs_checked, 1);
+        assert_eq!(report.orphaned_staging_directories, 0);
+        assert!(report.completed_at > 0);
+        // "Checked and clean" has to be distinguishable from "never checked".
+        assert_eq!(
+            archive.self_check_state(),
+            SelfCheckState::Completed(Box::new(report))
+        );
+    }
+
+    #[test]
+    fn detects_a_manifest_path_absent_from_the_revision() {
+        let (archive, _directory) = healthy_archive();
+        fs::remove_file(
+            archive
+                .revision_path("org/model", COMMIT)
+                .unwrap()
+                .join("weights/model.bin"),
+        )
+        .unwrap();
+
+        let report = archive.self_check();
+
+        assert_eq!(kinds(&report), vec![SelfCheckFindingKind::MissingFile]);
+        assert_eq!(
+            report.findings[0].path.as_deref(),
+            Some("weights/model.bin")
+        );
+        assert_eq!(report.findings[0].repo_id.as_deref(), Some("org/model"));
+        assert_eq!(report.findings[0].commit.as_deref(), Some(COMMIT));
+    }
+
+    #[test]
+    fn detects_a_size_that_no_longer_matches_the_manifest() {
+        let (archive, _directory) = healthy_archive();
+        fs::write(
+            archive
+                .revision_path("org/model", COMMIT)
+                .unwrap()
+                .join("config.json"),
+            b"{\"truncated\":true}",
+        )
+        .unwrap();
+
+        let report = archive.self_check();
+
+        assert_eq!(kinds(&report), vec![SelfCheckFindingKind::SizeMismatch]);
+        assert_eq!(report.findings[0].path.as_deref(), Some("config.json"));
+    }
+
+    #[test]
+    fn detects_a_ref_without_a_servable_revision() {
+        let (archive, directory) = healthy_archive();
+        let dangling = "2222222222222222222222222222222222222222";
+        fs::write(
+            directory.path().join("models/org/model/refs/main"),
+            dangling,
+        )
+        .unwrap();
+
+        let report = archive.self_check();
+
+        assert_eq!(kinds(&report), vec![SelfCheckFindingKind::DanglingRef]);
+        assert_eq!(report.findings[0].reference.as_deref(), Some("main"));
+        assert_eq!(report.findings[0].commit.as_deref(), Some(dangling));
+    }
+
+    #[test]
+    fn detects_a_manifest_path_that_leaves_the_revision() {
+        let (archive, _directory) = healthy_archive();
+        rewrite_manifest(
+            &archive,
+            "\"path\":\"config.json\"",
+            "\"path\":\"../escape.json\"",
+        );
+
+        let report = archive.self_check();
+
+        assert_eq!(kinds(&report), vec![SelfCheckFindingKind::UnsafePath]);
+        // The rejected path is identified by manifest position and never
+        // echoed back, so a report can carry no path ModelKeep refuses to use.
+        assert_eq!(report.findings[0].path, None);
+        assert!(!format!("{:?}", report.findings[0]).contains("escape.json"));
+        assert!(report.findings[0].detail.contains("manifest entry 0"));
+    }
+
+    #[test]
+    fn an_internal_archive_path_in_a_manifest_is_counted_and_never_repeated() {
+        let (archive, _directory) = healthy_archive();
+        rewrite_manifest(
+            &archive,
+            "\"path\":\"config.json\"",
+            "\"path\":\".cache/huggingface/download.json\"",
+        );
+
+        let report = archive.self_check();
+
+        // Serving filters an internal archive path, so a manifest that lists
+        // one is a counted observation and not a finding, and the path itself
+        // never reaches a report or a log line.
+        assert_eq!(report.findings, Vec::new());
+        assert_eq!(report.status(), "clean");
+        assert_eq!(report.filtered_internal_paths, 1);
+        assert!(!format!("{report:?}").contains(".cache/huggingface"));
+    }
+
+    #[test]
+    fn detects_a_symbolic_link_that_resolves_outside_the_revision() {
+        let (archive, directory) = healthy_archive();
+        let outside = directory.path().join("outside.json");
+        fs::write(&outside, b"{}").unwrap();
+        let archived = archive
+            .revision_path("org/model", COMMIT)
+            .unwrap()
+            .join("config.json");
+        fs::remove_file(&archived).unwrap();
+        std::os::unix::fs::symlink(&outside, &archived).unwrap();
+
+        let report = archive.self_check();
+
+        assert_eq!(kinds(&report), vec![SelfCheckFindingKind::UnsafePath]);
+        assert_eq!(report.findings[0].path.as_deref(), Some("config.json"));
+    }
+
+    #[test]
+    fn detects_a_manifest_that_does_not_parse_or_match_its_location() {
+        let (archive, _directory) = healthy_archive();
+        rewrite_manifest(
+            &archive,
+            "\"repo_type\":\"model\"",
+            "\"repo_type\":\"dataset\"",
+        );
+        assert_eq!(
+            kinds(&archive.self_check()),
+            vec![
+                SelfCheckFindingKind::InvalidManifest,
+                // The revision stops being servable, so its ref dangles too.
+                SelfCheckFindingKind::DanglingRef,
+            ]
+        );
+
+        fs::write(manifest_path(&archive), b"{not json").unwrap();
+        assert_eq!(
+            kinds(&archive.self_check()),
+            vec![
+                SelfCheckFindingKind::InvalidManifest,
+                SelfCheckFindingKind::DanglingRef,
+            ]
+        );
+    }
+
+    #[test]
+    fn detects_fetch_staging_left_behind_with_its_age() {
+        let (archive, directory) = healthy_archive();
+        leave_staging_behind(directory.path(), "fetch-abandoned-left-over");
+
+        let report = archive.self_check();
+
+        assert_eq!(kinds(&report), vec![SelfCheckFindingKind::OrphanedStaging]);
+        assert_eq!(report.staging_directories, 1);
+        assert_eq!(report.orphaned_staging_directories, 1);
+        assert_eq!(report.findings[0].repo_id.as_deref(), Some("org/model"));
+        assert!(report.findings[0].age_seconds.is_some());
+    }
+
+    #[test]
+    fn live_staging_is_counted_but_is_not_a_finding() {
+        let (archive, directory) = healthy_archive();
+        let staging = directory.path().join("tmp/.fetch-active-live");
+        fs::create_dir_all(&staging).unwrap();
+        write_staging_lease_with_expiry(&staging, "live", unix_timestamp() + 600).unwrap();
+
+        let report = archive.self_check();
+
+        assert_eq!(report.findings, Vec::new());
+        assert_eq!(report.staging_directories, 1);
+        assert_eq!(report.orphaned_staging_directories, 0);
+    }
+
+    #[test]
+    fn check_repairs_nothing_and_leaves_the_archive_untouched() {
+        let (archive, directory) = healthy_archive();
+        fs::remove_file(
+            archive
+                .revision_path("org/model", COMMIT)
+                .unwrap()
+                .join("config.json"),
+        )
+        .unwrap();
+        leave_staging_behind(directory.path(), "fetch-abandoned-kept");
+        let before = tree_digest(directory.path());
+
+        let report = archive.self_check();
+        assert_eq!(
+            kinds(&report),
+            vec![
+                SelfCheckFindingKind::MissingFile,
+                SelfCheckFindingKind::OrphanedStaging,
+            ]
+        );
+
+        // Nothing was repaired, deleted, or re-acquired: the damaged archive is
+        // byte-for-byte what it was, staging included, and a second run says
+        // exactly the same thing.
+        assert_eq!(tree_digest(directory.path()), before);
+        assert_eq!(kinds(&archive.self_check()), kinds(&report));
+        assert_eq!(tree_digest(directory.path()), before);
+    }
+
+    #[test]
+    fn reports_a_measured_duration_against_the_revision_count() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        for index in 0..32u32 {
+            let commit = format!("{index:040x}");
+            archive
+                .publish_revision(PublishRequest {
+                    repo_id: "org/many".into(),
+                    requested_revision: "main".into(),
+                    commit: commit.clone(),
+                    files: vec![ArchiveFile {
+                        path: "config.json".into(),
+                        bytes: commit.clone().into_bytes(),
+                    }],
+                })
+                .unwrap();
+        }
+
+        let report = archive.self_check();
+
+        assert_eq!(report.findings, Vec::new());
+        assert_eq!(report.revisions_checked, 32);
+        assert_eq!(report.files_checked, 32);
+        // The duration is reported beside the revision count it was measured
+        // over, so startup cost stays observable as the archive grows.
+        assert!(report.duration_ms < 60_000);
     }
 }

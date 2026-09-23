@@ -6,6 +6,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -48,10 +49,25 @@ def server(binary, archive, helper=None, captured_logs=None, upstream_endpoint=N
         stderr=subprocess.PIPE,
         text=True,
     )
+    # Drain stderr continuously. Reading it only at teardown lets the pipe fill
+    # and blocks the server on its next log write, which deadlocks the test for
+    # reasons that have nothing to do with what it asserts.
+    drained = []
+    drain = threading.Thread(
+        target=lambda stream: drained.extend(iter(stream.readline, "")),
+        args=(process.stderr,),
+        daemon=True,
+    )
+    drain.start()
+
+    def logs():
+        return "".join(drained)
+
     try:
         for _ in range(100):
             if process.poll() is not None:
-                raise RuntimeError(process.stderr.read())
+                drain.join(timeout=5)
+                raise RuntimeError(logs())
             try:
                 with urllib.request.urlopen(f"{endpoint}/readyz", timeout=0.2) as response:
                     if response.status == 200:
@@ -64,8 +80,9 @@ def server(binary, archive, helper=None, captured_logs=None, upstream_endpoint=N
     finally:
         process.terminate()
         process.wait(timeout=5)
+        drain.join(timeout=5)
         if captured_logs is not None:
-            captured_logs.append(process.stderr.read())
+            captured_logs.append(logs())
 
 
 @contextlib.contextmanager

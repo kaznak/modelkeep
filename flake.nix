@@ -267,6 +267,18 @@
             touch $out
           '';
 
+          archive-startup-self-check = pkgs.runCommand "modelkeep-archive-startup-self-check" {
+            nativeBuildInputs = [
+              pkgs.python3
+              self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep
+            ];
+          } ''
+            export HOME="$TMPDIR"
+            python3 ${./tests/archive_startup_self_check.py} \
+              ${self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep}/bin/modelkeep
+            touch $out
+          '';
+
           qnap-client-acceptance-tests = pkgs.runCommand "modelkeep-qnap-client-acceptance-tests" {
             nativeBuildInputs = [ pkgs.python3 ];
           } ''

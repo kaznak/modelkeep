@@ -21,6 +21,12 @@ headers, bearer tokens, signed URLs, or upstream error payloads.
 | `admin_job_failed` | WARN | `job_id`, `job_kind`, job target (`repo_id`, `revision`), `error_class`, credential-safe `safe_reason` |
 | `incomplete_fetch_preserved` | WARN | `repo_id`, `requested_revision` |
 | `incomplete_fetch_recovered` | INFO | `repo_id`, `requested_revision`, `recovery_action`; resumable staging also has immutable `commit` |
+| `acquisition_progress` | INFO | `request_kind`, `repo_id`, `requested_revision`, `path`, `phase`, `acquired_bytes`, `total_bytes` |
+| `acquisition_deadline_exceeded` | WARN | `request_kind`, `repo_id`, `requested_revision`, `path`, `deadline_seconds`, `acquired_bytes` |
+| `acquisition_abandoned` | ERROR | `repo_id`, `requested_revision` |
+| `archive_self_check_started` | DEBUG | `archive_root` |
+| `archive_self_check_finding` | WARN | `finding`, plus whichever of `repo_id`, `commit`, `path`, `reference`, `age_seconds` the class carries, and `detail` |
+| `archive_self_check_completed` | INFO | `status`, `finding_count`, `revisions_checked`, `duration_ms` |
 
 `request_kind` is one of `model_info`, `model_tree`, `get_file`, or `head_file`.
 `operation` is the operation that failed or caused a transition, such as
@@ -40,6 +46,62 @@ For storage failures, `io_kind=out_of_space` identifies ENOSPC. Other I/O failur
 use `io_kind=other`. ModelKeep never deletes an archived revision in response to
 either event. Capacity measurements and threshold alerting are specified separately
 by Issue 0004.
+
+## Cold-miss acquisition liveness
+
+A cold miss emits `archive_miss` and then reaches one of three outcomes, which is
+what distinguishes a live acquisition from a stalled one.
+
+`acquisition_progress` reports byte movement only. A repeated counter is never
+reported as progress: the event is emitted when `acquired_bytes` exceeds the
+highest value already observed for that acquisition, so a stalled transfer falls
+silent instead of producing a constant stream. `phase` is the fetch helper's own
+phase name, and `total_bytes` is absent when the helper does not know the size.
+
+`acquisition_deadline_exceeded` says the bounded wait ended and the response was
+answered without the file; `deadline_seconds` is the configured bound and
+`acquired_bytes` is what had moved by then. The transfer is not cancelled and is
+not restarted by a retry, so this event is not a failure of the acquisition.
+
+`acquisition_abandoned` is an internal failure: the acquisition ended without a
+result. It is never a cache miss and never a partial result.
+
+## Archive self-check
+
+The self-check runs once at startup, beside serving, and emits one
+`archive_self_check_finding` per finding and exactly one
+`archive_self_check_completed`. The completion event is emitted with
+`status=clean` and `finding_count=0` as well, so "checked and clean" is
+distinguishable from "never checked"; the Admin status route reports the same
+result under `self_check`, whose `status` is `never_run` until the first check
+completes and `running` while one is in flight.
+
+Every restart pays for the completion line, so it carries the result and the
+measurement only. The full counts — repositories, files, refs, staging
+directories, and findings by class — are on the Admin status route and in the
+report `modelkeep self-check` prints, neither of which a restart writes to a
+log. `archive_self_check_started` exists for the same reason at DEBUG: a check
+in flight is answered by the status route without logging.
+
+`archive_self_check_finding.finding` is one of `invalid_manifest`,
+`missing_file`, `size_mismatch`, `unsafe_path`, `dangling_ref`,
+`orphaned_staging`, or `unreadable_archive`. `detail` is ModelKeep's own
+description of archive state and never contains helper output, request headers,
+or credentials. A manifest path that fails validation is never echoed back: the
+finding names the manifest entry by position instead, because a path ModelKeep
+refuses to use is untrusted input everywhere else too.
+
+A manifest entry naming one of ModelKeep's own internal archive paths, such as
+`.cache/huggingface/download.json` left by an old writer, is not a finding.
+Serving filters those paths, so no client can observe or request one; the check
+counts them as `self_check.filtered_internal_paths` on the status route.
+
+The check reads manifests and file metadata only, never file contents, and never
+contacts upstream. It reports and repairs nothing: no finding causes a deletion,
+a re-acquisition, or a write to a published revision (core invariant 4,
+ADR-0007). `duration_ms` beside `revisions_checked` is what makes the startup
+cost observable as the archive grows. Digest verification stays in the `verify`
+and `audit` jobs.
 
 Recovery emits `recovery_action=preserved_for_resume` when an expired, identified
 download is retained for a later retry, and `recovery_action=discarded` when an

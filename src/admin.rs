@@ -29,7 +29,7 @@ use crate::upstream::{FetchProgress, FileSelection};
 use crate::{
     pullthrough::{AcquisitionOutcome, PullThrough, PullThroughError},
     validate_repository_id, validate_revision_ref, Archive, ArchiveError, ArchiveResult,
-    RepositorySummary, RepositoryType,
+    RepositorySummary, RepositoryType, SelfCheckState,
 };
 
 const ADMIN_CAPABILITY: &str = "io.modelkeep/cap/admin";
@@ -193,8 +193,74 @@ struct StatusBody {
     archive_filesystem_available_bytes: u64,
     archive_filesystem_available_percent: u8,
     archive_filesystem_low_space: bool,
+    self_check: SelfCheckSummary,
     principal: PrincipalView,
     auth_methods: Vec<&'static str>,
+}
+
+/// Bounded summary of the startup archive self-check.
+///
+/// `status` distinguishes "never checked" from "checked and clean", which is
+/// the point of reporting a zero-findings result at all. The findings
+/// themselves stay in the structured event stream; only their counts by class
+/// appear here so the route stays a fixed-size status answer.
+#[derive(Debug, Serialize)]
+struct SelfCheckSummary {
+    status: &'static str,
+    completed_at: u64,
+    duration_ms: u64,
+    repositories_checked: usize,
+    revisions_checked: usize,
+    files_checked: usize,
+    refs_checked: usize,
+    staging_directories: usize,
+    orphaned_staging_directories: usize,
+    oldest_orphaned_staging_age_seconds: u64,
+    filtered_internal_paths: usize,
+    finding_count: usize,
+    findings_by_kind: BTreeMap<&'static str, usize>,
+}
+
+impl SelfCheckSummary {
+    fn idle(status: &'static str) -> Self {
+        Self {
+            status,
+            completed_at: 0,
+            duration_ms: 0,
+            repositories_checked: 0,
+            revisions_checked: 0,
+            files_checked: 0,
+            refs_checked: 0,
+            staging_directories: 0,
+            orphaned_staging_directories: 0,
+            oldest_orphaned_staging_age_seconds: 0,
+            filtered_internal_paths: 0,
+            finding_count: 0,
+            findings_by_kind: BTreeMap::new(),
+        }
+    }
+
+    fn from_state(state: SelfCheckState) -> Self {
+        match state {
+            SelfCheckState::NeverRun => Self::idle("never_run"),
+            SelfCheckState::Running => Self::idle("running"),
+            SelfCheckState::Completed(report) => Self {
+                status: report.status(),
+                completed_at: report.completed_at,
+                duration_ms: report.duration_ms,
+                repositories_checked: report.repositories_checked,
+                revisions_checked: report.revisions_checked,
+                files_checked: report.files_checked,
+                refs_checked: report.refs_checked,
+                staging_directories: report.staging_directories,
+                orphaned_staging_directories: report.orphaned_staging_directories,
+                oldest_orphaned_staging_age_seconds: report.oldest_orphaned_staging_age_seconds,
+                filtered_internal_paths: report.filtered_internal_paths,
+                finding_count: report.findings.len(),
+                findings_by_kind: report.findings_by_kind(),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1389,6 +1455,10 @@ async fn status(state: AdminState, headers: HeaderMap, pullthrough_enabled: bool
             archive_filesystem_available_bytes: capacity.available_bytes,
             archive_filesystem_available_percent: capacity.available_percent,
             archive_filesystem_low_space: capacity.low_space,
+            // The self-check runs once at startup, beside serving. Reporting
+            // its stored result keeps this route a read of cached state, and
+            // never starts an archive walk from a status poll.
+            self_check: SelfCheckSummary::from_state(state.archive.self_check_state()),
             principal,
             auth_methods: state.config.auth_methods(),
         })
@@ -2339,6 +2409,76 @@ mod tests {
             assert!(value["archive_filesystem_low_space"].is_boolean());
             assert!(!directory.path().join("tmp").exists());
         }
+    }
+
+    #[tokio::test]
+    async fn management_status_distinguishes_an_unchecked_archive_from_a_clean_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        archive
+            .publish_revision(crate::PublishRequest {
+                repo_id: "org/model".into(),
+                requested_revision: "main".into(),
+                commit: "a".repeat(40),
+                files: vec![crate::ArchiveFile {
+                    path: "config.json".into(),
+                    bytes: b"{}".to_vec(),
+                }],
+            })
+            .unwrap();
+        let app = router(
+            archive.clone(),
+            Config::token("127.0.0.1:0".parse().unwrap(), "secret"),
+            None,
+        )
+        .unwrap();
+        let read_status = || {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(request("/api/admin/v1/status", Some("secret")))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                serde_json::from_slice::<serde_json::Value>(
+                    &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+                )
+                .unwrap()
+            }
+        };
+
+        let before = read_status().await;
+        assert_eq!(before["self_check"]["status"], "never_run");
+
+        archive.self_check();
+        let clean = read_status().await;
+        assert_eq!(clean["self_check"]["status"], "clean");
+        assert_eq!(clean["self_check"]["finding_count"], 0);
+        assert_eq!(clean["self_check"]["revisions_checked"], 1);
+        assert_eq!(clean["self_check"]["files_checked"], 1);
+        assert!(clean["self_check"]["completed_at"].as_u64().unwrap() > 0);
+        assert!(clean["self_check"]["duration_ms"].is_number());
+        assert_eq!(
+            clean["self_check"]["findings_by_kind"],
+            serde_json::json!({})
+        );
+
+        std::fs::remove_file(
+            directory
+                .path()
+                .join("models/org/model/revisions")
+                .join("a".repeat(40))
+                .join("config.json"),
+        )
+        .unwrap();
+        archive.self_check();
+        let damaged = read_status().await;
+        assert_eq!(damaged["self_check"]["status"], "findings");
+        assert_eq!(damaged["self_check"]["finding_count"], 1);
+        assert_eq!(
+            damaged["self_check"]["findings_by_kind"],
+            serde_json::json!({ "missing_file": 1 })
+        );
     }
 
     #[test]
