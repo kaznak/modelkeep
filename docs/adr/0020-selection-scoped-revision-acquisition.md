@@ -1,6 +1,6 @@
 # ADR-0020: Selection-scoped revision acquisition
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-09-24
 - Supersedes in part: ADR-0008
 

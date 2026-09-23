@@ -1,5 +1,5 @@
 ---
-status: open
+status: in-progress
 priority: P0
 related_adrs:
   - ADR-0020
@@ -15,9 +15,9 @@ updated: 2026-09-24
 ---
 # Issue 0070: Acquire a selected subset of repository files
 
-- Status: Open
+- Status: In Progress
 - Priority: P0
-- Related ADR: ADR-0020 (proposed, governs this work), ADR-0008 (partially superseded),
+- Related ADR: ADR-0020 (governs this work), ADR-0008 (partially superseded),
   ADR-0002, ADR-0005, ADR-0010, ADR-0015, ADR-0017, ADR-0018
 
 ## Objective
@@ -82,16 +82,12 @@ The three work items below are one reviewable unit.
 
 ## Governing decision
 
-ADR-0008 forbade a file filter and deferred per-file acquisition. ADR-0020 (proposed)
-specifies the deferred semantics and partially supersedes it: an acquisition may be
+ADR-0008 forbade a file filter and deferred per-file acquisition. ADR-0020 specifies the deferred semantics and partially supersedes it: an acquisition may be
 restricted to a selection; the archive records what it holds and asserts nothing about
 upstream completeness, so the manifest format and the four serving gates are unchanged;
 a path the archive does not hold is a miss resolved against upstream; and a revision's
 file set may grow but never change, so a revision that lacks a requested file is
 extended rather than re-published.
-
-**This issue is blocked on ADR-0020 being accepted.** If a decision there changes, this
-issue changes with it.
 
 ## Work items
 
