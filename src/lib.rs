@@ -1588,6 +1588,7 @@ fn validate_relative_file_path(value: &str) -> ArchiveResult<&Path> {
     let path = Path::new(value);
     if value.is_empty()
         || path.is_absolute()
+        || is_internal_archive_path(value)
         || value
             .bytes()
             .any(|byte| byte == 0 || byte.is_ascii_control())
@@ -1601,6 +1602,14 @@ fn validate_relative_file_path(value: &str) -> ArchiveResult<&Path> {
         return Err(ArchiveError::InvalidPath(value.into()));
     }
     Ok(path)
+}
+
+pub(crate) fn is_internal_archive_path(value: &str) -> bool {
+    let mut components = value.split('/');
+    let first = components.next().unwrap_or("");
+    first.starts_with(".modelkeep-")
+        || first == ".cache"
+        || components.any(|component| component == ".cache")
 }
 
 fn write_manifest(
@@ -2192,6 +2201,20 @@ mod tests {
             archive.publish_revision(bad),
             Err(ArchiveError::InvalidPath(_))
         ));
+
+        for path in [
+            ".modelkeep-staging-lease",
+            ".modelkeep-fetch.json",
+            ".cache/huggingface/download.json",
+            "nested/.cache/download.json",
+        ] {
+            let mut bad = request("cccccccc", b"internal");
+            bad.files[0].path = path.into();
+            assert!(matches!(
+                archive.publish_revision(bad),
+                Err(ArchiveError::InvalidPath(_))
+            ));
+        }
     }
 
     #[test]

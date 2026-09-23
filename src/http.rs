@@ -224,6 +224,7 @@ async fn repository_info(
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?
         .iter()
         .filter_map(|file| file["path"].as_str())
+        .filter(|path| !crate::is_internal_archive_path(path))
         .map(|path| serde_json::json!({ "rfilename": path }))
         .collect::<Vec<_>>();
     Ok(Json(serde_json::json!({
@@ -305,6 +306,11 @@ async fn repository_tree(
         .as_array()
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?
         .iter()
+        .filter(|file| {
+            file["path"]
+                .as_str()
+                .is_some_and(|path| !crate::is_internal_archive_path(path))
+        })
         .map(|file| {
             serde_json::json!({
                 "type": "file",
@@ -408,6 +414,9 @@ async fn file_response(
     let (namespace, repo, revision, path) = target;
     let repo_id = format!("{namespace}/{repo}");
     tracing::info!(event = "archive_request", request_kind = if head_only { "head_file" } else { "get_file" }, repo_type = %repo_type, repo_id = %repo_id, requested_revision = %revision, path = %path, "archive request received");
+    if crate::is_internal_archive_path(&path) {
+        return Err(StatusCode::NOT_FOUND);
+    }
     let resolved_result = if is_hf_commit(&revision) {
         state
             .archive
@@ -540,6 +549,7 @@ mod tests {
 
     use super::*;
     use axum::body::to_bytes;
+    use axum::http::Method;
     use std::io::Write;
     use std::sync::Mutex;
     use tower::ServiceExt;
@@ -885,6 +895,75 @@ mod tests {
         assert_eq!(value[0]["type"], "file");
         assert_eq!(value[0]["path"], "config.json");
         assert_eq!(value[0]["size"], 10);
+    }
+
+    #[tokio::test]
+    async fn hides_legacy_internal_staging_entries_from_clients() {
+        let (app, directory) = test_router();
+        let manifest_path = directory
+            .path()
+            .join("models/org/model/revisions")
+            .join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .join(".modelkeep-manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["files"].as_array_mut().unwrap().extend([
+            serde_json::json!({
+                "path": ".modelkeep-staging-lease",
+                "size": 1,
+                "sha256": "0"
+            }),
+            serde_json::json!({
+                "path": ".cache/huggingface/download.json",
+                "size": 1,
+                "sha256": "0"
+            }),
+        ]);
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let info = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/models/org/model/revision/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(info.status(), StatusCode::OK);
+        let info: serde_json::Value =
+            serde_json::from_slice(&to_bytes(info.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(info["siblings"].as_array().unwrap().len(), 1);
+        assert_eq!(info["siblings"][0]["rfilename"], "config.json");
+
+        let tree = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/models/org/model/tree/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa?recursive=true&expand=false")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tree.status(), StatusCode::OK);
+        let tree: serde_json::Value =
+            serde_json::from_slice(&to_bytes(tree.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(tree.as_array().unwrap().len(), 1);
+        assert_eq!(tree[0]["path"], "config.json");
+
+        let internal = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::HEAD)
+                    .uri("/org/model/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/.modelkeep-staging-lease")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(internal.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

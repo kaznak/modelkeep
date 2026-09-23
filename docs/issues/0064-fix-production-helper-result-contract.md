@@ -75,3 +75,31 @@ deployment endpoints.
 The helper must keep stdout machine-readable and credential-free; diagnostics belong
 on stderr and must not be surfaced verbatim. A fix that merely accepts arbitrary JSON
 would hide contract drift and weaken the trust boundary.
+
+## Investigation and implementation status
+
+The published v0.4.4 arm64 image contains the byte-identical tracked helper. Direct
+helper acquisition and a local real-server cold miss both completed, so no evidence
+supports relaxing the helper JSON contract.
+
+Operational logs instead exposed a completed legacy manifest advertising
+`.modelkeep-staging-lease` as a repository file. A supported client then issued a
+`HEAD` for that internal path; because the lease is removed at publication and does
+not exist upstream, ModelKeep incorrectly treated the request as a cold miss and ran
+the helper. The implementation now:
+
+- excludes root `.modelkeep-*` and every `.cache` component from model-info and tree
+  responses, including when an old durable manifest contains them;
+- returns `404` for direct requests to those internal paths without invoking
+  pull-through;
+- rejects those paths in every new publication;
+- exercises the production `hf_fetch.py` against a local ModelKeep upstream in both
+  supported real client-version checks;
+- injects legacy internal entries into a manifest and proves a fresh real client can
+  download the archived revision without requesting them.
+
+The implementation and deterministic checks are complete. Keep this issue open until
+the replacement arm64 image is deployed and both a completed legacy revision and a
+new small prefetch pass on the target runtime. If the new prefetch still reports a
+malformed result event, capture the safe structured reason as a separate remaining
+runtime discrepancy; do not weaken parsing based on unobserved output.

@@ -168,7 +168,8 @@
               python3 ${./tests/hf_client_integration.py} \
                 ${self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep}/bin/modelkeep \
                 ${./tests/fixtures/hf_fetch_fixture.py} \
-                ${hfClient.version}
+                ${hfClient.version} \
+                ${./upstream/hf_fetch.py}
               touch $out
             '';
         in {

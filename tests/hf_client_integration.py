@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import contextlib
+import json
 import os
 import socket
 import subprocess
@@ -26,7 +27,7 @@ def unused_port():
 
 
 @contextlib.contextmanager
-def server(binary, archive, helper=None, captured_logs=None):
+def server(binary, archive, helper=None, captured_logs=None, upstream_endpoint=None):
     port = unused_port()
     endpoint = f"http://127.0.0.1:{port}"
     environment = os.environ.copy()
@@ -36,6 +37,10 @@ def server(binary, archive, helper=None, captured_logs=None):
     else:
         environment.pop("MODELKEEP_HF_PYTHON", None)
         environment.pop("MODELKEEP_HF_HELPER", None)
+    if upstream_endpoint:
+        environment["HF_ENDPOINT"] = upstream_endpoint
+    else:
+        environment.pop("HF_ENDPOINT", None)
     process = subprocess.Popen(
         [str(binary), "serve", str(archive), f"127.0.0.1:{port}"],
         env=environment,
@@ -94,6 +99,7 @@ def main():
     binary = Path(sys.argv[1])
     helper = Path(sys.argv[2])
     expected_version = sys.argv[3]
+    actual_helper = Path(sys.argv[4])
     assert huggingface_hub_version == expected_version, (
         f"expected huggingface_hub {expected_version}, got {huggingface_hub_version}"
     )
@@ -212,7 +218,55 @@ def main():
             assert '"request_kind":"head_file"' in acquisition_logs[0]
             assert '"path":"model.safetensors"' in acquisition_logs[0]
 
-            with server(binary, archive) as endpoint:
+            # Exercise the production helper itself, rather than only the synthetic
+            # fixture that independently implements its stdout event contract. The
+            # populated first archive acts as a local upstream, so this remains
+            # deterministic and does not require internet access.
+            actual_archive = root / "actual-helper-archive"
+            with server(binary, archive) as upstream_endpoint:
+                with server(
+                    binary,
+                    actual_archive,
+                    actual_helper,
+                    upstream_endpoint=upstream_endpoint,
+                ) as endpoint:
+                    actual = Path(
+                        download(endpoint, root / "actual-helper-client", "main")
+                    )
+                    for relative, expected in expected_payloads.items():
+                        assert (actual / relative).read_bytes() == expected
+
+            # Released archives can outlive the writer that created their manifest.
+            # Simulate an old manifest that accidentally listed transient downloader
+            # metadata and prove a real supported client never observes or requests it.
+            manifest_path = (
+                archive
+                / "models"
+                / "org"
+                / "model"
+                / "revisions"
+                / COMMIT
+                / ".modelkeep-manifest.json"
+            )
+            manifest = json.loads(manifest_path.read_text())
+            manifest["files"].extend(
+                [
+                    {
+                        "path": ".modelkeep-staging-lease",
+                        "size": 1,
+                        "sha256": "0",
+                    },
+                    {
+                        "path": ".cache/huggingface/download.json",
+                        "size": 1,
+                        "sha256": "0",
+                    },
+                ]
+            )
+            manifest_path.write_text(json.dumps(manifest, separators=(",", ":")))
+
+            offline_logs = []
+            with server(binary, archive, captured_logs=offline_logs) as endpoint:
                 offline = Path(download(endpoint, root / "offline-client", COMMIT))
                 for relative, expected in expected_payloads.items():
                     assert (offline / relative).read_bytes() == expected
@@ -236,6 +290,8 @@ def main():
                         )
                     )
                 assert len(results) == 4
+            assert ".modelkeep-staging-lease" not in offline_logs[0]
+            assert ".cache/huggingface" not in offline_logs[0]
 
 
 if __name__ == "__main__":
