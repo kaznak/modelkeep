@@ -51,8 +51,8 @@ Nix flake から amd64 / arm64 image をビルドし、`v*` tag が push され�
 image を公開します。
 
 ```sh
-git tag v0.4.6
-git push origin v0.4.6
+git tag v0.4.7
+git push origin v0.4.7
 ```
 
 QNAP 側では以下のように起動します。
@@ -71,7 +71,7 @@ tailscale serve --service=svc:modelkeep-admin --accept-app-caps=io.modelkeep/cap
 tailscale serve status
 ```
 
-両方の Compose ファイルは公開済みの `ghcr.io/kaznak/modelkeep:v0.4.6` を既定で使用するため、
+両方の Compose ファイルは公開済みの `ghcr.io/kaznak/modelkeep:v0.4.7` を既定で使用するため、
 image 用の環境変数や GHCR ログインは不要です。QNAP Container Station の Application 作成では
 Compose の環境変数デフォルト値が展開されないため、別 registry や別 release を使う場合は
 両方のファイルの `image:` を直接変更してください。

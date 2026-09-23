@@ -71,7 +71,7 @@ does not exercise crash recovery.
 Keep ModelKeep stopped for at least 130 seconds. Leases are refreshed every 30 seconds
 and expire after 120 seconds; starting sooner can correctly leave the staging active
 and cause the retry to report a temporary conflict. After the wait, recreate or start
-the same pinned v0.4.6 Application with the same `/data` mount.
+the same pinned v0.4.7 Application with the same `/data` mount.
 
 ## Retry and verify reuse
 
