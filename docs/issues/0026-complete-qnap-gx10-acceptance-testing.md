@@ -1,15 +1,15 @@
 ---
-status: open
+status: complete
 priority: P1
 related_adrs:
   - ADR-0011
   - ADR-0013
 created: 2026-08-21
-updated: 2026-08-24
+updated: 2026-09-23
 ---
 # Issue 0026: Complete QNAP and GX10 acceptance testing
 
-- Status: Open
+- Status: Complete
 - Priority: P1
 - Related ADR: ADR-0011, ADR-0013
 
@@ -59,3 +59,17 @@ The client-side commands and the required operator transitions are documented in
 
 This cannot be completed in generic CI and requires access to the intended QNAP,
 tailnet policy, storage share, and GX10.
+
+## Completion evidence
+
+Completed on 2026-09-23 against the pinned multi-architecture
+`ghcr.io/kaznak/modelkeep:v0.4.4` image. The target QNAP was upgraded from QuTS hero
+h6.0.1.3564 to h6.0.2.3591 during the reboot phase. The retained local acceptance
+record passed preflight, cold and empty-client warm downloads, upstream-offline
+serving, HEAD/Range checks, LAN boundary checks, container recreation, and QNAP
+firmware-update/reboot recovery. The final status reported seven model repositories
+and approximately 1.92 TB of logical archive data. Internal endpoints and site
+identifiers remain only in the ignored operator record.
+
+The snapshot/backup restore phase is intentionally optional after Issue 0063 split
+site disaster-recovery validation from per-release ModelKeep acceptance.
