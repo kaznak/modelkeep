@@ -18,6 +18,8 @@ from pathlib import Path
 
 
 STABLE_COMMIT = "b" * 40
+CRASH_COMMIT = "c" * 40
+PARTIAL_PAYLOAD = b"incomplete-model-payload"
 
 
 def free_port():
@@ -126,6 +128,32 @@ def expire_staging_leases(archive):
     return staging
 
 
+def resumable_checkpoint(archive):
+    """Return durable resumable staging, plus state useful on timeout."""
+    states = []
+    for staging in sorted((archive / "tmp").glob(".fetch-active-*")):
+        partial = staging / "partial.bin"
+        metadata_path = staging / ".modelkeep-fetch.json"
+        payload_ready = partial.is_file() and partial.read_bytes() == PARTIAL_PAYLOAD
+        try:
+            metadata = json.loads(metadata_path.read_text())
+        except (OSError, json.JSONDecodeError) as error:
+            states.append(f"{staging.name}: payload={payload_ready}, metadata={error!r}")
+            continue
+        commit = metadata.get("resolved_commit")
+        states.append(
+            f"{staging.name}: payload={payload_ready}, resolved_commit={commit!r}"
+        )
+        if (
+            payload_ready
+            and metadata.get("repo_id") == "org/crash"
+            and metadata.get("requested_revision") == "main"
+            and commit == CRASH_COMMIT
+        ):
+            return staging, states
+    return None, states
+
+
 def crash_recovery_check(current, crash_helper, resume_helper, root):
     archive = root / "crash-archive"
     cache = create_cache(root / "stable", "org/stable", STABLE_COMMIT, b"stable")
@@ -144,13 +172,18 @@ def crash_recovery_check(current, crash_helper, resume_helper, root):
 
     requester = threading.Thread(target=request_missing_revision)
     requester.start()
+    checkpoint_states = []
     for _ in range(200):
-        if list((archive / "tmp").glob(".fetch-active-*/partial.bin")):
+        checkpoint, checkpoint_states = resumable_checkpoint(archive)
+        if checkpoint is not None:
             break
         time.sleep(0.025)
     else:
         stop_server(process, force=True)
-        raise AssertionError("fetch fixture did not write its partial payload")
+        raise AssertionError(
+            "fetch fixture did not reach its durable resumable checkpoint: "
+            + ("; ".join(checkpoint_states) or "no active fetch staging")
+        )
     stop_server(process, force=True)
     requester.join(timeout=5)
     assert not requester.is_alive()

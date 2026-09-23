@@ -17,8 +17,12 @@ args = parser.parse_args()
 
 output = Path(args.output)
 output.mkdir(parents=True, exist_ok=True)
-print(json.dumps({"type": "resolved", "version": 1, "commit": "c" * 40}), flush=True)
+# Make the payload observable first so the crash harness proves that it also waits
+# for ModelKeep to durably consume and record the resolved commit. This models the
+# scheduling race where helper output has been written but the server has not read it.
 (output / "partial.bin").write_bytes(b"incomplete-model-payload")
+time.sleep(0.25)
+print(json.dumps({"type": "resolved", "version": 1, "commit": "c" * 40}), flush=True)
 print(
     json.dumps(
         {
