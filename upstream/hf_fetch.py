@@ -25,6 +25,7 @@ class ProgressReporter:
         self.minimum_interval = minimum_interval
         self.lock = threading.Lock()
         self.last_emit = {}
+        self.last_event = {}
         self.output = None
         self.expected = {}
         self.completed_files = -1
@@ -35,9 +36,12 @@ class ProgressReporter:
         now = time.monotonic()
         key = (event["phase"], event.get("unit"))
         with self.lock:
+            if not force and self.last_event.get(key) == event:
+                return
             if not force and now - self.last_emit.get(key, 0.0) < self.minimum_interval:
                 return
             self.last_emit[key] = now
+            self.last_event[key] = event.copy()
             print(json.dumps({"type": "progress", "version": 1, **event}, separators=(",", ":")), file=self.stream, flush=True)
 
     def phase(self, phase):
@@ -49,11 +53,6 @@ class ProgressReporter:
         if not self.expected:
             self.phase("downloading")
             return
-        total = sum(self.expected.values()) if all(size is not None for size in self.expected.values()) else None
-        byte_event = {"phase": "downloading", "unit": "bytes", "completed": 0}
-        if total is not None:
-            byte_event["total"] = total
-        self.emit(byte_event, force=True)
         self._report_files(force=True)
 
     def _report_files(self, force=False, finalized=False):
@@ -70,6 +69,17 @@ class ProgressReporter:
             if path.is_file() and ((size is not None and metadata.st_size == size) or (size is None and finalized)):
                 completed += 1
                 completed_bytes += metadata.st_size
+        download_metadata = self.output / ".cache" / "huggingface" / "download"
+        try:
+            incomplete = download_metadata.glob("*.incomplete")
+            partial_bytes = sum(
+                path.stat().st_size for path in incomplete if path.is_file()
+            )
+        except OSError:
+            partial_bytes = 0
+        completed_bytes += partial_bytes
+        if self.expected and all(size is not None for size in self.expected.values()):
+            completed_bytes = min(completed_bytes, sum(self.expected.values()))
         changed = completed != self.completed_files
         bytes_changed = completed_bytes != self.completed_bytes
         self.completed_files = completed

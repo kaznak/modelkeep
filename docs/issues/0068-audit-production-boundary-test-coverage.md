@@ -82,3 +82,21 @@ supported real clients against deterministic local protocol fixtures, while reta
 small optional real-upstream observations separately. QNAP acceptance should validate
 filesystem and container-runtime behavior, not compensate for missing deterministic
 application tests.
+
+## Implementation status
+
+The initial audit and deterministic fixes are implemented:
+
+- `docs/testing-strategy.md` assigns each release-critical boundary to a black-box
+  Nix check and limits QNAP acceptance to runtime-specific evidence;
+- the restart check now carries retained partial state through `hf_fetch.acquire`,
+  isolates resume-only client diagnostics, completes publication, and removes staging;
+- supported real-client checks continue to exercise both pinned client versions,
+  production-helper cold acquisition, offline retrieval, and legacy metadata;
+- helper progress now includes retained `.incomplete` bytes and suppresses unchanged
+  counter events, with the previous completed-files-only expectation replaced by
+  regression tests.
+
+Focused checks and `nix flake check` pass on x86_64-linux. Keep this issue open until
+the native amd64 and arm64 GitHub Actions jobs confirm the packaged checks on both
+release architectures.

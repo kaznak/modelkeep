@@ -7,6 +7,8 @@ ModelKeep は、Hugging Face のモデルおよびデータセットリポジト
 既存の `hf` / `huggingface_hub` クライアントへ HTTP で再配信します。
 
 architecture、milestone、要件と Issue の対応は[開発計画](docs/development-plan.md)で管理します。
+CI と実機受け入れ試験の責務分担は
+[テストカバレッジ方針](docs/testing-strategy.md)に記載しています。
 
 QNAP の archive が永続データの正本です。クライアントキャッシュ、index、サーバープロセス、
 コンテナイメージを交換・再構築しても、保存済みモデルを再ダウンロードする必要はありません。

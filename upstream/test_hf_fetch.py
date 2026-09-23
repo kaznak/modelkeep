@@ -88,20 +88,21 @@ class HfFetchTests(unittest.TestCase):
         self.assertEqual(byte_events[-1]["completed"], 10)
         self.assertEqual(byte_events[-1]["total"], 10)
 
-    def test_progress_counts_only_complete_materialized_files(self):
+    def test_progress_includes_retained_incomplete_file_bytes(self):
         stream = io.StringIO()
         reporter = hf_fetch.ProgressReporter(stream=stream, minimum_interval=0)
         with tempfile.TemporaryDirectory() as output:
             reporter.set_expected(output, [("a.bin", 4), ("b.bin", 6)])
-            progress_type = reporter.tqdm_class()
-            first = progress_type(total=4, unit="B")
-            second = progress_type(total=6, unit="B")
-            first.update(4)
             Path(output, "a.bin").write_bytes(b"aaaa")
-            first.close()
-            second.update(3)
+            partial = Path(output, ".cache", "huggingface", "download", "b.incomplete")
+            partial.parent.mkdir(parents=True)
+            partial.write_bytes(b"bbb")
+            reporter._report_files()
+            partial.write_bytes(b"bbbbbb")
+            reporter._report_files()
             Path(output, "b.bin").write_bytes(b"bbbbbb")
-            second.close()
+            partial.unlink()
+            reporter._report_files(force=True, finalized=True)
 
         events = [json.loads(line) for line in stream.getvalue().splitlines()]
         byte_events = [event for event in events if event.get("unit") == "bytes"]
@@ -110,9 +111,24 @@ class HfFetchTests(unittest.TestCase):
             "type": "progress", "version": 1, "phase": "downloading", "unit": "bytes",
             "completed": 10, "total": 10,
         })
-        self.assertIn(4, [event["completed"] for event in byte_events])
+        self.assertIn(7, [event["completed"] for event in byte_events])
         self.assertEqual(file_events[-1]["completed"], 2)
         self.assertEqual(file_events[-1]["total"], 2)
+
+    def test_unchanged_counters_do_not_emit_false_progress_heartbeats(self):
+        stream = io.StringIO()
+        reporter = hf_fetch.ProgressReporter(stream=stream, minimum_interval=0)
+        with tempfile.TemporaryDirectory() as output:
+            reporter.set_expected(output, [("model.bin", 10)])
+            reporter._report_files()
+            reporter._report_files()
+
+        byte_events = [
+            event
+            for event in map(json.loads, stream.getvalue().splitlines())
+            if event.get("unit") == "bytes"
+        ]
+        self.assertEqual(len(byte_events), 1)
 
     def test_unknown_file_sizes_do_not_manufacture_a_byte_total(self):
         stream = io.StringIO()
