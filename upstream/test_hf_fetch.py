@@ -198,6 +198,116 @@ class HfFetchTests(unittest.TestCase):
         self.assertEqual(download_calls[0]["repo_type"], "dataset")
         self.assertEqual(result, {"commit": COMMIT_A, "files": ["data.jsonl"]})
 
+    def subset_api(self):
+        return SimpleNamespace(
+            repo_info=lambda repo_id, revision, repo_type, files_metadata=False: (
+                SimpleNamespace(
+                    sha=COMMIT_A,
+                    siblings=[
+                        SimpleNamespace(rfilename="config.json", size=6),
+                        SimpleNamespace(rfilename="q4/a.gguf", size=3),
+                        SimpleNamespace(rfilename="q4/b.gguf", size=3),
+                        SimpleNamespace(rfilename="q8/a.gguf", size=3),
+                    ],
+                )
+            )
+        )
+
+    def test_include_and_exclude_patterns_are_passed_to_the_official_client(self):
+        api = self.subset_api()
+        download_calls = []
+
+        def download(**kwargs):
+            download_calls.append(kwargs)
+            target = Path(kwargs["local_dir"], "q4", "a.gguf")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"aaa")
+
+        with tempfile.TemporaryDirectory() as output:
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = hf_fetch.acquire(
+                    "org/model",
+                    "main",
+                    output,
+                    files=["q4/"],
+                    exclude=["q4/b.gguf"],
+                    api=api,
+                    download=download,
+                )
+
+        self.assertEqual(download_calls[0]["allow_patterns"], ["q4/"])
+        self.assertEqual(download_calls[0]["ignore_patterns"], ["q4/b.gguf"])
+        self.assertEqual(result, {"commit": COMMIT_A, "files": ["q4/a.gguf"]})
+
+    def test_whole_repository_acquisition_passes_no_patterns(self):
+        api = self.subset_api()
+        download_calls = []
+
+        def download(**kwargs):
+            download_calls.append(kwargs)
+            Path(kwargs["local_dir"], "config.json").write_bytes(b"config")
+
+        with tempfile.TemporaryDirectory() as output:
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = hf_fetch.acquire(
+                    "org/model", "main", output, api=api, download=download
+                )
+
+        self.assertIsNone(download_calls[0]["allow_patterns"])
+        self.assertIsNone(download_calls[0]["ignore_patterns"])
+        self.assertEqual(result["files"], ["config.json"])
+
+    def test_files_outside_the_selection_are_not_recorded(self):
+        api = self.subset_api()
+
+        def download(**kwargs):
+            for path in ("config.json", "q4/a.gguf", "q4/b.gguf", "q8/a.gguf"):
+                target = Path(kwargs["local_dir"], path)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"xxx")
+
+        with tempfile.TemporaryDirectory() as output:
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = hf_fetch.acquire(
+                    "org/model",
+                    "main",
+                    output,
+                    files=["q4/"],
+                    exclude=["q4/b.gguf"],
+                    api=api,
+                    download=download,
+                )
+
+        self.assertEqual(result["files"], ["q4/a.gguf"])
+
+    def test_expected_files_honour_include_and_exclude(self):
+        info = self.subset_api().repo_info("org/model", "main", "model", True)
+
+        self.assertEqual(
+            hf_fetch.expected_files(info),
+            [
+                ("config.json", 6),
+                ("q4/a.gguf", 3),
+                ("q4/b.gguf", 3),
+                ("q8/a.gguf", 3),
+            ],
+        )
+        self.assertEqual(
+            hf_fetch.expected_files(info, ["q4/"], ["q4/b.gguf"]),
+            [("q4/a.gguf", 3)],
+        )
+        self.assertEqual(
+            hf_fetch.expected_files(info, None, ["q4/*", "q8/*"]),
+            [("config.json", 6)],
+        )
+
+    def test_directory_pattern_is_expanded_like_the_official_client(self):
+        self.assertEqual(hf_fetch.normalized_pattern("q4/"), "q4/*")
+        self.assertEqual(hf_fetch.normalized_pattern("q4/*.gguf"), "q4/*.gguf")
+        self.assertTrue(hf_fetch.selected("q4/a.gguf", ["q4/"], None))
+        self.assertFalse(hf_fetch.selected("q40/a.gguf", ["q4/"], None))
+        self.assertFalse(hf_fetch.selected("q4/a.gguf", ["q4/"], ["*.gguf"]))
+
     def test_malformed_resolved_commit_is_rejected_before_download(self):
         api = MovingRefApi()
         api.repo_info = lambda *args, **kwargs: SimpleNamespace(sha="not-a-commit")

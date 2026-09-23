@@ -146,13 +146,38 @@ def safe_relative_files(root: Path):
     return sorted(result)
 
 
-def expected_files(info, patterns=None):
+def normalized_pattern(pattern):
+    """Mirrors the official client's pattern normalization.
+
+    `huggingface_hub.utils.filter_repo_objects` rewrites separators and expands
+    a trailing `/` into a directory wildcard before matching with
+    `fnmatch.fnmatchcase`. The expected-file set and the post-download filter
+    must agree with what the client actually transfers.
+    """
+    pattern = str(pattern).replace("\\", "/")
+    return pattern + "*" if pattern.endswith("/") else pattern
+
+
+def selected(path, include=None, exclude=None):
+    path = str(path).replace("\\", "/")
+    if include and not any(
+        fnmatch.fnmatchcase(path, normalized_pattern(pattern)) for pattern in include
+    ):
+        return False
+    if exclude and any(
+        fnmatch.fnmatchcase(path, normalized_pattern(pattern)) for pattern in exclude
+    ):
+        return False
+    return True
+
+
+def expected_files(info, patterns=None, exclude=None):
     result = []
     for sibling in getattr(info, "siblings", None) or []:
         path = getattr(sibling, "rfilename", None)
         if not isinstance(path, str) or not path or ".cache" in Path(path).parts:
             continue
-        if patterns and not any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns):
+        if not selected(path, patterns, exclude):
             continue
         size = getattr(sibling, "size", None)
         result.append((path, size if isinstance(size, int) and size >= 0 else None))
@@ -164,6 +189,7 @@ def acquire(
     requested_revision,
     output,
     files=None,
+    exclude=None,
     repo_type="model",
     api=None,
     download=None,
@@ -194,7 +220,7 @@ def acquire(
         json.dumps({"type": "resolved", "version": 1, "commit": commit}, separators=(",", ":")),
         flush=True,
     )
-    expected = expected_files(info, files)
+    expected = expected_files(info, files, exclude)
     if progress is not None:
         progress.set_expected(output, expected)
 
@@ -204,15 +230,17 @@ def acquire(
         repo_type=repo_type,
         local_dir=str(output),
         allow_patterns=files or None,
+        ignore_patterns=exclude or None,
     )
     if progress is not None:
         download_kwargs["tqdm_class"] = progress.tqdm_class()
     with contextlib.redirect_stdout(sys.stderr):
         download(**download_kwargs)
     archived_files = safe_relative_files(output)
-    if files:
-        requested = set(files)
-        archived_files = [path for path in archived_files if path in requested]
+    if files or exclude:
+        archived_files = [
+            path for path in archived_files if selected(path, files, exclude)
+        ]
     if progress is not None:
         if not expected:
             progress.set_expected(output, [(path, None) for path in archived_files])
@@ -228,6 +256,7 @@ def main():
     parser.add_argument("--revision", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--file", action="append", dest="files")
+    parser.add_argument("--exclude", action="append", dest="exclude")
     args = parser.parse_args()
 
     result = acquire(
@@ -236,6 +265,7 @@ def main():
         requested_revision=args.revision,
         output=args.output,
         files=args.files,
+        exclude=args.exclude,
         progress=ProgressReporter(),
     )
     print(json.dumps({"type": "result", **result}, separators=(",", ":")), flush=True)

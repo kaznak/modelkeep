@@ -2,15 +2,23 @@ use std::sync::Arc;
 
 use crate::singleflight::SingleFlight;
 use crate::upstream::{
-    FetchProgress, FetchRequest, InvalidOutputReason, UpstreamError, UpstreamFetcher,
+    FetchProgress, FetchRequest, FileSelection, InvalidOutputReason, UpstreamError, UpstreamFetcher,
 };
 use crate::{is_hf_commit, Archive, ArchiveError, RepositoryType, SourceFile};
+
+/// Identity of one in-flight acquisition.
+///
+/// The normalized selection is part of it (ADR-0020 decision 5): two callers
+/// asking for the same revision under the same selection share one acquisition,
+/// while callers asking for different files must not be answered with a commit
+/// whose revision does not hold the file they asked for.
+type FlightKey = (RepositoryType, String, String, String);
 
 #[derive(Clone)]
 pub struct PullThrough {
     archive: Archive,
     fetcher: Arc<dyn UpstreamFetcher>,
-    flights: Arc<SingleFlight<(RepositoryType, String, String), String, PullThroughError>>,
+    flights: Arc<SingleFlight<FlightKey, String, PullThroughError>>,
     refresh_flights: Arc<SingleFlight<(String, String, bool), RefreshResult, PullThroughError>>,
 }
 
@@ -108,15 +116,52 @@ impl PullThrough {
         files: &[String],
         progress: &(dyn Fn(FetchProgress) + Send + Sync),
     ) -> Result<String, PullThroughError> {
+        let selection =
+            FileSelection::from_paths(files).map_err(|_| PullThroughError::UnsafePath)?;
+        self.ensure_selected_with_progress_for_type(
+            repo_type,
+            repo_id,
+            requested_revision,
+            &selection,
+            progress,
+        )
+    }
+
+    /// Acquires a revision restricted to `selection` (ADR-0020 decision 1).
+    pub fn ensure_selected_for_type(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        requested_revision: &str,
+        selection: &FileSelection,
+    ) -> Result<String, PullThroughError> {
+        self.ensure_selected_with_progress_for_type(
+            repo_type,
+            repo_id,
+            requested_revision,
+            selection,
+            &|_| {},
+        )
+    }
+
+    pub fn ensure_selected_with_progress_for_type(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        requested_revision: &str,
+        selection: &FileSelection,
+        progress: &(dyn Fn(FetchProgress) + Send + Sync),
+    ) -> Result<String, PullThroughError> {
+        let required = selection.required_paths();
         if let Ok(commit) =
             self.archive
                 .resolve_ref_for_type(repo_type, repo_id, requested_revision)
         {
-            if self.revision_is_ready(repo_type, repo_id, &commit, files) {
+            if self.revision_is_ready(repo_type, repo_id, &commit, &required) {
                 return Ok(commit);
             }
         }
-        if self.revision_is_ready(repo_type, repo_id, requested_revision, files) {
+        if self.revision_is_ready(repo_type, repo_id, requested_revision, &required) {
             return Ok(requested_revision.to_string());
         }
 
@@ -124,13 +169,22 @@ impl PullThrough {
             repo_type,
             repo_id.to_string(),
             requested_revision.to_string(),
+            // Pattern components can hold no control characters, so a newline
+            // join cannot make two different selections share one key.
+            selection.identity().join("\n"),
         );
         let repo_id = repo_id.to_string();
         let requested_revision = requested_revision.to_string();
-        let files = files.to_vec();
+        let selection = selection.clone();
         let this = self.clone();
         self.flights.run(key, move || {
-            this.fetch_and_publish(repo_type, &repo_id, &requested_revision, &files, progress)
+            this.fetch_and_publish(
+                repo_type,
+                &repo_id,
+                &requested_revision,
+                &selection,
+                progress,
+            )
         })
     }
 
@@ -220,6 +274,7 @@ impl PullThrough {
                     repo_id: repo_id.into(),
                     revision: reference.into(),
                     files: Vec::new(),
+                    exclude: Vec::new(),
                     staging: staging.path.clone(),
                     resume_commit: staging.resolved_commit.clone(),
                 },
@@ -307,25 +362,81 @@ impl PullThrough {
             })
     }
 
+    /// True when this commit already has a live, complete manifest.
+    ///
+    /// A revision directory that exists without a complete manifest is a
+    /// publication conflict, not something to extend.
+    fn revision_is_published(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        commit: &str,
+    ) -> bool {
+        self.archive
+            .is_complete_revision_for_type(repo_type, repo_id, commit)
+            .unwrap_or(false)
+    }
+
+    /// Adds the freshly acquired files a published revision does not list.
+    ///
+    /// Paths the live manifest already holds are skipped, never rewritten, so
+    /// no published byte changes (ADR-0020 decision 4).
+    fn extend_published_revision(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        requested_revision: &str,
+        fetched: &crate::upstream::FetchedRevision,
+        files: Vec<SourceFile>,
+    ) -> Result<(), PullThroughError> {
+        let extension = self
+            .archive
+            .extend_revision_from_directory_for_type(
+                repo_type,
+                crate::RevisionExtensionRequest {
+                    repo_id: repo_id.to_string(),
+                    commit: fetched.commit.clone(),
+                    source_root: fetched.staging.clone(),
+                    files,
+                },
+            )
+            .map_err(|error| {
+                log_archive_failure(repo_type, repo_id, requested_revision, "extend", error)
+            })?;
+        if !extension.added.is_empty() {
+            tracing::info!(event = "archive_extended", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %requested_revision, commit = %fetched.commit, added = extension.added.len(), skipped = extension.skipped.len(), operation = "pull_through", "archive revision extended");
+        }
+        Ok(())
+    }
+
     fn fetch_and_publish(
         &self,
         repo_type: RepositoryType,
         repo_id: &str,
         requested_revision: &str,
-        files: &[String],
+        selection: &FileSelection,
         progress: &(dyn Fn(FetchProgress) + Send + Sync),
     ) -> Result<String, PullThroughError> {
+        let required = selection.required_paths();
         if let Ok(commit) =
             self.archive
                 .resolve_ref_for_type(repo_type, repo_id, requested_revision)
         {
-            if self.revision_is_ready(repo_type, repo_id, &commit, files) {
+            if self.revision_is_ready(repo_type, repo_id, &commit, &required) {
                 return Ok(commit);
             }
         }
+        // The normalized selection is part of the staging identity, so staging
+        // recorded under a different selection is never adopted (ADR-0020
+        // decision 5, ADR-0017).
         let staging = self
             .archive
-            .acquire_fetch_staging_for_type(repo_type, repo_id, requested_revision, &[])
+            .acquire_fetch_staging_for_type(
+                repo_type,
+                repo_id,
+                requested_revision,
+                &selection.identity(),
+            )
             .map_err(|error| {
                 log_archive_failure(repo_type, repo_id, requested_revision, "stage", error)
             })?;
@@ -334,12 +445,13 @@ impl PullThrough {
         } else {
             "acquiring_snapshot"
         }));
-        tracing::info!(event = "upstream_fetch_started", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %requested_revision, resumed = staging.resumed, operation = "pull_through", "upstream fetch started");
+        tracing::info!(event = "upstream_fetch_started", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %requested_revision, resumed = staging.resumed, selected = !selection.is_unrestricted(), operation = "pull_through", "upstream fetch started");
         let request = FetchRequest {
             repo_type,
             repo_id: repo_id.to_string(),
             revision: requested_revision.to_string(),
-            files: Vec::new(),
+            files: selection.include().to_vec(),
+            exclude: selection.exclude().to_vec(),
             staging: staging.path.clone(),
             resume_commit: staging.resolved_commit.clone(),
         };
@@ -371,38 +483,60 @@ impl PullThrough {
                 path: path.clone(),
                 source: fetched.staging.join(path),
             })
-            .collect();
-        let publish = self
-            .archive
-            .publish_revision_from_directory_with_progress_for_type(
+            .collect::<Vec<_>>();
+        // A revision's file set may grow but never change (ADR-0020 decision 4).
+        // An acquisition whose commit is already published therefore extends
+        // that revision instead of re-publishing it, which is what makes a
+        // request for an unheld path cost that path rather than the repository.
+        let outcome = if self.revision_is_published(repo_type, repo_id, &fetched.commit) {
+            self.extend_published_revision(
                 repo_type,
-                crate::SourcePublishRequest {
-                    repo_id: repo_id.to_string(),
-                    requested_revision: requested_revision.to_string(),
-                    commit: fetched.commit.clone(),
-                    source_root: fetched.staging.clone(),
-                    files: source_files,
-                },
-                &|phase| progress(FetchProgress::phase(phase)),
-            );
-        let _ = std::fs::remove_dir_all(&staging.path);
-        let published = match publish {
-            Ok(_) => true,
-            Err(ArchiveError::AlreadyPublished(_))
-                if self.revision_is_ready(repo_type, repo_id, &fetched.commit, files) =>
-            {
-                false
-            }
-            Err(error) => {
-                return Err(log_archive_failure(
+                repo_id,
+                requested_revision,
+                &fetched,
+                source_files,
+            )
+            .map(|_| false)
+        } else {
+            match self
+                .archive
+                .publish_revision_from_directory_with_progress_for_type(
+                    repo_type,
+                    crate::SourcePublishRequest {
+                        repo_id: repo_id.to_string(),
+                        requested_revision: requested_revision.to_string(),
+                        commit: fetched.commit.clone(),
+                        source_root: fetched.staging.clone(),
+                        files: source_files.clone(),
+                    },
+                    &|phase| progress(FetchProgress::phase(phase)),
+                ) {
+                Ok(_) => Ok(true),
+                // A concurrent acquisition published this commit first; its file
+                // set may not cover what this caller asked for.
+                Err(ArchiveError::AlreadyPublished(_))
+                    if self.revision_is_published(repo_type, repo_id, &fetched.commit) =>
+                {
+                    self.extend_published_revision(
+                        repo_type,
+                        repo_id,
+                        requested_revision,
+                        &fetched,
+                        source_files,
+                    )
+                    .map(|_| false)
+                }
+                Err(error) => Err(log_archive_failure(
                     repo_type,
                     repo_id,
                     requested_revision,
                     "publish",
                     error,
-                ))
+                )),
             }
         };
+        let _ = std::fs::remove_dir_all(&staging.path);
+        let published = outcome?;
         if published {
             tracing::info!(event = "archive_published", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %requested_revision, commit = %fetched.commit, operation = "pull_through", "archive revision published");
         }
@@ -1305,6 +1439,404 @@ mod tests {
             .unwrap(),
             b"dataset"
         );
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedFetch {
+        files: Vec<String>,
+        exclude: Vec<String>,
+        resume_commit: Option<String>,
+    }
+
+    /// A fetcher that honours the selection it is given, like the real helper.
+    ///
+    /// It supports exact paths and a single trailing `*`, which is enough to
+    /// show that include and exclude patterns reach the acquisition.
+    struct SelectiveFetcher {
+        commit: String,
+        upstream: Vec<(String, Vec<u8>)>,
+        requests: Arc<Mutex<Vec<RecordedFetch>>>,
+        delay: Duration,
+    }
+
+    impl SelectiveFetcher {
+        fn new(commit: &str, upstream: &[(&str, &[u8])]) -> Self {
+            Self {
+                commit: commit.into(),
+                upstream: upstream
+                    .iter()
+                    .map(|(path, bytes)| ((*path).to_string(), bytes.to_vec()))
+                    .collect(),
+                requests: Arc::new(Mutex::new(Vec::new())),
+                delay: Duration::from_millis(0),
+            }
+        }
+
+        fn matches(path: &str, include: &[String], exclude: &[String]) -> bool {
+            let hit = |pattern: &String| match pattern.strip_suffix('*') {
+                Some(prefix) => path.starts_with(prefix),
+                None => path == pattern.as_str(),
+            };
+            (include.is_empty() || include.iter().any(hit)) && !exclude.iter().any(hit)
+        }
+    }
+
+    impl UpstreamFetcher for SelectiveFetcher {
+        fn fetch(&self, request: &FetchRequest) -> Result<FetchedRevision, UpstreamError> {
+            self.requests.lock().unwrap().push(RecordedFetch {
+                files: request.files.clone(),
+                exclude: request.exclude.clone(),
+                resume_commit: request.resume_commit.clone(),
+            });
+            std::thread::sleep(self.delay);
+            let mut files = Vec::new();
+            for (path, bytes) in &self.upstream {
+                if !Self::matches(path, &request.files, &request.exclude) {
+                    continue;
+                }
+                let destination = request.staging.join(path);
+                if let Some(parent) = destination.parent() {
+                    fs::create_dir_all(parent).unwrap();
+                }
+                fs::write(destination, bytes).unwrap();
+                files.push(path.clone());
+            }
+            Ok(FetchedRevision {
+                commit: self.commit.clone(),
+                files,
+                staging: request.staging.clone(),
+            })
+        }
+    }
+
+    fn selection(include: &[&str], exclude: &[&str]) -> FileSelection {
+        FileSelection::new(
+            &include
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>(),
+            &exclude
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn selection_reaches_the_upstream_helper_as_include_and_exclude() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let fetcher = Arc::new(SelectiveFetcher::new(
+            "cccccccccccccccccccccccccccccccccccccccc",
+            &[
+                ("config.json", b"config"),
+                ("weights/a.bin", b"a"),
+                ("weights/b.bin", b"b"),
+            ],
+        ));
+        let requests = fetcher.requests.clone();
+        let pull = PullThrough::new(archive.clone(), fetcher);
+
+        let commit = pull
+            .ensure_selected_for_type(
+                RepositoryType::Model,
+                "org/model",
+                "main",
+                &selection(&["weights/*"], &["weights/b.bin"]),
+            )
+            .unwrap();
+
+        let recorded = requests.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].files, vec!["weights/*".to_string()]);
+        assert_eq!(recorded[0].exclude, vec!["weights/b.bin".to_string()]);
+        assert!(archive
+            .resolve_file("org/model", &commit, "weights/a.bin")
+            .is_ok());
+        assert!(archive
+            .resolve_file("org/model", &commit, "weights/b.bin")
+            .is_err());
+        assert!(archive
+            .resolve_file("org/model", &commit, "config.json")
+            .is_err());
+        assert_eq!(archive.verify_revision("org/model", &commit).unwrap(), 1);
+    }
+
+    #[test]
+    fn single_file_cold_miss_acquires_and_publishes_only_that_file() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let fetcher = Arc::new(SelectiveFetcher::new(
+            "cccccccccccccccccccccccccccccccccccccccc",
+            &[
+                ("config.json", b"config"),
+                ("huge.bin", b"a-very-large-file"),
+            ],
+        ));
+        let requests = fetcher.requests.clone();
+        let pull = PullThrough::new(archive.clone(), fetcher);
+
+        let commit = pull
+            .ensure("org/model", "main", &["config.json".to_string()])
+            .unwrap();
+
+        assert_eq!(
+            requests.lock().unwrap()[0].files,
+            vec!["config.json".to_string()]
+        );
+        assert_eq!(archive.verify_revision("org/model", &commit).unwrap(), 1);
+        assert_eq!(
+            fs::read(
+                archive
+                    .resolve_file("org/model", &commit, "config.json")
+                    .unwrap()
+                    .path
+            )
+            .unwrap(),
+            b"config"
+        );
+        assert!(archive
+            .resolve_file("org/model", &commit, "huge.bin")
+            .is_err());
+    }
+
+    #[test]
+    fn unheld_path_extends_the_published_revision_without_refetching_it() {
+        let (_root, archive) = published_archive();
+        let fetcher = Arc::new(SelectiveFetcher::new(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &[
+                ("config.json", b"upstream-config"),
+                ("tokenizer.json", b"tokenizer"),
+                ("huge.bin", b"a-very-large-file"),
+            ],
+        ));
+        let requests = fetcher.requests.clone();
+        let pull = PullThrough::new(archive.clone(), fetcher);
+
+        let commit = pull
+            .ensure("org/model", "main", &["tokenizer.json".to_string()])
+            .unwrap();
+
+        assert_eq!(commit, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        // Only the requested path was transferred, not the repository.
+        assert_eq!(
+            requests.lock().unwrap()[0].files,
+            vec!["tokenizer.json".to_string()]
+        );
+        assert_eq!(
+            archive.list_revisions("org/model").unwrap(),
+            vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+        );
+        assert_eq!(
+            fs::read(
+                archive
+                    .resolve_file("org/model", &commit, "tokenizer.json")
+                    .unwrap()
+                    .path
+            )
+            .unwrap(),
+            b"tokenizer"
+        );
+    }
+
+    #[test]
+    fn extension_leaves_already_archived_files_byte_identical() {
+        let (_root, archive) = published_archive();
+        let pull = PullThrough::new(
+            archive.clone(),
+            Arc::new(SelectiveFetcher::new(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &[
+                    ("config.json", b"upstream-config"),
+                    ("tokenizer.json", b"tokenizer"),
+                ],
+            )),
+        );
+
+        let commit = pull
+            .ensure("org/model", "main", &["tokenizer.json".to_string()])
+            .unwrap();
+
+        assert_eq!(
+            fs::read(
+                archive
+                    .resolve_file("org/model", &commit, "config.json")
+                    .unwrap()
+                    .path
+            )
+            .unwrap(),
+            b"old"
+        );
+        assert_eq!(archive.verify_revision("org/model", &commit).unwrap(), 2);
+        assert!(archive.is_complete_revision("org/model", &commit).unwrap());
+    }
+
+    struct InterruptedSelectionFetcher {
+        commit: String,
+    }
+
+    impl UpstreamFetcher for InterruptedSelectionFetcher {
+        fn fetch(&self, request: &FetchRequest) -> Result<FetchedRevision, UpstreamError> {
+            crate::record_fetch_resolved_commit(
+                &request.staging,
+                &request.repo_id,
+                &request.revision,
+                &request.selection_identity(),
+                &self.commit,
+            )
+            .unwrap();
+            fs::write(request.staging.join("partial.bin"), b"partial").unwrap();
+            Err(UpstreamError::Unavailable)
+        }
+    }
+
+    #[test]
+    fn staging_recorded_under_a_different_selection_is_not_resumed() {
+        let commit = "cccccccccccccccccccccccccccccccccccccccc";
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let interrupted = PullThrough::new(
+            archive.clone(),
+            Arc::new(InterruptedSelectionFetcher {
+                commit: commit.into(),
+            }),
+        );
+        assert_eq!(
+            interrupted.ensure_selected_for_type(
+                RepositoryType::Model,
+                "org/model",
+                "main",
+                &selection(&["a.bin"], &[]),
+            ),
+            Err(PullThroughError::UpstreamUnavailable)
+        );
+
+        let fetcher = Arc::new(SelectiveFetcher::new(
+            commit,
+            &[("a.bin", b"aaa"), ("b.bin", b"bbb")],
+        ));
+        let requests = fetcher.requests.clone();
+        let pull = PullThrough::new(archive.clone(), fetcher);
+
+        // A different selection must not adopt the abandoned staging.
+        pull.ensure_selected_for_type(
+            RepositoryType::Model,
+            "org/model",
+            "main",
+            &selection(&["b.bin"], &[]),
+        )
+        .unwrap();
+        assert_eq!(requests.lock().unwrap()[0].resume_commit, None);
+
+        // The matching selection still resumes it.
+        pull.ensure_selected_for_type(
+            RepositoryType::Model,
+            "org/model",
+            "main",
+            &selection(&["a.bin"], &[]),
+        )
+        .unwrap();
+        assert_eq!(
+            requests.lock().unwrap()[1].resume_commit.as_deref(),
+            Some(commit)
+        );
+        assert!(archive.resolve_file("org/model", commit, "a.bin").is_ok());
+        assert!(archive.resolve_file("org/model", commit, "b.bin").is_ok());
+        assert!(archive
+            .resolve_file("org/model", commit, "partial.bin")
+            .is_err());
+    }
+
+    #[test]
+    fn concurrent_requests_for_the_same_selection_share_one_acquisition() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let mut fetcher = SelectiveFetcher::new(
+            "cccccccccccccccccccccccccccccccccccccccc",
+            &[("config.json", b"config"), ("tokenizer.json", b"tokenizer")],
+        );
+        fetcher.delay = Duration::from_millis(50);
+        let fetcher = Arc::new(fetcher);
+        let requests = fetcher.requests.clone();
+        let pull = Arc::new(PullThrough::new(archive.clone(), fetcher));
+
+        let start = Arc::new(Barrier::new(3));
+        let threads = (0..2)
+            .map(|_| {
+                let pull = pull.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    pull.ensure("org/model", "main", &["config.json".to_string()])
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        for thread in threads {
+            assert_eq!(
+                thread.join().unwrap().unwrap(),
+                "cccccccccccccccccccccccccccccccccccccccc"
+            );
+        }
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn archived_file_is_served_offline_while_an_unheld_path_reports_upstream_failure() {
+        let (_root, archive) = published_archive();
+        let pull = PullThrough::new(
+            archive.clone(),
+            Arc::new(RefreshFetcher {
+                commit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                fail: true,
+            }),
+        );
+
+        assert_eq!(
+            pull.ensure("org/model", "main", &["config.json".to_string()])
+                .unwrap(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            fs::read(
+                archive
+                    .resolve_file(
+                        "org/model",
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "config.json"
+                    )
+                    .unwrap()
+                    .path
+            )
+            .unwrap(),
+            b"old"
+        );
+        // ADR-0020: a path the archive does not hold is upstream's answer, so it
+        // fails as upstream-unavailable rather than as a local 404.
+        assert_eq!(
+            pull.ensure("org/model", "main", &["tokenizer.json".to_string()]),
+            Err(PullThroughError::UpstreamUnavailable)
+        );
+    }
+
+    #[test]
+    fn unsafe_selection_patterns_are_rejected_before_any_acquisition() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let fetcher = Arc::new(SelectiveFetcher::new(
+            "cccccccccccccccccccccccccccccccccccccccc",
+            &[("config.json", b"config")],
+        ));
+        let requests = fetcher.requests.clone();
+        let pull = PullThrough::new(archive, fetcher);
+
+        assert_eq!(
+            pull.ensure("org/model", "main", &["../escape".to_string()]),
+            Err(PullThroughError::UnsafePath)
+        );
+        assert!(requests.lock().unwrap().is_empty());
     }
 
     #[test]

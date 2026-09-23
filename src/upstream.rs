@@ -11,9 +11,163 @@ pub struct FetchRequest {
     pub repo_type: RepositoryType,
     pub repo_id: String,
     pub revision: String,
+    /// Include patterns handed to the official client as `allow_patterns`.
+    /// Empty means the whole repository.
     pub files: Vec<String>,
+    /// Exclude patterns handed to the official client as `ignore_patterns`.
+    pub exclude: Vec<String>,
     pub staging: PathBuf,
     pub resume_commit: Option<String>,
+}
+
+impl FetchRequest {
+    /// The selection component of this acquisition's staging identity.
+    pub fn selection_identity(&self) -> Vec<String> {
+        selection_identity(&self.files, &self.exclude)
+    }
+}
+
+/// Prefix distinguishing an exclude pattern inside a staging identity.
+///
+/// A leading `!` is rejected by [`FileSelection`] normalization, so an include
+/// pattern can never collide with the encoded form of an exclude pattern.
+const EXCLUDE_IDENTITY_PREFIX: &str = "!";
+
+/// Encodes an include/exclude selection as the staging-identity file list.
+///
+/// A selection without exclude patterns encodes to its include list unchanged,
+/// so staging recorded before exclude patterns existed stays adoptable.
+pub fn selection_identity(include: &[String], exclude: &[String]) -> Vec<String> {
+    if exclude.is_empty() {
+        return include.to_vec();
+    }
+    let mut identity = include.to_vec();
+    identity.extend(
+        exclude
+            .iter()
+            .map(|pattern| format!("{EXCLUDE_IDENTITY_PREFIX}{pattern}")),
+    );
+    identity
+}
+
+/// A rejected acquisition selection pattern.
+///
+/// The offending pattern is deliberately not carried: selection patterns are
+/// untrusted input that must not be echoed back into logs or management state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsafeSelectionPattern;
+
+impl std::fmt::Display for UnsafeSelectionPattern {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("unsafe acquisition selection pattern")
+    }
+}
+
+impl std::error::Error for UnsafeSelectionPattern {}
+
+/// A validated, normalized include/exclude selection for one acquisition.
+///
+/// ADR-0020 decision 1: ModelKeep validates and normalizes the patterns as
+/// untrusted input and delegates matching itself to the official client's
+/// `allow_patterns` / `ignore_patterns`. ADR-0020 decision 5: the normalized
+/// selection is part of acquisition identity, never of the published manifest.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileSelection {
+    include: Vec<String>,
+    exclude: Vec<String>,
+}
+
+impl FileSelection {
+    /// The whole repository: ADR-0020 decision 6 keeps this the default.
+    pub fn all() -> Self {
+        Self::default()
+    }
+
+    /// A selection naming exactly the requested paths.
+    pub fn from_paths(paths: &[String]) -> Result<Self, UnsafeSelectionPattern> {
+        Self::new(paths, &[])
+    }
+
+    pub fn new(include: &[String], exclude: &[String]) -> Result<Self, UnsafeSelectionPattern> {
+        Ok(Self {
+            include: normalize_patterns(include)?,
+            exclude: normalize_patterns(exclude)?,
+        })
+    }
+
+    pub fn include(&self) -> &[String] {
+        &self.include
+    }
+
+    pub fn exclude(&self) -> &[String] {
+        &self.exclude
+    }
+
+    /// True when this selection restricts nothing.
+    pub fn is_unrestricted(&self) -> bool {
+        self.include.is_empty() && self.exclude.is_empty()
+    }
+
+    /// The include entries that name one concrete path rather than a pattern.
+    ///
+    /// Only these can be checked against a published manifest; a pattern's
+    /// coverage is upstream's answer, not the archive's (ADR-0020 decision 3).
+    pub fn required_paths(&self) -> Vec<String> {
+        self.include
+            .iter()
+            .filter(|pattern| !is_glob_pattern(pattern))
+            .cloned()
+            .collect()
+    }
+
+    /// The selection component of the fetch staging identity.
+    pub fn identity(&self) -> Vec<String> {
+        selection_identity(&self.include, &self.exclude)
+    }
+}
+
+fn is_glob_pattern(value: &str) -> bool {
+    value.ends_with('/') || value.contains(['*', '?', '[', ']'])
+}
+
+fn normalize_patterns(patterns: &[String]) -> Result<Vec<String>, UnsafeSelectionPattern> {
+    let mut normalized = std::collections::BTreeSet::new();
+    for pattern in patterns {
+        if !is_safe_selection_pattern(pattern) {
+            return Err(UnsafeSelectionPattern);
+        }
+        normalized.insert(pattern.clone());
+    }
+    Ok(normalized.into_iter().collect())
+}
+
+/// Rejects a selection pattern that could escape the archive root, address
+/// ModelKeep's internal state, or make a staging identity ambiguous.
+fn is_safe_selection_pattern(pattern: &str) -> bool {
+    if pattern.is_empty()
+        || pattern.starts_with(EXCLUDE_IDENTITY_PREFIX)
+        || pattern.starts_with('/')
+        || pattern.contains('\\')
+        || pattern
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+    {
+        return false;
+    }
+    // A trailing `/` is the official client's directory form and expands to
+    // `<pattern>*`; it is the one empty trailing component that is allowed.
+    let body = pattern.strip_suffix('/').unwrap_or(pattern);
+    if body.is_empty() {
+        return false;
+    }
+    let mut components = body.split('/');
+    let first = components.next().unwrap_or_default();
+    if first.starts_with(".modelkeep-") {
+        return false;
+    }
+    std::iter::once(first)
+        .chain(components)
+        .all(|component| !matches!(component, "" | "." | ".." | ".cache"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,6 +342,9 @@ impl UpstreamFetcher for OfficialHfFetcher {
         for file in &request.files {
             command.arg("--file").arg(file);
         }
+        for pattern in &request.exclude {
+            command.arg("--exclude").arg(pattern);
+        }
         let mut child = command.spawn().map_err(UpstreamError::Io)?;
         let Some(stdout) = child.stdout.take() else {
             terminate_and_reap(&mut child);
@@ -227,7 +384,7 @@ impl UpstreamFetcher for OfficialHfFetcher {
                             request.repo_type,
                             &request.repo_id,
                             &request.revision,
-                            &request.files,
+                            &request.selection_identity(),
                             commit,
                         )
                         .map_err(|error| match error {
@@ -346,6 +503,7 @@ mod tests {
             repo_id: "public/model".into(),
             revision: "main".into(),
             files: Vec::new(),
+            exclude: Vec::new(),
             staging: staging.path,
             resume_commit,
         })
@@ -359,6 +517,142 @@ mod tests {
         let output: HelperOutput = serde_json::from_slice(encoded.as_bytes()).unwrap();
         assert_eq!(output.commit, commit);
         assert_eq!(output.files, vec!["config.json"]);
+    }
+
+    #[test]
+    fn selection_patterns_are_validated_as_untrusted_input() {
+        for pattern in [
+            "",
+            "../escape",
+            "/etc/passwd",
+            "a/../b",
+            "weights/./a",
+            ".modelkeep-manifest.json",
+            ".cache/blob",
+            "a/.cache/b",
+            "a//b",
+            "a\\b",
+            "!negated",
+            "a\nb",
+            "/",
+        ] {
+            assert_eq!(
+                FileSelection::new(&[pattern.to_string()], &[]),
+                Err(UnsafeSelectionPattern),
+                "include {pattern:?} was accepted"
+            );
+            assert_eq!(
+                FileSelection::new(&[], &[pattern.to_string()]),
+                Err(UnsafeSelectionPattern),
+                "exclude {pattern:?} was accepted"
+            );
+        }
+        for pattern in [
+            "config.json",
+            "weights/*",
+            "weights/",
+            "*.safetensors",
+            "a/b/c.bin",
+            "Qwen3-Q4_K_M/?.gguf",
+        ] {
+            assert!(
+                FileSelection::new(&[pattern.to_string()], &[]).is_ok(),
+                "safe pattern {pattern:?} was rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn normalized_selection_identity_separates_include_from_exclude() {
+        let selection = FileSelection::new(
+            &["b.bin".into(), "a.bin".into(), "b.bin".into()],
+            &["z.bin".into()],
+        )
+        .unwrap();
+        assert_eq!(selection.include(), ["a.bin".to_string(), "b.bin".into()]);
+        assert_eq!(
+            selection.identity(),
+            vec!["a.bin".to_string(), "b.bin".into(), "!z.bin".into()]
+        );
+        assert_eq!(
+            FileSelection::new(&["a.bin".into(), "b.bin".into()], &["z.bin".into()])
+                .unwrap()
+                .identity(),
+            selection.identity()
+        );
+        assert_ne!(
+            FileSelection::new(&["a.bin".into()], &[])
+                .unwrap()
+                .identity(),
+            FileSelection::new(&[], &["a.bin".into()])
+                .unwrap()
+                .identity()
+        );
+        // An unrestricted acquisition keeps the identity it had before
+        // selections existed, so staging written earlier stays adoptable.
+        assert!(FileSelection::all().identity().is_empty());
+        assert!(FileSelection::all().is_unrestricted());
+        assert_eq!(
+            FileSelection::new(
+                &["weights/*".into(), "config.json".into(), "dir/".into()],
+                &[]
+            )
+            .unwrap()
+            .required_paths(),
+            vec!["config.json".to_string()]
+        );
+    }
+
+    #[test]
+    fn helper_invocation_carries_include_and_exclude_patterns() {
+        let commit = "a".repeat(40);
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        let selection = FileSelection::new(&["config.json".into()], &["weights/*".into()]).unwrap();
+        let staging = archive
+            .acquire_fetch_staging("public/model", "main", &selection.identity())
+            .unwrap();
+        let arguments = directory.path().join("arguments");
+        let helper = directory.path().join("helper.sh");
+        fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\nfor argument in \"$@\"; do echo \"$argument\" >> '{}'; done\necho '{{\"type\":\"result\",\"commit\":\"{commit}\",\"files\":[\"config.json\"]}}'\n",
+                arguments.display()
+            ),
+        )
+        .unwrap();
+
+        let fetched = OfficialHfFetcher {
+            python: "sh".into(),
+            helper,
+        }
+        .fetch(&FetchRequest {
+            repo_type: RepositoryType::Model,
+            repo_id: "public/model".into(),
+            revision: "main".into(),
+            files: selection.include().to_vec(),
+            exclude: selection.exclude().to_vec(),
+            staging: staging.path,
+            resume_commit: None,
+        })
+        .unwrap();
+
+        assert_eq!(fetched.files, vec!["config.json"]);
+        let recorded = fs::read_to_string(arguments).unwrap();
+        let recorded = recorded.lines().collect::<Vec<_>>();
+        assert!(
+            recorded
+                .windows(2)
+                .any(|pair| pair == ["--file", "config.json"]),
+            "include pattern missing from {recorded:?}"
+        );
+        assert!(
+            recorded
+                .windows(2)
+                .any(|pair| pair == ["--exclude", "weights/*"]),
+            "exclude pattern missing from {recorded:?}"
+        );
     }
 
     #[test]
@@ -526,6 +820,7 @@ mod tests {
                 repo_id: "public/model".into(),
                 revision: "main".into(),
                 files: vec![],
+                exclude: Vec::new(),
                 staging: staging.path,
                 resume_commit: Some(commit.clone()),
             })
@@ -561,6 +856,7 @@ mod tests {
             repo_id: "public/model".into(),
             revision: "main".into(),
             files: Vec::new(),
+            exclude: Vec::new(),
             staging: staging.path,
             resume_commit: None,
         })

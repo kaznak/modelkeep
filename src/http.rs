@@ -1137,12 +1137,24 @@ mod tests {
             &self,
             request: &crate::upstream::FetchRequest,
         ) -> Result<crate::upstream::FetchedRevision, crate::upstream::UpstreamError> {
-            std::fs::write(request.staging.join("config.json"), b"cold-http").unwrap();
-            assert!(request.files.is_empty());
-            std::fs::write(request.staging.join("tokenizer.json"), b"tokenizer-http").unwrap();
+            // The helper honours the selection it is given: an unrestricted
+            // request takes the repository, a selected one takes only what the
+            // caller asked for.
+            let upstream: [(&str, &[u8]); 2] = [
+                ("config.json", b"cold-http"),
+                ("tokenizer.json", b"tokenizer-http"),
+            ];
+            let mut files = Vec::new();
+            for (path, bytes) in upstream {
+                if !request.files.is_empty() && !request.files.iter().any(|file| file == path) {
+                    continue;
+                }
+                std::fs::write(request.staging.join(path), bytes).unwrap();
+                files.push(path.to_string());
+            }
             Ok(crate::upstream::FetchedRevision {
                 commit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
-                files: vec!["config.json".into(), "tokenizer.json".into()],
+                files,
                 staging: request.staging.clone(),
             })
         }
@@ -1189,6 +1201,61 @@ mod tests {
         assert_eq!(
             to_bytes(response.into_body(), usize::MAX).await.unwrap(),
             "cold-http"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_for_an_unheld_path_extends_the_published_revision() {
+        let commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        archive
+            .publish_revision(crate::PublishRequest {
+                repo_id: "org/model".into(),
+                requested_revision: "main".into(),
+                commit: commit.into(),
+                files: vec![crate::ArchiveFile {
+                    path: "config.json".into(),
+                    bytes: b"already-archived".to_vec(),
+                }],
+            })
+            .unwrap();
+        archive.update_ref("org/model", "main", commit).unwrap();
+        let pullthrough = Arc::new(PullThrough::new(archive.clone(), Arc::new(HttpFakeFetcher)));
+        let app = router_with_pullthrough(archive.clone(), pullthrough);
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/org/model/resolve/main/tokenizer.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+            "tokenizer-http"
+        );
+
+        // The revision grew; it was neither republished nor rewritten.
+        assert_eq!(archive.list_revisions("org/model").unwrap(), vec![commit]);
+        assert_eq!(archive.verify_revision("org/model", commit).unwrap(), 2);
+        let served = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/org/model/resolve/main/config.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(served.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(served.into_body(), usize::MAX).await.unwrap(),
+            "already-archived"
         );
     }
 
