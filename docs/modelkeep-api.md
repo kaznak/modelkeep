@@ -90,6 +90,12 @@ A file request the archive cannot serve needs upstream. That acquisition can tak
 minutes or hours for a large file, so a `resolve` request does not wait for it
 indefinitely.
 
+The two kinds of route are bounded differently, because the supported clients treat
+them differently. Both behaviors below were measured against `huggingface_hub`
+0.36.0 and 1.27.0, not assumed.
+
+### `resolve` is bounded by default
+
 - `GET` and `HEAD` on `/{namespace}/{repo}/resolve/{revision}/{path}` wait for the
   acquisition for at most the cold-miss deadline, **8 seconds** by default. The
   deadline applies to both methods identically.
@@ -98,33 +104,71 @@ indefinitely.
   holding the deadline in seconds. The acquisition is **not** cancelled: it keeps
   running, and a retry joins it instead of starting a second download. A retry after
   a `503` therefore costs nothing upstream.
-- `MODELKEEP_COLD_MISS_DEADLINE_SECONDS` configures the deadline in whole seconds.
+- `MODELKEEP_COLD_MISS_DEADLINE_SECONDS` configures this deadline in whole seconds.
   `0` restores an unbounded wait, which holds the connection open with no response
   headers for the whole transfer and is not recommended.
 
-The default is set by the supported clients' own patience, measured against
-`huggingface_hub` 0.36.0 and 1.27.0: both abandon a `resolve` metadata request after
-10 seconds with a read timeout, which is the `status=000` that motivated this
-contract. Answering at 8 seconds keeps ModelKeep's status inside that window. Both
-versions retry a `503` on their own — 0.36.0 with its own 1s/2s/4s/8s/8s backoff,
-1.27.0 following `Retry-After` — so a cold miss that completes within roughly a
-minute is transparently recovered by the client.
+The default is set by the supported clients' own patience: both abandon a `resolve`
+request after 10 seconds with a read timeout, which is the `status=000` that
+motivated this contract. Answering at 8 seconds keeps ModelKeep's status inside that
+window. Both versions then retry a `503` on their own — 0.36.0 with its own
+1s/2s/4s/8s/8s backoff, 1.27.0 following `Retry-After` — so a cold miss that
+completes within roughly a minute is transparently recovered by the client.
 
-Beyond that, the client gives up while the acquisition continues. Do not read a
-large repository cold through the download endpoint. Submit a prefetch job through
-the [Admin API](admin-api.md), follow it to a terminal job state, and then download,
-which is then a warm read.
+### Repository metadata waits by default
 
-`503` from this route always means "acquiring, retry"; it never means the file is
-absent, and no partial data is published or served because a request was cut off.
-Operationally, an `archive_miss` event is followed either by `acquisition_progress`
-events carrying a byte count that actually advanced, or by
-`acquisition_deadline_exceeded`; a byte counter that is not moving is never reported
-as progress.
+`GET` on `/api/.../revision/{revision}` and `/api/.../tree/{revision}` for a revision
+the archive has never seen waits for the whole repository acquisition to finish and
+then answers normally. It is **not** bounded by the `resolve` deadline, and by
+default it is not bounded at all. The request can therefore stay open for minutes or
+hours on a large repository.
 
-Repository metadata routes (`/api/.../revision/...` and `/api/.../tree/...`) are not
-bounded by this deadline yet, so a cold metadata lookup for a revision the archive
-has never seen can still hold its connection for the whole repository acquisition.
+That is deliberate, and it rests on two measurements:
+
+- Neither client applies its 10-second `resolve` read timeout to a metadata request.
+  0.36.0 waited 30 s and 1.27.0 waited 12 s per metadata request, and both then
+  completed the download. A metadata cold miss is slow, not broken.
+- Neither client retries a bounded metadata answer. `503`, and equally `429`, `425`,
+  `500` and `504`, each end the call on the first response: `snapshot_download`
+  raises `LocalEntryNotFoundError` and `list_repo_tree` raises `HfHubHTTPError`.
+  There is no status that buys a client-side retry here, unlike on `resolve`.
+
+Bounding metadata by default would therefore make the first mirror of any repository
+whose acquisition outlasts the deadline fail outright, which is ModelKeep's central
+use. 1.27.0 requests `revision` and then `tree` during a download; 0.36.0 requests
+`revision` only, so both routes behave the same way.
+
+The practical consequence is a client that appears to hang while the mirror fills.
+Do not read a large repository cold through the download endpoint: submit a prefetch
+job through the [Admin API](admin-api.md), follow it to a terminal job state, and
+then download, which is then a warm read.
+
+An operator who prefers a prompt answer over a long wait can opt in:
+
+- `MODELKEEP_METADATA_COLD_MISS_DEADLINE_SECONDS` bounds the metadata routes in whole
+  seconds. It is **`0` by default, meaning wait for the acquisition**. It is a
+  separate setting from `MODELKEEP_COLD_MISS_DEADLINE_SECONDS` and neither changes
+  the other.
+- When it is set and the deadline passes, the metadata routes answer exactly as
+  `resolve` does: `503` with `Retry-After`, the acquisition still running, and a
+  repeated request joining it rather than starting a second download.
+- **The cost is a failed download.** Because neither supported client retries, every
+  cold `hf download` whose acquisition outlasts the configured deadline fails with
+  `LocalEntryNotFoundError` instead of completing. Repeating the command joins the
+  running acquisition and succeeds once the revision is archived, but the client will
+  not do that by itself. Set this only where a prompt, classified answer is worth
+  that trade — for example behind a proxy that would drop the connection anyway.
+
+`503` from either kind of route always means "acquiring, retry"; it never means the
+repository, revision, or file is absent, and no partial data is published or served
+because a request was cut off. A metadata `503` is never replaced by a `200` holding
+an empty or partial file list. Operationally, an `archive_miss` event is followed
+either by `acquisition_progress` events carrying a byte count that actually
+advanced, or — where a deadline applies — by `acquisition_deadline_exceeded`; a byte
+counter that is not moving is never reported as progress.
+
+An already archived revision never enters this path: its metadata and files are
+answered from the archive and are unaffected by the deadline.
 
 ## Health and compatibility routes
 
@@ -176,8 +220,10 @@ Client-facing status codes distinguish common failure classes:
 - `404`: the requested upstream object or revision does not exist;
 - `416`: a requested byte range is unsatisfiable;
 - `502`: upstream is unavailable or acquisition failed;
-- `503` on a `resolve` route: the acquisition is still running and exceeded the
-  cold-miss deadline; retry after `Retry-After` seconds, or prefetch instead;
+- `503` on a `resolve` route, or on a repository metadata route where
+  `MODELKEEP_METADATA_COLD_MISS_DEADLINE_SECONDS` is configured: the acquisition is
+  still running and exceeded the cold-miss deadline; retry after `Retry-After`
+  seconds, or prefetch instead;
 - `507`: archive storage failure;
 - `500`: integrity, helper-contract, publication conflict, or another internal
   failure.

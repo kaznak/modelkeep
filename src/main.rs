@@ -407,6 +407,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 management_enabled = admin_config.is_some(),
                 cold_miss_deadline_seconds =
                     cold_miss.deadline.map_or(0, |deadline| deadline.as_secs()),
+                metadata_cold_miss_deadline_seconds = cold_miss
+                    .metadata_deadline
+                    .map_or(0, |deadline| deadline.as_secs()),
                 "startup configuration loaded"
             );
             match (upstream, admin_config) {

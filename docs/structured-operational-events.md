@@ -17,6 +17,8 @@ headers, bearer tokens, signed URLs, or upstream error payloads.
 | `upstream_fetch_failed` | WARN | fetch fields plus credential-safe `error_class` |
 | `archive_verification_failed` | WARN | `repo_id` and immutable `commit`, or `requested_revision` and `operation`; credential-safe `error_class` |
 | `archive_published` | INFO | `repo_id`, `requested_revision`, immutable `commit`, `operation` |
+| `archive_extended` | INFO | `repo_id`, `requested_revision`, immutable `commit`, `added`, `skipped`, `operation` |
+| `archive_selection_satisfied` | INFO | `repo_id`, `requested_revision`, immutable `commit`, `covered` |
 | `archive_storage_failed` | ERROR | `repo_id`, `requested_revision`, `operation`, `error_class=storage`, `io_kind` |
 | `admin_job_failed` | WARN | `job_id`, `job_kind`, job target (`repo_id`, `revision`), `error_class`, credential-safe `safe_reason` |
 | `incomplete_fetch_preserved` | WARN | `repo_id`, `requested_revision` |
@@ -24,13 +26,29 @@ headers, bearer tokens, signed URLs, or upstream error payloads.
 | `acquisition_progress` | INFO | `request_kind`, `repo_id`, `requested_revision`, `path`, `phase`, `acquired_bytes`, `total_bytes` |
 | `acquisition_deadline_exceeded` | WARN | `request_kind`, `repo_id`, `requested_revision`, `path`, `deadline_seconds`, `acquired_bytes` |
 | `acquisition_abandoned` | ERROR | `repo_id`, `requested_revision` |
+| `server_ready` | INFO | `listen_address` |
+| `server_bind_failed` | ERROR | `listen_address`, `error` |
+| `shutdown_started` | INFO | none |
+| `shutdown_completed` | INFO | none |
+| `health_probe_succeeded` | DEBUG | `endpoint` |
+| `readiness_probe_succeeded` | DEBUG | `endpoint` |
+| `readiness_probe_failed` | WARN | `endpoint`, `error` |
 | `archive_self_check_started` | DEBUG | `archive_root` |
 | `archive_self_check_finding` | WARN | `finding`, plus whichever of `repo_id`, `commit`, `path`, `reference`, `age_seconds` the class carries, and `detail` |
 | `archive_self_check_completed` | INFO | `status`, `finding_count`, `revisions_checked`, `duration_ms` |
 
-`request_kind` is one of `model_info`, `model_tree`, `get_file`, or `head_file`.
-`operation` is the operation that failed or caused a transition, such as
-`pull_through`, `refresh`, `stage`, `publish`, or `update_ref`.
+`request_kind` is one of `model_info`, `model_tree`, `get_file`, or `head_file`;
+`model_info` and `model_tree` cover the dataset metadata routes as well, which are
+distinguished by `repo_type`. Every repository event carries `repo_type`, which is
+`model` or `dataset`. `operation` is the operation that failed or caused a
+transition, such as `pull_through`, `refresh`, `stage`, `publish`, or `update_ref`.
+
+`archive_extended` reports an acquisition that added paths to an already published
+immutable revision rather than publishing a new one: `added` and `skipped` count the
+manifest entries added and the ones the revision already held.
+`archive_selection_satisfied` reports the opposite outcome, that the requested
+selection needed no transfer, and `covered` counts the paths the selection resolved
+to.
 
 `upstream_fetch_failed.error_class` is one of `unavailable`, `not_found`,
 `unauthorized`, `invalid_output`, `storage`, `failed`, or `io`. The upstream diagnostic itself
@@ -50,7 +68,18 @@ by Issue 0004.
 ## Cold-miss acquisition liveness
 
 A cold miss emits `archive_miss` and then reaches one of three outcomes, which is
-what distinguishes a live acquisition from a stalled one.
+what distinguishes a live acquisition from a stalled one. Every route that can miss
+reports this the same way, so `request_kind` says whether the acquisition was
+started by a file request (`get_file`, `head_file`) or by a repository metadata
+request (`model_info`, `model_tree`). A metadata acquisition has no single requested
+file, so its `path` field is empty; a file acquisition carries the requested path.
+
+A metadata acquisition is unbounded by default and so normally reaches publication
+rather than a deadline: `acquisition_deadline_exceeded` appears with
+`request_kind=model_info` or `model_tree` only where an operator configured
+`MODELKEEP_METADATA_COLD_MISS_DEADLINE_SECONDS`
+([`modelkeep-api.md`](modelkeep-api.md)). `acquisition_progress` is emitted for both
+kinds regardless.
 
 `acquisition_progress` reports byte movement only. A repeated counter is never
 reported as progress: the event is emitted when `acquired_bytes` exceeds the

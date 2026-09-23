@@ -38,49 +38,112 @@ pub const DEFAULT_COLD_MISS_DEADLINE: Duration = Duration::from_secs(8);
 
 const COLD_MISS_PENDING_BODY: &str = "{\"error\":\"acquisition in progress\"}";
 
-/// How long a cold-miss `resolve` waits for acquisition before answering.
+const RESOLVE_DEADLINE_VARIABLE: &str = "MODELKEEP_COLD_MISS_DEADLINE_SECONDS";
+const METADATA_DEADLINE_VARIABLE: &str = "MODELKEEP_METADATA_COLD_MISS_DEADLINE_SECONDS";
+
+/// How long a cold miss waits for acquisition before answering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ColdMissPolicy {
-    /// `None` restores an unbounded wait, which holds the connection open with
-    /// no headers for the whole transfer.
+    /// The `resolve` bound. `None` restores an unbounded wait, which holds the
+    /// connection open with no headers for the whole transfer.
     pub deadline: Option<Duration>,
+    /// The repository metadata bound, `None` by default.
+    ///
+    /// A metadata cold miss waits for the acquisition to finish unless an
+    /// operator opts in, because neither supported client retries a bounded
+    /// metadata answer: see [`DEFAULT_METADATA_COLD_MISS_DEADLINE`].
+    pub metadata_deadline: Option<Duration>,
 }
+
+/// Bound on a cold-miss repository metadata response: none by default.
+///
+/// The `resolve` bound exists because both supported clients abandon a
+/// `resolve` request after ten seconds and retry a `503` on their own. Neither
+/// property holds on `/api/.../revision/...` or `/api/.../tree/...`, measured
+/// against `huggingface_hub` 0.36.0 and 1.27.0 on 2026-09-24:
+///
+/// - the clients apply no read timeout to a metadata request. 0.36.0 waited
+///   30 s and 1.27.0 waited 12 s per request and then completed the download,
+///   so waiting is slow but correct rather than broken;
+/// - neither client retries a metadata `503` — nor `429`, `425`, `500` or
+///   `504`. Each ends the call on the first response.
+///
+/// Bounding metadata by default would therefore turn every first mirror of a
+/// repository whose acquisition outlasts the deadline into a failed
+/// `hf download`, which is ModelKeep's central use. The bound stays available
+/// for an operator who prefers a fast, explicit answer over a long wait.
+pub const DEFAULT_METADATA_COLD_MISS_DEADLINE: Option<Duration> = None;
 
 impl Default for ColdMissPolicy {
     fn default() -> Self {
         Self {
             deadline: Some(DEFAULT_COLD_MISS_DEADLINE),
+            metadata_deadline: DEFAULT_METADATA_COLD_MISS_DEADLINE,
         }
     }
 }
 
 impl ColdMissPolicy {
     pub fn from_env() -> Result<Self, String> {
-        Self::from_value(std::env::var("MODELKEEP_COLD_MISS_DEADLINE_SECONDS"))
+        Self::from_values(
+            std::env::var(RESOLVE_DEADLINE_VARIABLE),
+            std::env::var(METADATA_DEADLINE_VARIABLE),
+        )
     }
 
+    fn from_values(
+        resolve: Result<String, std::env::VarError>,
+        metadata: Result<String, std::env::VarError>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            deadline: deadline_from_value(
+                resolve,
+                RESOLVE_DEADLINE_VARIABLE,
+                Some(DEFAULT_COLD_MISS_DEADLINE),
+            )?,
+            metadata_deadline: deadline_from_value(
+                metadata,
+                METADATA_DEADLINE_VARIABLE,
+                DEFAULT_METADATA_COLD_MISS_DEADLINE,
+            )?,
+        })
+    }
+
+    #[cfg(test)]
     fn from_value(value: Result<String, std::env::VarError>) -> Result<Self, String> {
-        match value {
-            Err(std::env::VarError::NotPresent) => Ok(Self::default()),
-            Err(error) => Err(format!(
-                "invalid MODELKEEP_COLD_MISS_DEADLINE_SECONDS: {error}"
-            )),
-            Ok(value) => {
-                let seconds = value.trim().parse::<u64>().map_err(|_| {
-                    "invalid MODELKEEP_COLD_MISS_DEADLINE_SECONDS: expected whole seconds"
-                        .to_string()
-                })?;
-                Ok(Self {
-                    deadline: (seconds > 0).then(|| Duration::from_secs(seconds)),
-                })
-            }
-        }
+        Self::from_values(value, Err(std::env::VarError::NotPresent))
     }
 
     fn retry_after_seconds(&self) -> u64 {
-        self.deadline
-            .map_or(1, |deadline| deadline.as_secs().max(1))
+        retry_after_seconds(self.deadline)
     }
+
+    fn metadata_retry_after_seconds(&self) -> u64 {
+        retry_after_seconds(self.metadata_deadline)
+    }
+}
+
+/// Reads one whole-second deadline setting. `0` means an unbounded wait.
+fn deadline_from_value(
+    value: Result<String, std::env::VarError>,
+    variable: &str,
+    default: Option<Duration>,
+) -> Result<Option<Duration>, String> {
+    match value {
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(format!("invalid {variable}: {error}")),
+        Ok(value) => {
+            let seconds = value
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| format!("invalid {variable}: expected whole seconds"))?;
+            Ok((seconds > 0).then(|| Duration::from_secs(seconds)))
+        }
+    }
+}
+
+fn retry_after_seconds(deadline: Option<Duration>) -> u64 {
+    deadline.map_or(1, |deadline| deadline.as_secs().max(1))
 }
 
 #[derive(Clone)]
@@ -241,14 +304,14 @@ async fn readyz(State(state): State<HttpState>) -> StatusCode {
 async fn model_info(
     State(state): State<HttpState>,
     Path((namespace, repo, revision)): Path<(String, String, String)>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<Response, StatusCode> {
     repository_info(state, namespace, repo, revision, RepositoryType::Model).await
 }
 
 async fn dataset_info(
     State(state): State<HttpState>,
     Path((namespace, repo, revision)): Path<(String, String, String)>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<Response, StatusCode> {
     repository_info(state, namespace, repo, revision, RepositoryType::Dataset).await
 }
 
@@ -258,7 +321,7 @@ async fn repository_info(
     repo: String,
     revision: String,
     repo_type: RepositoryType,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<Response, StatusCode> {
     let repo_id = format!("{namespace}/{repo}");
     tracing::info!(
         event = "archive_request",
@@ -295,14 +358,26 @@ async fn repository_info(
             let Some(pullthrough) = state.pullthrough.clone() else {
                 return Err(StatusCode::NOT_FOUND);
             };
-            let requested = revision.clone();
-            let repo = repo_id.clone();
-            task::spawn_blocking(move || {
-                pullthrough.ensure_for_type(repo_type, &repo, &requested, &[])
-            })
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .map_err(status_for_pullthrough_error)?
+            // Unbounded by default: a metadata cold miss waits for the
+            // acquisition, because no supported client retries a bounded
+            // answer on this route.
+            let acquired = await_cold_miss_acquisition(
+                state.cold_miss.metadata_deadline,
+                pullthrough,
+                repo_type,
+                &repo_id,
+                &revision,
+                "model_info",
+                None,
+            )
+            .await?;
+            let Some(commit) = acquired else {
+                return cold_miss_pending_response(
+                    false,
+                    state.cold_miss.metadata_retry_after_seconds(),
+                );
+            };
+            commit
         }
         Err(error) => return Err(status_for_archive_error(error)),
     };
@@ -318,20 +393,21 @@ async fn repository_info(
     Ok(Json(serde_json::json!({
         "id": repo_id, "sha": commit, "private": false, "downloads": 0,
         "likes": 0, "tags": [], "siblings": siblings,
-    })))
+    }))
+    .into_response())
 }
 
 async fn model_tree(
     State(state): State<HttpState>,
     Path((namespace, repo, revision)): Path<(String, String, String)>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<Response, StatusCode> {
     repository_tree(state, namespace, repo, revision, RepositoryType::Model).await
 }
 
 async fn dataset_tree(
     State(state): State<HttpState>,
     Path((namespace, repo, revision)): Path<(String, String, String)>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<Response, StatusCode> {
     repository_tree(state, namespace, repo, revision, RepositoryType::Dataset).await
 }
 
@@ -341,7 +417,7 @@ async fn repository_tree(
     repo: String,
     revision: String,
     repo_type: RepositoryType,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<Response, StatusCode> {
     let repo_id = format!("{namespace}/{repo}");
     tracing::info!(
         event = "archive_request",
@@ -378,14 +454,26 @@ async fn repository_tree(
             let Some(pullthrough) = state.pullthrough.clone() else {
                 return Err(StatusCode::NOT_FOUND);
             };
-            let requested = revision.clone();
-            let repo = repo_id.clone();
-            task::spawn_blocking(move || {
-                pullthrough.ensure_for_type(repo_type, &repo, &requested, &[])
-            })
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .map_err(status_for_pullthrough_error)?
+            // Unbounded by default: a metadata cold miss waits for the
+            // acquisition, because no supported client retries a bounded
+            // answer on this route.
+            let acquired = await_cold_miss_acquisition(
+                state.cold_miss.metadata_deadline,
+                pullthrough,
+                repo_type,
+                &repo_id,
+                &revision,
+                "model_tree",
+                None,
+            )
+            .await?;
+            let Some(commit) = acquired else {
+                return cold_miss_pending_response(
+                    false,
+                    state.cold_miss.metadata_retry_after_seconds(),
+                );
+            };
+            commit
         }
         Err(error) => return Err(status_for_archive_error(error)),
     };
@@ -408,7 +496,7 @@ async fn repository_tree(
             })
         })
         .collect::<Vec<_>>();
-    Ok(Json(files))
+    Ok(Json(files).into_response())
 }
 
 fn validated_manifest(
@@ -532,43 +620,17 @@ async fn file_response(
                 return Err(StatusCode::NOT_FOUND);
             };
             let request_kind = if head_only { "head_file" } else { "get_file" };
-            let requested = revision.clone();
-            let requested_file = path.clone();
-            let repo = repo_id.clone();
-            let deadline = state.cold_miss.deadline.map(|bound| Instant::now() + bound);
-            // The acquisition runs on its own thread inside the flight. This
-            // wait is bounded, so giving up here neither cancels the transfer
-            // nor holds the Tokio runtime open past the deadline.
-            let acquired_bytes = Arc::new(AtomicU64::new(0));
-            let observed_bytes = Arc::clone(&acquired_bytes);
-            let progress_repo_id = repo_id.clone();
-            let progress_revision = revision.clone();
-            let progress_path = path.clone();
-            let commit = task::spawn_blocking(move || {
-                let progress = move |event: FetchProgress| {
-                    let Some(acquired) = advanced_bytes(&event, &observed_bytes) else {
-                        return;
-                    };
-                    tracing::info!(event = "acquisition_progress", request_kind, repo_type = %repo_type, repo_id = %progress_repo_id, requested_revision = %progress_revision, path = %progress_path, phase = %event.phase, acquired_bytes = acquired, total_bytes = event.total, "cold-miss acquisition is transferring bytes");
-                };
-                pullthrough.ensure_bounded_for_type(
-                    repo_type,
-                    &repo,
-                    &requested,
-                    &[requested_file],
-                    deadline,
-                    &progress,
-                )
-            })
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .map_err(status_for_pullthrough_error)?;
+            let commit = await_cold_miss_acquisition(
+                state.cold_miss.deadline,
+                pullthrough,
+                repo_type,
+                &repo_id,
+                &revision,
+                request_kind,
+                Some(&path),
+            )
+            .await?;
             let Some(commit) = commit else {
-                let deadline_seconds = state
-                    .cold_miss
-                    .deadline
-                    .map_or(0, |deadline| deadline.as_secs());
-                tracing::warn!(event = "acquisition_deadline_exceeded", request_kind, repo_type = %repo_type, repo_id = %repo_id, requested_revision = %revision, path = %path, deadline_seconds, acquired_bytes = acquired_bytes.load(Ordering::Relaxed), "cold-miss acquisition exceeded the response deadline and continues in the background");
                 return cold_miss_pending_response(
                     head_only,
                     state.cold_miss.retry_after_seconds(),
@@ -632,6 +694,70 @@ async fn file_response(
     response
         .body(body)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// Waits for the acquisition a missing request needs, bounded by `wait`.
+///
+/// Every route that can miss shares this one wait, so the routes cannot drift
+/// apart in anything but the bound their caller passes: the same flight, the
+/// same liveness events, and the same pending answer. The acquisition runs on
+/// its own thread inside the flight, so giving up here neither cancels the
+/// transfer nor holds the Tokio runtime open past the deadline, and a later
+/// request joins the same flight instead of starting a second download.
+///
+/// `wait: None` waits for the acquisition to finish, which is what the
+/// metadata routes do by default ([`DEFAULT_METADATA_COLD_MISS_DEADLINE`]).
+///
+/// `path` is the one file a `resolve` needs. A metadata route has no path and
+/// passes `None`, which acquires the revision's snapshot (ADR-0008).
+///
+/// `Ok(None)` means the deadline elapsed with the acquisition still running;
+/// the caller answers with [`cold_miss_pending_response`].
+async fn await_cold_miss_acquisition(
+    wait: Option<Duration>,
+    pullthrough: Arc<PullThrough>,
+    repo_type: RepositoryType,
+    repo_id: &str,
+    revision: &str,
+    request_kind: &'static str,
+    path: Option<&str>,
+) -> Result<Option<String>, StatusCode> {
+    let files: Vec<String> = path.map(str::to_string).into_iter().collect();
+    let deadline = wait.map(|bound| Instant::now() + bound);
+    let acquired_bytes = Arc::new(AtomicU64::new(0));
+    let observed_bytes = Arc::clone(&acquired_bytes);
+    // A metadata acquisition has no single path; the empty field keeps one
+    // event shape for every request kind.
+    let event_path = path.unwrap_or_default().to_string();
+    let progress_path = event_path.clone();
+    let progress_repo_id = repo_id.to_string();
+    let progress_revision = revision.to_string();
+    let owned_repo_id = repo_id.to_string();
+    let owned_revision = revision.to_string();
+    let commit = task::spawn_blocking(move || {
+        let progress = move |event: FetchProgress| {
+            let Some(acquired) = advanced_bytes(&event, &observed_bytes) else {
+                return;
+            };
+            tracing::info!(event = "acquisition_progress", request_kind, repo_type = %repo_type, repo_id = %progress_repo_id, requested_revision = %progress_revision, path = %progress_path, phase = %event.phase, acquired_bytes = acquired, total_bytes = event.total, "cold-miss acquisition is transferring bytes");
+        };
+        pullthrough.ensure_bounded_for_type(
+            repo_type,
+            &owned_repo_id,
+            &owned_revision,
+            &files,
+            deadline,
+            &progress,
+        )
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(status_for_pullthrough_error)?;
+    if commit.is_none() {
+        let deadline_seconds = wait.map_or(0, |deadline| deadline.as_secs());
+        tracing::warn!(event = "acquisition_deadline_exceeded", request_kind, repo_type = %repo_type, repo_id = %repo_id, requested_revision = %revision, path = %event_path, deadline_seconds, acquired_bytes = acquired_bytes.load(Ordering::Relaxed), "cold-miss acquisition exceeded the response deadline and continues in the background");
+    }
+    Ok(commit)
 }
 
 /// The byte count to report when an acquisition event shows real movement.
@@ -1645,13 +1771,28 @@ mod tests {
             }
         }
 
+        /// A router with the shipped policy: `resolve` bounded, metadata not.
         fn router(&self, deadline: Duration) -> Router {
+            self.router_with(ColdMissPolicy {
+                deadline: Some(deadline),
+                ..ColdMissPolicy::default()
+            })
+        }
+
+        /// A router for an operator who opted the metadata routes into the
+        /// bound as well.
+        fn metadata_router(&self, deadline: Duration) -> Router {
+            self.router_with(ColdMissPolicy {
+                deadline: Some(deadline),
+                metadata_deadline: Some(deadline),
+            })
+        }
+
+        fn router_with(&self, policy: ColdMissPolicy) -> Router {
             router_with_pullthrough_and_policy(
                 self.archive.clone(),
                 Arc::clone(&self.pullthrough),
-                ColdMissPolicy {
-                    deadline: Some(deadline),
-                },
+                policy,
             )
         }
 
@@ -1880,6 +2021,329 @@ mod tests {
             .unwrap();
         assert_eq!(served.status(), StatusCode::OK);
         assert!(fixture.staging_directories().is_empty());
+    }
+
+    const METADATA_ROUTES: [&str; 2] = [
+        "/api/models/org/model/revision/main",
+        "/api/models/org/model/tree/main",
+    ];
+
+    async fn json_body(response: Response) -> serde_json::Value {
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
+    }
+
+    /// The shipped default: a metadata cold miss waits for the acquisition.
+    ///
+    /// Bounding it would break the first mirror of any repository whose
+    /// acquisition outlasts the deadline, because neither supported client
+    /// retries a bounded metadata answer
+    /// ([`a_configured_metadata_deadline_is_an_explicit_operator_trade`]).
+    #[tokio::test]
+    async fn a_cold_metadata_request_waits_for_the_acquisition_by_default() {
+        assert_eq!(ColdMissPolicy::default().metadata_deadline, None);
+        let (logs, guard) = capture_logs("info");
+        let fixture = ColdMissFixture::new();
+        // `resolve` keeps its bound; the metadata routes are not bounded by it.
+        let app = fixture.router(Duration::from_millis(100));
+        let held = Duration::from_millis(700);
+        let gate = Arc::clone(&fixture.gate);
+        std::thread::spawn(move || {
+            std::thread::sleep(held);
+            gate.release();
+        });
+
+        let started = Instant::now();
+        let info = app
+            .clone()
+            .oneshot(cold_miss_request(
+                Method::GET,
+                "/api/models/org/model/revision/main",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            info.status(),
+            StatusCode::OK,
+            "a metadata cold miss must not be cut off by the resolve deadline"
+        );
+        assert!(
+            started.elapsed() >= held,
+            "the request answered before the acquisition finished: {:?}",
+            started.elapsed()
+        );
+        let info = json_body(info).await;
+        assert_eq!(info["sha"], COLD_MISS_COMMIT);
+        assert_eq!(info["siblings"][0]["rfilename"], "config.json");
+
+        let tree = app
+            .oneshot(cold_miss_request(
+                Method::GET,
+                "/api/models/org/model/tree/main",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(tree.status(), StatusCode::OK);
+        assert_eq!(json_body(tree).await[0]["path"], "config.json");
+
+        let output = logs.output();
+        drop(guard);
+        assert!(output.contains("archive_miss"), "{output}");
+        assert!(
+            !output.contains("acquisition_deadline_exceeded"),
+            "the default metadata wait must not report a deadline: {output}"
+        );
+        assert_eq!(fixture.acquisitions(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_configured_metadata_deadline_answers_within_it_and_keeps_acquiring() {
+        for route in METADATA_ROUTES {
+            let (logs, guard) = capture_logs("info");
+            let fixture = ColdMissFixture::new();
+            let app = fixture.metadata_router(Duration::from_millis(200));
+            let started = Instant::now();
+            let response = app
+                .oneshot(cold_miss_request(Method::GET, route))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{route} must answer with the documented cold-miss status"
+            );
+            assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{route} was not bounded: {:?}",
+                started.elapsed()
+            );
+            assert_eq!(fixture.started_acquisitions(), 1);
+            let output = logs.output();
+            drop(guard);
+            assert!(output.contains("archive_miss"), "{output}");
+            assert!(output.contains("acquisition_deadline_exceeded"), "{output}");
+
+            // The acquisition was never cancelled, so it still publishes.
+            fixture.settle();
+            assert_eq!(fixture.acquisitions(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_metadata_retry_joins_the_running_acquisition_and_is_answered_once_it_finishes() {
+        let fixture = ColdMissFixture::new();
+        let impatient = fixture.metadata_router(Duration::from_millis(100));
+        let patient = fixture.metadata_router(Duration::from_secs(30));
+
+        let bounded = impatient
+            .oneshot(cold_miss_request(
+                Method::GET,
+                "/api/models/org/model/revision/main",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(bounded.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(fixture.started_acquisitions(), 1);
+
+        let gate = Arc::clone(&fixture.gate);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            gate.release();
+        });
+        let info = patient
+            .clone()
+            .oneshot(cold_miss_request(
+                Method::GET,
+                "/api/models/org/model/revision/main",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(info.status(), StatusCode::OK);
+        let info = json_body(info).await;
+        assert_eq!(info["sha"], COLD_MISS_COMMIT);
+        assert_eq!(info["siblings"][0]["rfilename"], "config.json");
+
+        let tree = patient
+            .oneshot(cold_miss_request(
+                Method::GET,
+                "/api/models/org/model/tree/main",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(tree.status(), StatusCode::OK);
+        let tree = json_body(tree).await;
+        assert_eq!(tree[0]["path"], "config.json");
+        assert_eq!(tree[0]["size"], "cold-http".len());
+
+        // Every later request joined or read the archive; none started a
+        // second download.
+        assert_eq!(fixture.acquisitions(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_archived_revision_answers_metadata_without_entering_the_acquisition_path() {
+        let fixture = ColdMissFixture::new();
+        fixture
+            .archive
+            .publish_revision(crate::PublishRequest {
+                repo_id: "org/model".into(),
+                requested_revision: "main".into(),
+                commit: COLD_MISS_COMMIT.into(),
+                files: vec![crate::ArchiveFile {
+                    path: "config.json".into(),
+                    bytes: b"already-archived".to_vec(),
+                }],
+            })
+            .unwrap();
+        fixture
+            .archive
+            .update_ref("org/model", "main", COLD_MISS_COMMIT)
+            .unwrap();
+        // The gate is never released: a warm metadata answer that entered the
+        // miss path would block instead of answering.
+        let app = fixture.metadata_router(Duration::from_secs(30));
+        for route in METADATA_ROUTES {
+            let started = Instant::now();
+            let response = app
+                .clone()
+                .oneshot(cold_miss_request(Method::GET, route))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{route}");
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{route} must not wait on acquisition: {:?}",
+                started.elapsed()
+            );
+        }
+        assert_eq!(fixture.acquisitions(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_metadata_request_that_reaches_its_deadline_publishes_nothing() {
+        let fixture = ColdMissFixture::new();
+        let app = fixture.metadata_router(Duration::from_millis(200));
+        let response = app
+            .clone()
+            .oneshot(cold_miss_request(
+                Method::GET,
+                "/api/models/org/model/revision/main",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // The pending answer is not metadata: it never reports an empty or
+        // partial file list as the revision's contents.
+        assert_eq!(
+            json_body(response).await["error"],
+            "acquisition in progress"
+        );
+
+        assert!(fixture
+            .archive
+            .list_revisions("org/model")
+            .unwrap()
+            .is_empty());
+        assert!(!fixture
+            .archive
+            .is_complete_revision("org/model", COLD_MISS_COMMIT)
+            .unwrap_or(false));
+        assert!(fixture
+            .archive
+            .manifest("org/model", COLD_MISS_COMMIT)
+            .is_err());
+        assert_eq!(fixture.started_acquisitions(), 1);
+        assert_eq!(
+            fixture.staging_directories().len(),
+            1,
+            "the interrupted request must leave exactly one resumable staging directory"
+        );
+
+        fixture.settle();
+        let served = app
+            .oneshot(cold_miss_request(
+                Method::GET,
+                "/api/models/org/model/revision/main",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(served.status(), StatusCode::OK);
+        assert_eq!(json_body(served).await["sha"], COLD_MISS_COMMIT);
+        assert!(fixture.staging_directories().is_empty());
+    }
+
+    /// Fixes the measured reaction of the supported clients to a bounded
+    /// metadata answer (`huggingface_hub` 0.36.0 and 1.27.0, 2026-09-24),
+    /// which is *not* the reaction they have to a bounded `resolve`, and which
+    /// is why the metadata bound is opt-in:
+    ///
+    /// - `/api/models/.../revision/...` and `/api/models/.../tree/...`: neither
+    ///   client retries any candidate status. `503`, `429`, `425`, `500` and
+    ///   `504` each end the call on the first response, as
+    ///   `LocalEntryNotFoundError` (from `snapshot_download`) or
+    ///   `HfHubHTTPError` (from `list_repo_tree`). On `resolve` both clients
+    ///   retry `503` on their own; on metadata neither does.
+    /// - holding the metadata request open instead: neither client applies its
+    ///   10-second `resolve` read timeout here. 0.36.0 waited 30 s and 1.27.0
+    ///   waited 12 s per metadata request, and both then completed the
+    ///   download. Waiting is slow, not broken.
+    /// - 1.27.0 requests `revision` and then `tree` during a download; 0.36.0
+    ///   requests `revision` only.
+    ///
+    /// So a bound on these routes is a trade an operator makes deliberately:
+    /// it buys a prompt, classified answer at the cost of failing every cold
+    /// download whose acquisition outlasts the deadline. Waiting remains the
+    /// default. When an operator does configure it, the answer is the one the
+    /// `resolve` route already documents — `503` with `Retry-After`, never
+    /// confusable with `404` absent, with the acquisition still running and a
+    /// repeated request joining it.
+    #[test]
+    fn a_configured_metadata_deadline_is_an_explicit_operator_trade() {
+        // Shipped: `resolve` bounded, metadata waiting.
+        let shipped = ColdMissPolicy::default();
+        assert_eq!(shipped.deadline, Some(DEFAULT_COLD_MISS_DEADLINE));
+        assert_eq!(shipped.metadata_deadline, None);
+
+        // Configuring the metadata bound does not disturb the `resolve` bound.
+        let configured =
+            ColdMissPolicy::from_values(Err(std::env::VarError::NotPresent), Ok("30".into()))
+                .unwrap();
+        assert_eq!(configured.deadline, Some(DEFAULT_COLD_MISS_DEADLINE));
+        assert_eq!(configured.metadata_deadline, Some(Duration::from_secs(30)));
+        assert_eq!(configured.metadata_retry_after_seconds(), 30);
+
+        // And the answer it produces is the documented one.
+        let pending = cold_miss_pending_response(false, 30).unwrap();
+        assert_eq!(pending.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(pending.headers()[header::RETRY_AFTER], "30");
+    }
+
+    #[test]
+    fn the_metadata_cold_miss_deadline_is_a_separate_setting_that_defaults_to_waiting() {
+        let unset = Err(std::env::VarError::NotPresent);
+        assert_eq!(
+            ColdMissPolicy::from_values(unset.clone(), unset.clone()).unwrap(),
+            ColdMissPolicy::default()
+        );
+        // Zero is the default and says so explicitly.
+        assert_eq!(
+            ColdMissPolicy::from_values(unset.clone(), Ok("0".into()))
+                .unwrap()
+                .metadata_deadline,
+            None
+        );
+        // The two settings are independent in both directions.
+        let resolve_only = ColdMissPolicy::from_values(Ok("0".into()), unset.clone()).unwrap();
+        assert_eq!(resolve_only.deadline, None);
+        assert_eq!(resolve_only.metadata_deadline, None);
+        let both = ColdMissPolicy::from_values(Ok("5".into()), Ok("60".into())).unwrap();
+        assert_eq!(both.deadline, Some(Duration::from_secs(5)));
+        assert_eq!(both.metadata_deadline, Some(Duration::from_secs(60)));
+        // A malformed metadata setting is a configuration failure, never a
+        // silently applied bound.
+        assert!(ColdMissPolicy::from_values(unset.clone(), Ok("soon".into())).is_err());
+        assert!(ColdMissPolicy::from_values(unset, Ok("-1".into())).is_err());
     }
 
     /// Fixes the measured reaction of the supported clients to the candidate
