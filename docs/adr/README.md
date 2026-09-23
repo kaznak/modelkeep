@@ -26,3 +26,4 @@ Initial records:
 - ADR-0017 — resume identified fetch staging after lease expiry
 - ADR-0018 — reconstructible indexes for paged management job history
 - ADR-0019 — separate model and dataset archive namespaces
+- ADR-0020 — selection-scoped revision acquisition (proposed; partially supersedes ADR-0008)

@@ -1,6 +1,6 @@
 # ADR-0008: Publish only complete upstream snapshots
 
-- Status: Accepted
+- Status: Accepted (partial supersession proposed in ADR-0020)
 - Date: 2026-08-21
 
 ## Context
