@@ -26,13 +26,13 @@
 | 13: authentication/gated models | [Issue 0028](issues/0028-define-private-gated-credential-policy.md)、[Issue 0021](issues/0021-add-tailnet-identity-aware-authorization.md) |
 | 14: Rust server/security | ~~[safe archive resolution](https://github.com/kaznak/modelkeep/commit/220a62b94371cd6a21e623c52a9a5da86b2d30c0)~~、~~[Issue 0015](https://github.com/kaznak/modelkeep/commit/1b024cc23d148df3640c0290f99f0d25fd5eb4ea)~~ |
 | 15: Nix/OCI | ~~[aarch64対応OCI CI](https://github.com/kaznak/modelkeep/commit/ad1b222abe5777b08aa9fad67e56b34b76afb38c)~~、~~[Issues 0012–0013: reproducible environment](https://github.com/kaznak/modelkeep/commit/2718a3a4dd54b1daade42d9abfe556192fc333af)~~、~~[Issue 0023: supported HF client version matrix](https://github.com/kaznak/modelkeep/commit/6d6f77bb65174ed292552959b4b57879161dda99)~~ |
-| 16: QNAP | ~~[Issue 0011: permissions](https://github.com/kaznak/modelkeep/commit/2b8de5e1bdcb191958c2546160ac3949756e30ff)~~、~~[Issue 0019: production runbook](https://github.com/kaznak/modelkeep/commit/e95e1dc62c2187165f2b156406009dad55c1db65)~~、~~[Issue 0005: Tailscale boundary](https://github.com/kaznak/modelkeep/commit/a13d437915dda66392bdc3367137eb1607992e59)~~、~~[Issue 0044: QNAP container identification](https://github.com/kaznak/modelkeep/commit/4953eab)~~、~~[Issue 0060: local acceptance site config](https://github.com/kaznak/modelkeep/commit/94c376e)~~、[Issue 0026](issues/0026-complete-qnap-gx10-acceptance-testing.md) |
+| 16: QNAP | ~~[Issue 0011: permissions](https://github.com/kaznak/modelkeep/commit/2b8de5e1bdcb191958c2546160ac3949756e30ff)~~、~~[Issue 0019: production runbook](https://github.com/kaznak/modelkeep/commit/e95e1dc62c2187165f2b156406009dad55c1db65)~~、~~[Issue 0005: Tailscale boundary](https://github.com/kaznak/modelkeep/commit/a13d437915dda66392bdc3367137eb1607992e59)~~、~~[Issue 0044: QNAP container identification](https://github.com/kaznak/modelkeep/commit/4953eab)~~、~~[Issue 0060: local acceptance site config](https://github.com/kaznak/modelkeep/commit/94c376e)~~、~~[Issue 0026](https://github.com/kaznak/modelkeep/commit/8665cc6bf8650e3266c2e0e9fc76108c30891dd0)~~ |
 | 17: GX10 cache import | ~~[cache importer実装](https://github.com/kaznak/modelkeep/commit/d017a2d1c9cdd63b830d6426d41ce7e6c61a5ff7)~~、[Issue 0025](issues/0025-validate-large-hf-cache-migration.md) |
 | 18: CLI/管理 | ~~[list/show](https://github.com/kaznak/modelkeep/commit/fc34136b181acab80e2b19e674306726e25af214)~~、~~[explicit remove](https://github.com/kaznak/modelkeep/commit/e8aa9cce7aaccf1d9f5b8e701d317b0d678b343b)~~、~~[Issue 0016: refresh](https://github.com/kaznak/modelkeep/commit/ccd518b9fd39db55401bc0c34c9ed3630680eddc)~~、~~[Issue 0020: audit](https://github.com/kaznak/modelkeep/commit/ef2da9c8a9471bc4ca3b900b6a15472759195480)~~、~~[Issues 0049–0051: job progress and authenticated operator UI](https://github.com/kaznak/modelkeep/commit/0e7cce9)~~、~~[Issue 0054: durable job identity and idempotency](https://github.com/kaznak/modelkeep/commit/fdcaf1f)~~、~~[Issue 0055: paged management job history](https://github.com/kaznak/modelkeep/commit/af864d3376bb5b9bd3edce23bb8930a8a641ba49)~~、~~[Issue 0057: accurate acquisition progress](https://github.com/kaznak/modelkeep/commit/b06b2758ecdd852f87115956a8360ed2da921a56)~~、~~[Issue 0059: active job deduplication](https://github.com/kaznak/modelkeep/commit/4601308)~~ |
 | 19: observability | ~~[JSON operational logging基盤](https://github.com/kaznak/modelkeep/commit/8a4d9b2c048d6d72856f54967ad8b05cbb9b4e28)~~、~~[Issue 0043: startup lifecycle logging](https://github.com/kaznak/modelkeep/commit/35c6c28)（[CLI stdout分離](https://github.com/kaznak/modelkeep/commit/d85018f)）~~、~~[Issue 0027: structured operational events](https://github.com/kaznak/modelkeep/commit/461d59ec5ed69934c7ffd94c99a3afea8e8247fa)~~、~~[Issue 0004: storage capacity observability](https://github.com/kaznak/modelkeep/commit/e0c0a2b3347835ca8834b2f0db77c3f8534ceca5)~~、~~[Issue 0052: admin polling write probes](https://github.com/kaznak/modelkeep/commit/f94e24b)~~ |
 | 20–21: observation/testing | ~~[Issue 0015](https://github.com/kaznak/modelkeep/commit/1b024cc23d148df3640c0290f99f0d25fd5eb4ea)~~、~~[Issue 0022](https://github.com/kaznak/modelkeep/commit/136ee61c676396bc4b9a01d0eb61fa53aae4d3f0)~~、~~[Issue 0024: black-box crash and upgrade safety](https://github.com/kaznak/modelkeep/commit/ad5f20f)~~、[Issue 0025](issues/0025-validate-large-hf-cache-migration.md)、~~[Issue 0062: deterministic crash/resume test](https://github.com/kaznak/modelkeep/commit/eb24827f518e8dd99a7bd6a447de43ab42f5b2c1)~~ |
 | 22: CI | ~~[native amd64/arm64 image jobs](https://github.com/kaznak/modelkeep/commit/b0a5f24e3d50e50b05b3c6c6ce178b0ed69c39f0)~~、~~[Issue 0023: supported HF client version matrix](https://github.com/kaznak/modelkeep/commit/6d6f77bb65174ed292552959b4b57879161dda99)~~ |
-| 23–24: phases/MVP acceptance | 下記のphase/MVP対応表、[Issue 0026](issues/0026-complete-qnap-gx10-acceptance-testing.md)、~~[Issue 0063: release acceptanceとrestore drillの分離](https://github.com/kaznak/modelkeep/commit/3d5a1cb4182b1b31c50e8199daf1366df72ced38)~~ |
+| 23–24: phases/MVP acceptance | 下記のphase/MVP対応表、~~[Issue 0026](https://github.com/kaznak/modelkeep/commit/8665cc6bf8650e3266c2e0e9fc76108c30891dd0)~~、~~[Issue 0063: release acceptanceとrestore drillの分離](https://github.com/kaznak/modelkeep/commit/3d5a1cb4182b1b31c50e8199daf1366df72ced38)~~ |
 | 25: 将来拡張 | 下記の各候補Issue |
 | 26: 実装優先タスク | 下記のリンク付き一覧 |
 
@@ -725,7 +725,7 @@ HF_ENDPOINT=http://127.0.0.1:8090 \
 
 #### Cold miss
 
-~~Fixtureで検証済み — [Issue 0015](https://github.com/kaznak/modelkeep/commit/1b024cc23d148df3640c0290f99f0d25fd5eb4ea)~~。実機は[Issue 0026](issues/0026-complete-qnap-gx10-acceptance-testing.md)。
+~~Fixtureで検証済み — [Issue 0015](https://github.com/kaznak/modelkeep/commit/1b024cc23d148df3640c0290f99f0d25fd5eb4ea)~~。実機は~~[Issue 0026](https://github.com/kaznak/modelkeep/commit/8665cc6bf8650e3266c2e0e9fc76108c30891dd0)~~。
 
 ```text
 ModelKeep empty
@@ -737,7 +737,7 @@ ModelKeep empty
 
 #### Warm hit / offline
 
-~~Fixtureで検証済み — [Issue 0015](https://github.com/kaznak/modelkeep/commit/1b024cc23d148df3640c0290f99f0d25fd5eb4ea)~~。実機は[Issue 0026](issues/0026-complete-qnap-gx10-acceptance-testing.md)。
+~~Fixtureで検証済み — [Issue 0015](https://github.com/kaznak/modelkeep/commit/1b024cc23d148df3640c0290f99f0d25fd5eb4ea)~~。実機は~~[Issue 0026](https://github.com/kaznak/modelkeep/commit/8665cc6bf8650e3266c2e0e9fc76108c30891dd0)~~。
 
 ```text
 GX10 cache empty
@@ -842,7 +842,7 @@ upstream を使う online test と、fixture/archive だけを使う determinist
 - ~~non-root — [QNAP Compose](https://github.com/kaznak/modelkeep/commit/b441c26)~~
 - ~~read-only rootfs — [QNAP Compose](https://github.com/kaznak/modelkeep/commit/b441c26)~~
 - ~~Container Station deployment definition — [Issue 0005](https://github.com/kaznak/modelkeep/commit/a13d437915dda66392bdc3367137eb1607992e59)~~
-- restart/reboot tests — [Issue 0026](issues/0026-complete-qnap-gx10-acceptance-testing.md)
+- restart/reboot tests — ~~[Issue 0026](https://github.com/kaznak/modelkeep/commit/8665cc6bf8650e3266c2e0e9fc76108c30891dd0)~~
 - ~~QNAP snapshot integration policy — [Issue 0019](https://github.com/kaznak/modelkeep/commit/e95e1dc62c2187165f2b156406009dad55c1db65)~~
 
 ### Phase 6 — Operations
@@ -860,10 +860,10 @@ upstream を使う online test と、fixture/archive だけを使う determinist
 
 以下をすべて満たした時点を MVP 完了とする。
 
-1. QNAP Container Station上でModelKeepが常駐する — [Issue 0026](issues/0026-complete-qnap-gx10-acceptance-testing.md)
-2. GX10から`HF_ENDPOINT=ModelKeep`で標準`hf download`が動作する — [Issue 0026](issues/0026-complete-qnap-gx10-acceptance-testing.md)
-3. ~~未保存public modelがupstreamから取得され、archiveへ完全にpublishされる — [Issue 0015](https://github.com/kaznak/modelkeep/commit/1b024cc23d148df3640c0290f99f0d25fd5eb4ea)~~（QNAP実機の永続性は[Issue 0026](issues/0026-complete-qnap-gx10-acceptance-testing.md)）
-4. GX10のローカルcacheを削除しても同モデルをQNAPから再取得できる — [Issue 0026](issues/0026-complete-qnap-gx10-acceptance-testing.md)
+1. QNAP Container Station上でModelKeepが常駐する — ~~[Issue 0026](https://github.com/kaznak/modelkeep/commit/8665cc6bf8650e3266c2e0e9fc76108c30891dd0)~~
+2. GX10から`HF_ENDPOINT=ModelKeep`で標準`hf download`が動作する — ~~[Issue 0026](https://github.com/kaznak/modelkeep/commit/8665cc6bf8650e3266c2e0e9fc76108c30891dd0)~~
+3. ~~未保存public modelがupstreamから取得され、archiveへ完全にpublishされる — [Issue 0015](https://github.com/kaznak/modelkeep/commit/1b024cc23d148df3640c0290f99f0d25fd5eb4ea)~~（QNAP実機の永続性は~~[Issue 0026](https://github.com/kaznak/modelkeep/commit/8665cc6bf8650e3266c2e0e9fc76108c30891dd0)~~）
+4. GX10のローカルcacheを削除しても同モデルをQNAPから再取得できる — ~~[Issue 0026](https://github.com/kaznak/modelkeep/commit/8665cc6bf8650e3266c2e0e9fc76108c30891dd0)~~
 5. ~~upstream通信を遮断してもarchive済みモデルを取得できる — [Issue 0015](https://github.com/kaznak/modelkeep/commit/1b024cc23d148df3640c0290f99f0d25fd5eb4ea)~~
 6. ~~Range requestが正しく動作する — [Issue 0015](https://github.com/kaznak/modelkeep/commit/1b024cc23d148df3640c0290f99f0d25fd5eb4ea)~~
 7. ~~同一fileの同時missが一回のupstream fetchに集約される — [single-flight implementation and tests](https://github.com/kaznak/modelkeep/commit/b071528)~~
@@ -871,7 +871,7 @@ upstream を使う online test と、fixture/archive だけを使う determinist
 9. ~~`main`更新後も旧commitが保存される — [Issue 0016](https://github.com/kaznak/modelkeep/commit/ccd518b9fd39db55401bc0c34c9ed3630680eddc)~~
 10. GX10の既存HF cacheから大型モデルをimportできる — [Issue 0025](issues/0025-validate-large-hf-cache-migration.md)
 11. ~~ModelKeep version updateでarchiveの再取得が不要である — [Issue 0024](https://github.com/kaznak/modelkeep/commit/ad5f20f)~~
-12. QNAP reboot / Container Station restart後に自動復旧する — [Issue 0026](issues/0026-complete-qnap-gx10-acceptance-testing.md)
+12. QNAP reboot / Container Station restart後に自動復旧する — ~~[Issue 0026](https://github.com/kaznak/modelkeep/commit/8665cc6bf8650e3266c2e0e9fc76108c30891dd0)~~
 
 ---
 
@@ -914,7 +914,7 @@ ModelKeep という名称は Hugging Face 専用に限定しないため、将�
 10. ~~offline warm-hit testをCIに入れる — [Issue 0015](https://github.com/kaznak/modelkeep/commit/1b024cc23d148df3640c0290f99f0d25fd5eb4ea)~~
 11. ~~`import-hf-cache`を実装する — [cache importer](https://github.com/kaznak/modelkeep/commit/d017a2d1c9cdd63b830d6426d41ce7e6c61a5ff7)~~。大型実機検証は[Issue 0025](issues/0025-validate-large-hf-cache-migration.md)
 12. ~~Nix OCI imageをaarch64-linux向けに生成する — [native arm64 CI](https://github.com/kaznak/modelkeep/commit/b0a5f24e3d50e50b05b3c6c6ce178b0ed69c39f0)~~
-13. QNAP Container Stationで長時間運転・再起動試験を行う — [Issue 0026](issues/0026-complete-qnap-gx10-acceptance-testing.md)
+13. QNAP Container Stationで長時間運転・再起動試験を行う — ~~[Issue 0026](https://github.com/kaznak/modelkeep/commit/8665cc6bf8650e3266c2e0e9fc76108c30891dd0)~~
 
 ---
 
