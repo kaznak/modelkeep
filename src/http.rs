@@ -1287,6 +1287,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn archived_revision_is_served_while_upstream_is_unavailable() {
+        let commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        archive
+            .publish_revision(crate::PublishRequest {
+                repo_id: "org/model".into(),
+                requested_revision: "main".into(),
+                commit: commit.into(),
+                files: vec![crate::ArchiveFile {
+                    path: "config.json".into(),
+                    bytes: b"already-archived".to_vec(),
+                }],
+            })
+            .unwrap();
+        archive.update_ref("org/model", "main", commit).unwrap();
+        let pullthrough = Arc::new(PullThrough::new(
+            archive.clone(),
+            Arc::new(ErrorFetcher(UpstreamErrorKind::Unavailable)),
+        ));
+        let app = router_with_pullthrough(archive, pullthrough);
+
+        // Core invariant 8: metadata and file serving for archived content must
+        // not depend on upstream being reachable.
+        for uri in [
+            "/api/models/org/model/revision/main",
+            "/api/models/org/model/tree/main",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        }
+        let file = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/org/model/resolve/main/config.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(file.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(file.into_body(), usize::MAX).await.unwrap(),
+            "already-archived"
+        );
+    }
+
+    #[tokio::test]
     async fn preserves_upstream_failure_classes_in_http_status() {
         for (kind, expected) in [
             (UpstreamErrorKind::NotFound, StatusCode::NOT_FOUND),

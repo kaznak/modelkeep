@@ -177,6 +177,26 @@ pub struct FetchedRevision {
     pub staging: PathBuf,
 }
 
+/// Asks upstream which paths a selection covers, without transferring any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InventoryRequest {
+    pub repo_type: RepositoryType,
+    pub repo_id: String,
+    pub revision: String,
+    pub files: Vec<String>,
+    pub exclude: Vec<String>,
+}
+
+/// Upstream's answer to an [`InventoryRequest`].
+///
+/// Unlike an acquisition, an empty file list is a legitimate answer: it means
+/// upstream holds nothing matching the selection at this revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevisionInventory {
+    pub commit: String,
+    pub files: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct FetchProgress {
     #[serde(default)]
@@ -307,6 +327,19 @@ pub trait UpstreamFetcher: Send + Sync {
         _progress: &(dyn Fn(FetchProgress) + Send + Sync),
     ) -> Result<FetchedRevision, UpstreamError> {
         self.fetch(request)
+    }
+
+    /// Resolves the commit and the upstream paths a selection covers, without
+    /// transferring anything.
+    ///
+    /// `Ok(None)` means this fetcher cannot enumerate upstream. The caller then
+    /// acquires with the selection exactly as given instead of reconciling an
+    /// already published revision against it.
+    fn inventory(
+        &self,
+        _request: &InventoryRequest,
+    ) -> Result<Option<RevisionInventory>, UpstreamError> {
+        Ok(None)
     }
 }
 
@@ -458,6 +491,94 @@ impl UpstreamFetcher for OfficialHfFetcher {
             files: response.files,
             staging: request.staging.clone(),
         })
+    }
+
+    fn inventory(
+        &self,
+        request: &InventoryRequest,
+    ) -> Result<Option<RevisionInventory>, UpstreamError> {
+        let mut command = Command::new(&self.python);
+        command
+            .arg(&self.helper)
+            .arg("--repo-type")
+            .arg(request.repo_type.to_string())
+            .arg("--repo-id")
+            .arg(&request.repo_id)
+            .arg("--revision")
+            .arg(&request.revision)
+            .arg("--resolve-only")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        for file in &request.files {
+            command.arg("--file").arg(file);
+        }
+        for pattern in &request.exclude {
+            command.arg("--exclude").arg(pattern);
+        }
+        let mut child = command.spawn().map_err(UpstreamError::Io)?;
+        let Some(stdout) = child.stdout.take() else {
+            terminate_and_reap(&mut child);
+            return Err(UpstreamError::InvalidOutput(
+                InvalidOutputReason::StdoutUnavailable,
+            ));
+        };
+        let parsed = (|| {
+            let mut result = None;
+            for line in BufReader::new(stdout).lines() {
+                let line = line.map_err(UpstreamError::Io)?;
+                let value: serde_json::Value = serde_json::from_str(&line)
+                    .map_err(|_| UpstreamError::InvalidOutput(InvalidOutputReason::NonJsonLine))?;
+                match value.get("type").and_then(|value| value.as_str()) {
+                    // A resolve-only call owns no staging, so there is nothing
+                    // to record from a resolved event and nothing to report
+                    // from a progress event; the result event is authoritative.
+                    Some("progress" | "resolved") => continue,
+                    Some("result") => {
+                        result =
+                            Some(serde_json::from_value::<HelperOutput>(value).map_err(|_| {
+                                UpstreamError::InvalidOutput(InvalidOutputReason::MalformedResult)
+                            })?);
+                    }
+                    None => continue,
+                    _ => {
+                        return Err(UpstreamError::InvalidOutput(
+                            InvalidOutputReason::UnsupportedEventType,
+                        ))
+                    }
+                }
+            }
+            Ok(result)
+        })();
+        let result = match parsed {
+            Ok(result) => result,
+            Err(error) => {
+                terminate_and_reap(&mut child);
+                return Err(error);
+            }
+        };
+        let status = child.wait().map_err(UpstreamError::Io)?;
+        if !status.success() {
+            return Err(match status.code() {
+                Some(10) => UpstreamError::Unavailable,
+                Some(11) => UpstreamError::NotFound,
+                Some(12) => UpstreamError::Unauthorized,
+                _ => UpstreamError::Failed,
+            });
+        }
+        let response: HelperOutput = result.ok_or(UpstreamError::InvalidOutput(
+            InvalidOutputReason::MissingResult,
+        ))?;
+        if !is_hf_commit(&response.commit) {
+            return Err(UpstreamError::InvalidOutput(
+                InvalidOutputReason::MalformedResultCommit,
+            ));
+        }
+        // An empty list is a legitimate answer here: it means upstream holds
+        // nothing matching this selection, not that a transfer produced nothing.
+        Ok(Some(RevisionInventory {
+            commit: response.commit,
+            files: response.files,
+        }))
     }
 }
 
@@ -652,6 +773,96 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair == ["--exclude", "weights/*"]),
             "exclude pattern missing from {recorded:?}"
+        );
+    }
+
+    fn run_resolve_only(
+        result_line: &str,
+        arguments: &std::path::Path,
+    ) -> Option<RevisionInventory> {
+        let directory = tempfile::tempdir().unwrap();
+        let helper = directory.path().join("helper.sh");
+        fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\nfor argument in \"$@\"; do echo \"$argument\" >> '{}'; done\n{result_line}\n",
+                arguments.display()
+            ),
+        )
+        .unwrap();
+        OfficialHfFetcher {
+            python: "sh".into(),
+            helper,
+        }
+        .inventory(&InventoryRequest {
+            repo_type: RepositoryType::Model,
+            repo_id: "public/model".into(),
+            revision: "main".into(),
+            files: vec!["q4/".into()],
+            exclude: vec!["q4/b.gguf".into()],
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn resolve_only_helper_invocation_returns_the_selection_inventory() {
+        let commit = "a".repeat(40);
+        let directory = tempfile::tempdir().unwrap();
+        let arguments = directory.path().join("arguments");
+        let script = format!(
+            "echo '{{\"type\":\"resolved\",\"version\":1,\"commit\":\"{commit}\"}}'\necho '{{\"type\":\"result\",\"commit\":\"{commit}\",\"files\":[\"q4/a.gguf\"],\"sizes\":{{\"q4/a.gguf\":3}}}}'"
+        );
+
+        let inventory = run_resolve_only(&script, &arguments).unwrap();
+
+        assert_eq!(inventory.commit, commit);
+        assert_eq!(inventory.files, vec!["q4/a.gguf"]);
+        let recorded = fs::read_to_string(arguments).unwrap();
+        let recorded = recorded.lines().collect::<Vec<_>>();
+        assert!(recorded.contains(&"--resolve-only"), "{recorded:?}");
+        assert!(recorded.windows(2).any(|pair| pair == ["--file", "q4/"]));
+        assert!(recorded
+            .windows(2)
+            .any(|pair| pair == ["--exclude", "q4/b.gguf"]));
+        // A resolve-only call owns no staging directory.
+        assert!(!recorded.contains(&"--output"), "{recorded:?}");
+    }
+
+    #[test]
+    fn resolve_only_accepts_a_selection_that_matches_nothing_upstream() {
+        let commit = "a".repeat(40);
+        let directory = tempfile::tempdir().unwrap();
+        let arguments = directory.path().join("arguments");
+        let script = format!("echo '{{\"type\":\"result\",\"commit\":\"{commit}\",\"files\":[]}}'");
+
+        let inventory = run_resolve_only(&script, &arguments).unwrap();
+
+        // Unlike an acquisition, this is an answer rather than an empty snapshot.
+        assert_eq!(inventory.commit, commit);
+        assert!(inventory.files.is_empty());
+    }
+
+    #[test]
+    fn a_fetcher_without_inventory_support_reports_no_inventory() {
+        struct PlainFetcher;
+
+        impl UpstreamFetcher for PlainFetcher {
+            fn fetch(&self, _request: &FetchRequest) -> Result<FetchedRevision, UpstreamError> {
+                Err(UpstreamError::Unavailable)
+            }
+        }
+
+        assert_eq!(
+            PlainFetcher
+                .inventory(&InventoryRequest {
+                    repo_type: RepositoryType::Model,
+                    repo_id: "public/model".into(),
+                    revision: "main".into(),
+                    files: Vec::new(),
+                    exclude: Vec::new(),
+                })
+                .unwrap(),
+            None
         );
     }
 

@@ -177,6 +177,8 @@ def expected_files(info, patterns=None, exclude=None):
         path = getattr(sibling, "rfilename", None)
         if not isinstance(path, str) or not path or ".cache" in Path(path).parts:
             continue
+        if Path(path).parts[0].startswith(".modelkeep-"):
+            continue
         if not selected(path, patterns, exclude):
             continue
         size = getattr(sibling, "size", None)
@@ -184,22 +186,22 @@ def expected_files(info, patterns=None, exclude=None):
     return sorted(result)
 
 
-def acquire(
+def resolve(
     repo_id,
     requested_revision,
-    output,
     files=None,
     exclude=None,
     repo_type="model",
     api=None,
-    download=None,
     progress=None,
 ):
-    output = Path(output)
-    output.mkdir(parents=True, exist_ok=True)
-    api = api or HfApi()
-    download = download or snapshot_download
+    """Resolves the commit and the upstream files the selection covers.
 
+    Transfers nothing. The `resolved` event is emitted here so that both the
+    acquisition and the resolve-only mode announce the immutable commit the same
+    way.
+    """
+    api = api or HfApi()
     if progress is not None:
         progress.phase("resolving_revision")
     # stdout is the machine-readable ModelKeep event channel. Official client and
@@ -220,7 +222,66 @@ def acquire(
         json.dumps({"type": "resolved", "version": 1, "commit": commit}, separators=(",", ":")),
         flush=True,
     )
-    expected = expected_files(info, files, exclude)
+    return commit, expected_files(info, files, exclude)
+
+
+def inventory(
+    repo_id,
+    requested_revision,
+    files=None,
+    exclude=None,
+    repo_type="model",
+    api=None,
+    progress=None,
+):
+    """Resolve-only answer: which upstream paths the selection covers.
+
+    The payload keeps the `result` event's existing shape — `commit` plus a list
+    of path strings — and adds `sizes` for the paths whose size upstream
+    reported. An empty `files` list is a legitimate answer here: it means
+    upstream holds nothing matching the selection.
+    """
+    commit, expected = resolve(
+        repo_id,
+        requested_revision,
+        files=files,
+        exclude=exclude,
+        repo_type=repo_type,
+        api=api,
+        progress=progress,
+    )
+    return {
+        "commit": commit,
+        "files": [path for path, _ in expected],
+        "sizes": {path: size for path, size in expected},
+    }
+
+
+def acquire(
+    repo_id,
+    requested_revision,
+    output,
+    files=None,
+    exclude=None,
+    repo_type="model",
+    api=None,
+    download=None,
+    progress=None,
+):
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=True)
+    api = api or HfApi()
+    download = download or snapshot_download
+
+    commit, expected = resolve(
+        repo_id,
+        requested_revision,
+        files=files,
+        exclude=exclude,
+        repo_type=repo_type,
+        api=api,
+        progress=progress,
+    )
     if progress is not None:
         progress.set_expected(output, expected)
 
@@ -254,20 +315,32 @@ def main():
     parser.add_argument("--repo-id", required=True)
     parser.add_argument("--repo-type", choices=("model", "dataset"), default="model")
     parser.add_argument("--revision", required=True)
-    parser.add_argument("--output", required=True)
+    parser.add_argument("--output")
     parser.add_argument("--file", action="append", dest="files")
     parser.add_argument("--exclude", action="append", dest="exclude")
+    parser.add_argument("--resolve-only", action="store_true", dest="resolve_only")
     args = parser.parse_args()
 
-    result = acquire(
-        repo_id=args.repo_id,
-        repo_type=args.repo_type,
-        requested_revision=args.revision,
-        output=args.output,
-        files=args.files,
-        exclude=args.exclude,
-        progress=ProgressReporter(),
-    )
+    if args.resolve_only:
+        result = inventory(
+            repo_id=args.repo_id,
+            repo_type=args.repo_type,
+            requested_revision=args.revision,
+            files=args.files,
+            exclude=args.exclude,
+        )
+    else:
+        if not args.output:
+            parser.error("--output is required unless --resolve-only is given")
+        result = acquire(
+            repo_id=args.repo_id,
+            repo_type=args.repo_type,
+            requested_revision=args.revision,
+            output=args.output,
+            files=args.files,
+            exclude=args.exclude,
+            progress=ProgressReporter(),
+        )
     print(json.dumps({"type": "result", **result}, separators=(",", ":")), flush=True)
 
 

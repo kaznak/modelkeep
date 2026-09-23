@@ -301,6 +301,43 @@ class HfFetchTests(unittest.TestCase):
             [("config.json", 6)],
         )
 
+    def test_resolve_only_inventory_lists_the_selection_without_downloading(self):
+        api = self.subset_api()
+        protocol = io.StringIO()
+
+        with contextlib.redirect_stdout(protocol):
+            result = hf_fetch.inventory(
+                "org/model", "main", files=["q4/"], api=api
+            )
+
+        self.assertEqual(result["commit"], COMMIT_A)
+        self.assertEqual(result["files"], ["q4/a.gguf", "q4/b.gguf"])
+        self.assertEqual(result["sizes"], {"q4/a.gguf": 3, "q4/b.gguf": 3})
+        events = [json.loads(line) for line in protocol.getvalue().splitlines()]
+        self.assertEqual([event["type"] for event in events], ["resolved"])
+        self.assertEqual(events[0]["commit"], COMMIT_A)
+
+    def test_resolve_only_inventory_may_legitimately_match_nothing(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = hf_fetch.inventory(
+                "org/model", "main", files=["absent/*"], api=self.subset_api()
+            )
+
+        self.assertEqual(result["files"], [])
+        self.assertEqual(result["sizes"], {})
+        self.assertEqual(result["commit"], COMMIT_A)
+
+    def test_internal_archive_paths_never_enter_the_expected_set(self):
+        info = SimpleNamespace(
+            siblings=[
+                SimpleNamespace(rfilename=".modelkeep-manifest.json", size=1),
+                SimpleNamespace(rfilename=".cache/huggingface/x", size=1),
+                SimpleNamespace(rfilename="config.json", size=6),
+            ]
+        )
+
+        self.assertEqual(hf_fetch.expected_files(info), [("config.json", 6)])
+
     def test_directory_pattern_is_expanded_like_the_official_client(self):
         self.assertEqual(hf_fetch.normalized_pattern("q4/"), "q4/*")
         self.assertEqual(hf_fetch.normalized_pattern("q4/*.gguf"), "q4/*.gguf")
