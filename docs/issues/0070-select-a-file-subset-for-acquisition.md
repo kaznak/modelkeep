@@ -23,9 +23,8 @@ updated: 2026-09-24
 ## Objective
 
 Acquire and serve an explicitly requested subset of a repository's files through the
-management API and through pull-through, without any revision claiming a coverage it
-does not have, and without a later request for an unlisted path costing a whole
-repository.
+management API and through pull-through, without a later request for a path the archive
+does not hold costing a whole repository.
 
 ## Problem
 
@@ -77,18 +76,19 @@ returns an error. The same trap already exists today for any revision that does 
 every upstream file, such as one produced by `import-hf-cache`.
 
 Honouring the requested path in pull-through therefore requires adding files to an
-already published revision, which requires the monotonic extension operation. The four
-work items below are one reviewable unit.
+already published revision, which requires the monotonic extension operation.
+
+The three work items below are one reviewable unit.
 
 ## Governing decision
 
 ADR-0008 forbade a file filter and deferred per-file acquisition. ADR-0020 (proposed)
-specifies the deferred semantics and partially supersedes it: a manifest records
-`coverage: "snapshot" | "partial"` plus the normalized selection as provenance;
-`complete` keeps its existing publication-integrity meaning, so the four serving gates
-are unchanged; a revision's file set may grow but never change; and extension is
-unconditional, so a revision that wrongly claims snapshot coverage is corrected the
-first time a missing file is requested rather than by an upstream audit.
+specifies the deferred semantics and partially supersedes it: an acquisition may be
+restricted to a selection; the archive records what it holds and asserts nothing about
+upstream completeness, so the manifest format and the four serving gates are unchanged;
+a path the archive does not hold is a miss resolved against upstream; and a revision's
+file set may grow but never change, so a revision that lacks a requested file is
+extended rather than re-published.
 
 **This issue is blocked on ADR-0020 being accepted.** If a decision there changes, this
 issue changes with it.
@@ -110,30 +110,29 @@ issue changes with it.
    }
    ```
 
-2. **Manifest coverage.** `write_manifest` (`src/lib.rs:1615`, three call sites) records
-   `coverage` and the selection. Readers treat a missing `coverage` as `"snapshot"`.
-
-3. **Pull-through honours the requested path.** `fetch_and_publish` stops discarding the
+2. **Pull-through honours the requested path.** `fetch_and_publish` stops discarding the
    caller's file list (`src/pullthrough.rs:342`), so a miss acquires the requested path
    rather than the repository.
 
-4. **Monotonic extension.** Adding files to an already published revision: write the new
+3. **Monotonic extension.** Adding files to an already published revision: write the new
    files durably, then atomically replace the manifest with a superset. The existing
    `fs::rename`-onto-`revisions/<commit>` publication cannot be reused. Extension is
-   never refused on the basis of recorded coverage; extending a `coverage: "snapshot"`
-   revision re-records it as `partial` and emits a structured event.
+   never refused on the basis of what the revision already holds.
 
 ## Write scope
 
-`src/admin.rs`, `src/pullthrough.rs`, `src/lib.rs` (manifest and extension),
+`src/admin.rs`, `src/pullthrough.rs`, `src/lib.rs` (extension operation),
 `src/upstream.rs`, `src/http.rs` where the requested path is passed,
 `docs/admin-api.md`, `docs/modelkeep-api.md`.
+
+The manifest format does not change, and neither do the four serving gates that read
+`complete`.
 
 ## Do not touch
 
 - archive deletion or GC policy;
 - the Xet boundary and delegation to the official client;
-- the four serving gates' meaning of `complete`;
+- the manifest format and the four serving gates' meaning of `complete`;
 - revisions published before this change; no in-place upgrade or rewrite.
 
 ## Acceptance criteria
@@ -146,23 +145,23 @@ issue changes with it.
   jobs.
 - A filtered prefetch transfers only matching files, and `total_bytes` / `total_files`
   describe the filtered set, so progress is measured against what is being transferred.
-- The published revision records `coverage: "partial"` with the normalized selection as
-  provenance and `complete: true`, and is served through the unchanged serving gates.
+- The published revision is served through the unchanged serving gates, and no new
+  manifest field is introduced.
 - A real supported client downloads the archived subset while upstream is unavailable,
-  and repository metadata reports the archived set and the selection scope.
+  and repository metadata reports exactly the archived set.
 - A resolve for a path outside the selection acquires that path only, extends the
   existing revision, and does not re-transfer the repository; the extension never
   overwrites or removes a published path.
 - An induced crash during an extension leaves either the old or the new manifest live,
   and no file absent from the live manifest is ever served.
-- Extending a revision recorded as `coverage: "snapshot"` succeeds, re-records it as
-  `partial`, and emits a structured event; a legacy revision that does not hold every
-  upstream file is corrected by that path without an upstream audit.
+- A request for a file a previously imported revision does not hold extends that
+  revision rather than re-acquiring the repository.
 - Interrupting a filtered acquisition publishes nothing partial; a retry adopts only
   staging whose recorded selection matches, and staging under a different selection is
   discarded rather than resumed.
 - `docs/admin-api.md` and `docs/modelkeep-api.md` no longer state that patterns are
-  unsupported, and describe coverage and its serving semantics.
+  unsupported, and state that the archive holds what it holds and asserts nothing about
+  upstream completeness.
 
 ## Verification
 
@@ -173,13 +172,12 @@ nix develop -c cargo test --all-features
 nix flake check
 ```
 
-Unit tests for selection normalization, unsafe-pattern rejection, idempotency-key
-derivation, manifest coverage round-tripping, and legacy manifests with no `coverage`
-field. Integration tests with both
+Unit tests for selection normalization, unsafe-pattern rejection, and idempotency-key
+derivation. Integration tests with both
 supported real `hf` / `huggingface_hub` versions for filtered cold acquisition, warm and
 offline retrieval of the subset, metadata listing, a resolve for a path outside the
-selection, extension of a legacy snapshot-coverage revision, crash during an extension,
-and staging-selection mismatch. Run the supported
+selection, extension of a previously imported revision, crash during an extension, and
+staging-selection mismatch. Run the supported
 real-client suite, since this changes the compatibility surface. Before closing, record
 one sanitized QNAP measurement of a filtered prefetch against the same repository,
 including transferred bytes and peak staging usage.
