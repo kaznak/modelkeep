@@ -25,10 +25,11 @@ use serde::{Deserialize, Serialize};
 
 use sha2::{Digest, Sha256};
 
-use crate::upstream::FetchProgress;
+use crate::upstream::{FetchProgress, FileSelection};
 use crate::{
-    pullthrough::PullThrough, validate_repository_id, validate_revision_ref, Archive, ArchiveError,
-    ArchiveResult, RepositorySummary, RepositoryType,
+    pullthrough::{AcquisitionOutcome, PullThrough, PullThroughError},
+    validate_repository_id, validate_revision_ref, Archive, ArchiveError, ArchiveResult,
+    RepositorySummary, RepositoryType,
 };
 
 const ADMIN_CAPABILITY: &str = "io.modelkeep/cap/admin";
@@ -273,6 +274,39 @@ enum JobState {
     Cancelled,
 }
 
+/// What a terminal acquisition job did to the archive.
+///
+/// Issue 0071: a job that transferred nothing because the selection was
+/// already archived and a job that reached a terminal state having moved zero
+/// bytes are otherwise indistinguishable to an operator reading the API.
+/// This mirrors [`AcquisitionOutcome`] into the durable job record, which
+/// ADR-0018 already treats as the authority for job history; nothing else
+/// stores it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum JobOutcome {
+    /// Every path the selection covers was already archived.
+    AlreadyArchived,
+    /// A revision was published for the first time.
+    Published,
+    /// An already published revision gained the paths it did not hold.
+    Extended,
+}
+
+/// What running one job produced: the resolved commit when there is one, the
+/// acquisition outcome when the job acquired, or a safe failure class/message.
+type JobRunResult = Result<(Option<String>, Option<JobOutcome>), (&'static str, String)>;
+
+impl From<AcquisitionOutcome> for JobOutcome {
+    fn from(outcome: AcquisitionOutcome) -> Self {
+        match outcome {
+            AcquisitionOutcome::AlreadyArchived => Self::AlreadyArchived,
+            AcquisitionOutcome::Published => Self::Published,
+            AcquisitionOutcome::Extended => Self::Extended,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Job {
     id: String,
@@ -283,6 +317,17 @@ struct Job {
     repo_type: RepositoryType,
     repo_id: Option<String>,
     revision: Option<String>,
+    /// Normalized acquisition selection (ADR-0020 decision 5). Empty means the
+    /// whole repository, which is what every record written before selections
+    /// existed means, so an absent field needs no migration.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    include: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    exclude: Vec<String>,
+    /// Terminal acquisition outcome; absent for a job that acquires nothing and
+    /// for any record written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    outcome: Option<JobOutcome>,
     resolved_commit: Option<String>,
     #[serde(default)]
     resumed: bool,
@@ -318,6 +363,9 @@ struct JobView {
     repo_type: RepositoryType,
     repo_id: Option<String>,
     revision: Option<String>,
+    include: Vec<String>,
+    exclude: Vec<String>,
+    outcome: Option<JobOutcome>,
     resolved_commit: Option<String>,
     resumed: bool,
     progress_bytes: Option<u64>,
@@ -344,6 +392,9 @@ impl From<Job> for JobView {
             repo_type: job.repo_type,
             repo_id: job.repo_id,
             revision: job.revision,
+            include: job.include,
+            exclude: job.exclude,
+            outcome: job.outcome,
             resolved_commit: job.resolved_commit,
             resumed: job.resumed,
             progress_bytes: job.progress_bytes,
@@ -375,6 +426,10 @@ struct JobRequest {
     repo_type: RepositoryType,
     repo_id: Option<String>,
     revision: Option<String>,
+    /// Acquisition selection patterns. Accepted for `prefetch` only; they are
+    /// untrusted input and are validated by [`FileSelection`].
+    include: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -544,17 +599,20 @@ impl JobManager {
         pullthrough: Option<Arc<PullThrough>>,
         principal: PrincipalView,
     ) -> Result<(Job, bool), &'static str> {
-        validate_job_request(&request)?;
+        let selection = validate_job_request(&request)?;
         let idempotency_hash = idempotency_key.map(hash_idempotency_key).transpose()?;
         let idempotency_request_hash = idempotency_hash
             .as_ref()
-            .map(|_| hash_idempotency_request(&request, &principal));
+            .map(|_| hash_idempotency_request(&request, &selection, &principal));
         let mut jobs = self.inner.active_jobs.lock().unwrap();
         if let Some(hash) = &idempotency_hash {
             match self.read_idempotency(hash) {
                 Ok(Some(entry)) => match self.read_job(&entry.job_id) {
                     Ok(existing) => {
+                        // A record written before selections existed describes a
+                        // whole-repository request, so it can only match one.
                         let legacy_model_match = request.repo_type == RepositoryType::Model
+                            && selection.is_unrestricted()
                             && entry.request_hash
                                 == hash_legacy_idempotency_request(&request, &principal);
                         return if Some(entry.request_hash) == idempotency_request_hash
@@ -578,7 +636,7 @@ impl JobManager {
         }
         if let Some(existing) = jobs
             .values()
-            .find(|job| is_equivalent_active_job(job, &request))
+            .find(|job| is_equivalent_active_job(job, &request, &selection))
             .cloned()
         {
             return Ok((existing, false));
@@ -594,6 +652,9 @@ impl JobManager {
                 repo_type: request.repo_type,
                 repo_id: request.repo_id.clone(),
                 revision: request.revision.clone(),
+                include: selection.include().to_vec(),
+                exclude: selection.exclude().to_vec(),
+                outcome: None,
                 resolved_commit: None,
                 resumed: false,
                 progress_bytes: None,
@@ -658,20 +719,25 @@ impl JobManager {
         let progress = move |event: FetchProgress| {
             progress_manager.record_progress(&progress_job_id, event);
         };
-        let result: Result<Option<String>, (&'static str, String)> = match job.kind {
+        let result: JobRunResult = match job.kind {
             JobKind::Prefetch => pullthrough
                 .as_ref()
                 .ok_or_else(|| ("upstream_disabled", "pull-through is disabled".into()))
                 .and_then(|pullthrough| {
+                    // The stored patterns were normalized at submission; a
+                    // record that no longer validates is an unsafe path, never
+                    // an unrestricted acquisition.
+                    let selection = FileSelection::new(&job.include, &job.exclude)
+                        .map_err(|_| classify_pullthrough_error(PullThroughError::UnsafePath))?;
                     pullthrough
-                        .ensure_with_progress_for_type(
+                        .ensure_selected_with_progress_for_type(
                             job.repo_type,
                             job.repo_id.as_deref().unwrap(),
                             job.revision.as_deref().unwrap(),
-                            &[],
+                            &selection,
                             &progress,
                         )
-                        .map(Some)
+                        .map(|result| (Some(result.commit), Some(result.outcome.into())))
                         .map_err(classify_pullthrough_error)
                 }),
             JobKind::Refresh => pullthrough
@@ -686,7 +752,7 @@ impl JobManager {
                             false,
                             &progress,
                         )
-                        .map(|result| Some(result.proposed))
+                        .map(|result| (Some(result.proposed), None))
                         .map_err(classify_pullthrough_error)
                 }),
             JobKind::Verify => archive
@@ -695,14 +761,14 @@ impl JobManager {
                     job.repo_id.as_deref().unwrap(),
                     job.revision.as_deref().unwrap(),
                 )
-                .map(|_| job.revision.clone())
+                .map(|_| (job.revision.clone(), None))
                 .map_err(classify_archive_error),
             JobKind::Audit => archive
                 .audit()
                 .map_err(classify_archive_error)
                 .and_then(|report| {
                     if report.failures.is_empty() {
-                        Ok(None)
+                        Ok((None, None))
                     } else {
                         Err((
                             "integrity",
@@ -712,11 +778,12 @@ impl JobManager {
                 }),
         };
         match result {
-            Ok(commit) => {
+            Ok((commit, outcome)) => {
                 self.update(id, |job| {
                     job.state = JobState::Completed;
                     job.phase = "completed".into();
                     job.resolved_commit = commit;
+                    job.outcome = outcome;
                     job.finished_at = Some(unix_timestamp());
                 });
             }
@@ -1065,12 +1132,14 @@ impl JobManager {
     }
 }
 
-fn is_equivalent_active_job(job: &Job, request: &JobRequest) -> bool {
+fn is_equivalent_active_job(job: &Job, request: &JobRequest, selection: &FileSelection) -> bool {
     matches!(job.state, JobState::Queued | JobState::Running)
         && job.kind == request.kind
         && job.repo_type == request.repo_type
         && job.repo_id == request.repo_id
         && job.revision == request.revision
+        && job.include == selection.include()
+        && job.exclude == selection.exclude()
 }
 
 pub fn router(
@@ -1485,7 +1554,13 @@ fn csrf_authorized(headers: &HeaderMap) -> bool {
         == Some("1")
 }
 
-fn validate_job_request(request: &JobRequest) -> Result<(), &'static str> {
+/// Validates a submission and returns its normalized acquisition selection.
+///
+/// Patterns are untrusted input; validation and normalization are delegated to
+/// [`FileSelection`] (ADR-0020 decision 1) rather than matched here. Only
+/// `prefetch` acquires, so a selection on any other kind is rejected the same
+/// way `audit` rejects target fields.
+fn validate_job_request(request: &JobRequest) -> Result<FileSelection, &'static str> {
     match request.kind {
         JobKind::Audit => {
             if request.repo_id.is_some() || request.revision.is_some() {
@@ -1501,7 +1576,15 @@ fn validate_job_request(request: &JobRequest) -> Result<(), &'static str> {
             }
         }
     }
-    Ok(())
+    if request.kind != JobKind::Prefetch && (request.include.is_some() || request.exclude.is_some())
+    {
+        return Err("invalid_request");
+    }
+    FileSelection::new(
+        request.include.as_deref().unwrap_or_default(),
+        request.exclude.as_deref().unwrap_or_default(),
+    )
+    .map_err(|_| "invalid_request")
 }
 
 fn hash_idempotency_key(value: &str) -> Result<String, &'static str> {
@@ -1514,8 +1597,19 @@ fn hash_idempotency_key(value: &str) -> Result<String, &'static str> {
         .collect())
 }
 
-fn hash_idempotency_request(request: &JobRequest, principal: &PrincipalView) -> String {
-    let value = format!(
+/// The exact-request component of an idempotency entry.
+///
+/// The normalized selection is part of acquisition identity (ADR-0020
+/// decision 5), so two submissions differing only in their patterns are
+/// different requests. An unrestricted selection contributes nothing, which
+/// keeps the hash of every request that carries no selection identical to the
+/// one recorded before selections existed.
+fn hash_idempotency_request(
+    request: &JobRequest,
+    selection: &FileSelection,
+    principal: &PrincipalView,
+) -> String {
+    let mut value = format!(
         "{:?}\0{}\0{}\0{}\0{}\0{}",
         request.kind,
         request.repo_type,
@@ -1524,6 +1618,12 @@ fn hash_idempotency_request(request: &JobRequest, principal: &PrincipalView) -> 
         principal.auth_method,
         principal.login.as_deref().unwrap_or("")
     );
+    if !selection.is_unrestricted() {
+        // Patterns hold no control characters, so a newline join cannot make
+        // two different selections share one hash.
+        value.push('\0');
+        value.push_str(&selection.identity().join("\n"));
+    }
     Sha256::digest(value.as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -1650,8 +1750,8 @@ mod tests {
     use super::*;
     use crate::pullthrough::PullThroughError;
     use crate::upstream::{
-        FetchRequest, FetchedRevision, InvalidOutputReason, OfficialHfFetcher, UpstreamError,
-        UpstreamFetcher,
+        FetchRequest, FetchedRevision, InvalidOutputReason, InventoryRequest, OfficialHfFetcher,
+        RevisionInventory, UpstreamError, UpstreamFetcher,
     };
     use crate::{ArchiveFile, PublishRequest};
     use axum::{body::to_bytes, body::Body, http::Request};
@@ -1880,6 +1980,9 @@ mod tests {
             repo_type: RepositoryType::Model,
             repo_id: None,
             revision: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            outcome: None,
             resolved_commit: None,
             resumed: false,
             progress_bytes: None,
@@ -1947,14 +2050,17 @@ mod tests {
             repo_type: RepositoryType::Model,
             repo_id: Some("org/shared".into()),
             revision: Some("main".into()),
+            include: None,
+            exclude: None,
         };
         let dataset = JobRequest {
             repo_type: RepositoryType::Dataset,
             ..model.clone()
         };
+        let selection = FileSelection::all();
         assert_ne!(
-            hash_idempotency_request(&model, &principal),
-            hash_idempotency_request(&dataset, &principal)
+            hash_idempotency_request(&model, &selection, &principal),
+            hash_idempotency_request(&dataset, &selection, &principal)
         );
     }
 
@@ -1970,15 +2076,18 @@ mod tests {
             repo_type: RepositoryType::Model,
             repo_id: Some("org/shared".into()),
             revision: Some("main".into()),
+            include: None,
+            exclude: None,
         };
         let dataset = JobRequest {
             repo_type: RepositoryType::Dataset,
             ..model.clone()
         };
-        assert!(is_equivalent_active_job(&active, &model));
-        assert!(!is_equivalent_active_job(&active, &dataset));
+        let selection = FileSelection::all();
+        assert!(is_equivalent_active_job(&active, &model, &selection));
+        assert!(!is_equivalent_active_job(&active, &dataset, &selection));
         active.repo_type = RepositoryType::Dataset;
-        assert!(is_equivalent_active_job(&active, &dataset));
+        assert!(is_equivalent_active_job(&active, &dataset, &selection));
     }
 
     #[test]
@@ -2350,6 +2459,8 @@ mod tests {
                     repo_type: RepositoryType::Model,
                     repo_id: Some("org/model".into()),
                     revision: Some("main".into()),
+                    include: None,
+                    exclude: None,
                 },
                 Some("different-key"),
                 archive,
@@ -2406,6 +2517,8 @@ mod tests {
                     repo_type: RepositoryType::Model,
                     repo_id: Some("org/model".into()),
                     revision: Some("main".into()),
+                    include: None,
+                    exclude: None,
                 },
                 Some("retry-prefetch"),
                 archive,
@@ -2447,6 +2560,8 @@ mod tests {
                             repo_type: RepositoryType::Model,
                             repo_id: Some("org/concurrent".into()),
                             revision: Some("main".into()),
+                            include: None,
+                            exclude: None,
                         },
                         Some(&format!("concurrent-{index}")),
                         archive,
@@ -2607,6 +2722,8 @@ mod tests {
                 repo_type: RepositoryType::Model,
                 repo_id: None,
                 revision: None,
+                include: None,
+                exclude: None,
             },
             Some("shared-key"),
             archive.clone(),
@@ -2625,6 +2742,8 @@ mod tests {
                 repo_type: RepositoryType::Model,
                 repo_id: None,
                 revision: None,
+                include: None,
+                exclude: None,
             },
             Some("shared-key"),
             archive,
@@ -2648,6 +2767,8 @@ mod tests {
             repo_type: RepositoryType::Model,
             repo_id: None,
             revision: None,
+            include: None,
+            exclude: None,
         };
         let principal = PrincipalView {
             auth_method: "bearer".into(),
@@ -2770,6 +2891,9 @@ mod tests {
             repo_type: RepositoryType::Model,
             repo_id: None,
             revision: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            outcome: None,
             resolved_commit: None,
             resumed: false,
             progress_bytes: None,
@@ -2885,5 +3009,484 @@ mod tests {
         assert_eq!(principal.auth_method, "tailscale");
         assert_eq!(principal.login.as_deref(), Some("operator@example.com"));
         assert_eq!(principal.name.as_deref(), Some("Example Operator"));
+    }
+
+    /// Fetcher that records every acquisition request and can enumerate
+    /// upstream, so a selection can be observed end to end and a published
+    /// revision can be reconciled against upstream's file list.
+    #[derive(Default)]
+    struct SelectionFetcher {
+        requests: Mutex<Vec<FetchRequest>>,
+    }
+
+    impl SelectionFetcher {
+        const FILES: [&'static str; 2] = ["config.json", "weights/model.bin"];
+
+        fn matches(path: &str, patterns: &[String]) -> bool {
+            patterns
+                .iter()
+                .any(|pattern| match pattern.strip_suffix('*') {
+                    Some(prefix) => path.starts_with(prefix),
+                    None => pattern.as_str() == path,
+                })
+        }
+
+        fn matched(include: &[String], exclude: &[String]) -> Vec<String> {
+            Self::FILES
+                .into_iter()
+                .filter(|path| include.is_empty() || Self::matches(path, include))
+                .filter(|path| !Self::matches(path, exclude))
+                .map(str::to_string)
+                .collect()
+        }
+
+        fn selections(&self) -> Vec<(Vec<String>, Vec<String>)> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|request| (request.files.clone(), request.exclude.clone()))
+                .collect()
+        }
+    }
+
+    impl UpstreamFetcher for SelectionFetcher {
+        fn fetch(&self, request: &FetchRequest) -> Result<FetchedRevision, UpstreamError> {
+            self.requests.lock().unwrap().push(request.clone());
+            let files = Self::matched(&request.files, &request.exclude);
+            std::fs::create_dir_all(&request.staging).map_err(UpstreamError::Io)?;
+            for path in &files {
+                let target = request.staging.join(path);
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent).map_err(UpstreamError::Io)?;
+                }
+                std::fs::write(target, path.as_bytes()).map_err(UpstreamError::Io)?;
+            }
+            Ok(FetchedRevision {
+                commit: "e".repeat(40),
+                files,
+                staging: request.staging.clone(),
+            })
+        }
+
+        fn inventory(
+            &self,
+            request: &InventoryRequest,
+        ) -> Result<Option<RevisionInventory>, UpstreamError> {
+            Ok(Some(RevisionInventory {
+                commit: "e".repeat(40),
+                files: Self::matched(&request.files, &request.exclude),
+            }))
+        }
+    }
+
+    fn selected_prefetch(include: Option<Vec<&str>>, exclude: Option<Vec<&str>>) -> JobRequest {
+        JobRequest {
+            kind: JobKind::Prefetch,
+            repo_type: RepositoryType::Model,
+            repo_id: Some("org/model".into()),
+            revision: Some("main".into()),
+            include: include.map(|patterns| patterns.into_iter().map(String::from).collect()),
+            exclude: exclude.map(|patterns| patterns.into_iter().map(String::from).collect()),
+        }
+    }
+
+    fn test_principal() -> PrincipalView {
+        PrincipalView {
+            auth_method: "bearer".into(),
+            login: None,
+            name: None,
+        }
+    }
+
+    async fn submit_body(app: &Router, key: &'static str, body: &'static str) -> serde_json::Value {
+        let response = app
+            .clone()
+            .oneshot(job_request_with_body(true, key, body))
+            .await
+            .unwrap();
+        let status = response.status();
+        let value: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED, "{value}");
+        value
+    }
+
+    async fn terminal_job(app: &Router, id: &str) -> serde_json::Value {
+        for _ in 0..200 {
+            let response = app
+                .clone()
+                .oneshot(request(&format!("/api/admin/v1/jobs/{id}"), Some("secret")))
+                .await
+                .unwrap();
+            let value: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            if value["state"] == "completed" || value["state"] == "failed" {
+                return value;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("job {id} did not reach a terminal state");
+    }
+
+    #[tokio::test]
+    async fn prefetch_selection_reaches_the_acquisition_helper() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        let fetcher = Arc::new(SelectionFetcher::default());
+        let pullthrough = Arc::new(PullThrough::new(archive.clone(), fetcher.clone()));
+        let app = router(
+            archive.clone(),
+            Config::token("127.0.0.1:0".parse().unwrap(), "secret"),
+            Some(pullthrough),
+        )
+        .unwrap();
+
+        let submitted = submit_body(
+            &app,
+            "selected-prefetch",
+            r#"{"kind":"prefetch","repo_id":"org/model","revision":"main","include":["weights/*","config.json"],"exclude":["weights/model.bin"]}"#,
+        )
+        .await;
+        let completed = terminal_job(&app, submitted["id"].as_str().unwrap()).await;
+
+        assert_eq!(completed["state"], "completed");
+        assert_eq!(completed["outcome"], "published");
+        assert_eq!(
+            completed["include"],
+            serde_json::json!(["config.json", "weights/*"])
+        );
+        assert_eq!(
+            completed["exclude"],
+            serde_json::json!(["weights/model.bin"])
+        );
+        assert_eq!(
+            fetcher.selections(),
+            vec![(
+                vec!["config.json".to_string(), "weights/*".to_string()],
+                vec!["weights/model.bin".to_string()]
+            )]
+        );
+        // Only the selected file was archived; the excluded one was not.
+        let manifest = archive
+            .manifest_for_type(RepositoryType::Model, "org/model", &"e".repeat(40))
+            .unwrap();
+        assert!(manifest.contains("config.json"));
+        assert!(!manifest.contains("weights/model.bin"));
+    }
+
+    #[tokio::test]
+    async fn unsafe_selection_patterns_are_rejected_as_file_selection_rejects_them() {
+        for pattern in [
+            "../secrets.bin",
+            "/etc/passwd",
+            "weights/../../escape",
+            "!weights/model.bin",
+            ".modelkeep-state/lease",
+            "weights\\model.bin",
+            "",
+        ] {
+            let patterns = vec![pattern.to_string()];
+            assert!(
+                FileSelection::new(&patterns, &[]).is_err(),
+                "expected {pattern:?} to be unsafe"
+            );
+            assert_eq!(
+                validate_job_request(&selected_prefetch(Some(vec![pattern]), None)).err(),
+                Some("invalid_request"),
+                "include {pattern:?}"
+            );
+            assert_eq!(
+                validate_job_request(&selected_prefetch(None, Some(vec![pattern]))).err(),
+                Some("invalid_request"),
+                "exclude {pattern:?}"
+            );
+        }
+        for pattern in ["config.json", "weights/*", "weights/"] {
+            assert!(FileSelection::new(&[pattern.to_string()], &[]).is_ok());
+            assert!(validate_job_request(&selected_prefetch(Some(vec![pattern]), None)).is_ok());
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        let app = router(
+            archive,
+            Config::token("127.0.0.1:0".parse().unwrap(), "secret"),
+            Some(Arc::new(PullThrough::new(
+                Archive::new(directory.path()).unwrap(),
+                Arc::new(SelectionFetcher::default()),
+            ))),
+        )
+        .unwrap();
+        let response = app
+            .oneshot(job_request_with_body(
+                true,
+                "traversal-selection",
+                r#"{"kind":"prefetch","repo_id":"org/model","revision":"main","include":["../etc/passwd"]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"], "invalid_request");
+    }
+
+    #[tokio::test]
+    async fn selection_is_rejected_for_kinds_that_do_not_acquire() {
+        for kind in [JobKind::Refresh, JobKind::Verify, JobKind::Audit] {
+            let targeted = kind != JobKind::Audit;
+            let base = JobRequest {
+                kind,
+                repo_type: RepositoryType::Model,
+                repo_id: targeted.then(|| "org/model".to_string()),
+                revision: targeted.then(|| "main".to_string()),
+                include: None,
+                exclude: None,
+            };
+            assert!(validate_job_request(&base).is_ok());
+            assert_eq!(
+                validate_job_request(&JobRequest {
+                    include: Some(vec!["config.json".into()]),
+                    ..base.clone()
+                })
+                .err(),
+                Some("invalid_request"),
+                "{kind:?} include"
+            );
+            assert_eq!(
+                validate_job_request(&JobRequest {
+                    exclude: Some(vec!["config.json".into()]),
+                    ..base
+                })
+                .err(),
+                Some("invalid_request"),
+                "{kind:?} exclude"
+            );
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        let app = router(
+            archive,
+            Config::token("127.0.0.1:0".parse().unwrap(), "secret"),
+            None,
+        )
+        .unwrap();
+        let response = app
+            .oneshot(job_request_with_body(
+                true,
+                "refresh-selection",
+                r#"{"kind":"refresh","repo_id":"org/model","revision":"main","include":["config.json"]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn identical_selections_deduplicate_and_different_selections_are_separate_jobs() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Arc::new(Archive::new(directory.path()).unwrap());
+        let manager = JobManager::open(&archive).unwrap();
+
+        let (first, created) = manager
+            .submit(
+                selected_prefetch(Some(vec!["weights/*"]), None),
+                Some("selection-key"),
+                archive.clone(),
+                None,
+                test_principal(),
+            )
+            .unwrap();
+        assert!(created);
+
+        let (repeated, created) = manager
+            .submit(
+                selected_prefetch(Some(vec!["weights/*"]), None),
+                Some("selection-key"),
+                archive.clone(),
+                None,
+                test_principal(),
+            )
+            .unwrap();
+        assert!(!created);
+        assert_eq!(repeated.id, first.id);
+
+        let (other, created) = manager
+            .submit(
+                selected_prefetch(Some(vec!["config.json"]), None),
+                Some("other-selection-key"),
+                archive.clone(),
+                None,
+                test_principal(),
+            )
+            .unwrap();
+        assert!(created);
+        assert_ne!(other.id, first.id);
+        assert_eq!(other.include, vec!["config.json".to_string()]);
+
+        // Reusing one key for a different selection is a conflict, not a reuse.
+        assert!(matches!(
+            manager.submit(
+                selected_prefetch(Some(vec!["config.json"]), None),
+                Some("selection-key"),
+                archive,
+                None,
+                test_principal(),
+            ),
+            Err("idempotency_conflict")
+        ));
+    }
+
+    #[test]
+    fn selection_normalization_decides_idempotency_identity() {
+        let principal = test_principal();
+        let ordered = selected_prefetch(Some(vec!["a.bin", "b.bin"]), Some(vec!["c.bin"]));
+        let shuffled = selected_prefetch(
+            Some(vec!["b.bin", "a.bin", "b.bin"]),
+            Some(vec!["c.bin", "c.bin"]),
+        );
+        let swapped = selected_prefetch(Some(vec!["c.bin"]), Some(vec!["a.bin", "b.bin"]));
+        let hash = |request: &JobRequest| {
+            let selection = validate_job_request(request).unwrap();
+            hash_idempotency_request(request, &selection, &principal)
+        };
+        assert_eq!(hash(&ordered), hash(&shuffled));
+        assert_ne!(hash(&ordered), hash(&swapped));
+        assert_ne!(hash(&ordered), hash(&selected_prefetch(None, None)));
+
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Arc::new(Archive::new(directory.path()).unwrap());
+        let manager = JobManager::open(&archive).unwrap();
+        let (first, created) = manager
+            .submit(
+                ordered,
+                Some("normalized-key"),
+                archive.clone(),
+                None,
+                principal.clone(),
+            )
+            .unwrap();
+        assert!(created);
+        let (repeated, created) = manager
+            .submit(shuffled, Some("normalized-key"), archive, None, principal)
+            .unwrap();
+        assert!(!created);
+        assert_eq!(repeated.id, first.id);
+    }
+
+    #[tokio::test]
+    async fn prefetch_records_publication_then_an_already_archived_no_op() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        let pullthrough = Arc::new(PullThrough::new(archive.clone(), Arc::new(FixtureFetcher)));
+        let app = router(
+            archive,
+            Config::token("127.0.0.1:0".parse().unwrap(), "secret"),
+            Some(pullthrough),
+        )
+        .unwrap();
+
+        let first = submit_body(
+            &app,
+            "outcome-first",
+            r#"{"kind":"prefetch","repo_id":"org/model","revision":"main"}"#,
+        )
+        .await;
+        let first = terminal_job(&app, first["id"].as_str().unwrap()).await;
+        assert_eq!(first["state"], "completed");
+        assert_eq!(first["outcome"], "published");
+
+        let second = submit_body(
+            &app,
+            "outcome-second",
+            r#"{"kind":"prefetch","repo_id":"org/model","revision":"main"}"#,
+        )
+        .await;
+        let second = terminal_job(&app, second["id"].as_str().unwrap()).await;
+        assert_eq!(second["state"], "completed");
+        assert_eq!(second["outcome"], "already_archived");
+        assert_ne!(second["outcome"], first["outcome"]);
+    }
+
+    #[tokio::test]
+    async fn prefetch_that_extends_a_revision_records_the_extension() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        let fetcher = Arc::new(SelectionFetcher::default());
+        let pullthrough = Arc::new(PullThrough::new(archive.clone(), fetcher.clone()));
+        let app = router(
+            archive.clone(),
+            Config::token("127.0.0.1:0".parse().unwrap(), "secret"),
+            Some(pullthrough),
+        )
+        .unwrap();
+
+        let selected = submit_body(
+            &app,
+            "extend-selected",
+            r#"{"kind":"prefetch","repo_id":"org/model","revision":"main","include":["config.json"]}"#,
+        )
+        .await;
+        let selected = terminal_job(&app, selected["id"].as_str().unwrap()).await;
+        assert_eq!(selected["outcome"], "published");
+
+        let whole = submit_body(
+            &app,
+            "extend-whole",
+            r#"{"kind":"prefetch","repo_id":"org/model","revision":"main"}"#,
+        )
+        .await;
+        let whole = terminal_job(&app, whole["id"].as_str().unwrap()).await;
+        assert_eq!(whole["state"], "completed");
+        assert_eq!(whole["outcome"], "extended");
+        // The extension acquired only the path the revision lacked.
+        assert_eq!(
+            fetcher.selections().last().unwrap().0,
+            vec!["weights/model.bin".to_string()]
+        );
+        let manifest = archive
+            .manifest_for_type(RepositoryType::Model, "org/model", &"e".repeat(40))
+            .unwrap();
+        assert!(manifest.contains("config.json"));
+        assert!(manifest.contains("weights/model.bin"));
+    }
+
+    #[test]
+    fn job_records_without_selection_or_outcome_remain_readable() {
+        let mut job = stored_job("legacy-outcome", 1);
+        job.kind = JobKind::Prefetch;
+        job.include = vec!["config.json".into()];
+        job.outcome = Some(JobOutcome::Extended);
+        let mut value = serde_json::to_value(&job).unwrap();
+        assert_eq!(value["outcome"], "extended");
+        assert_eq!(value["include"], serde_json::json!(["config.json"]));
+        for field in ["include", "exclude", "outcome"] {
+            value.as_object_mut().unwrap().remove(field);
+        }
+
+        let legacy: Job = serde_json::from_value(value.clone()).unwrap();
+        assert!(legacy.include.is_empty());
+        assert!(legacy.exclude.is_empty());
+        assert_eq!(legacy.outcome, None);
+
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        let manager = JobManager::open(&archive).unwrap();
+        fs::write(
+            manager.inner.directory.join("legacy-outcome.json"),
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+        drop(manager);
+
+        let reopened = JobManager::open(&archive).unwrap();
+        let recovered = reopened.get("legacy-outcome").unwrap().unwrap();
+        assert_eq!(recovered.outcome, None);
+        assert!(recovered.include.is_empty());
     }
 }

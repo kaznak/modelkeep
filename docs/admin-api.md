@@ -41,6 +41,12 @@ request returns the original job. Reusing the key for different input returns
 terminal failure. Equivalent queued or running jobs are also deduplicated even when
 their keys differ.
 
+The normalized acquisition selection is part of "one exact request": a prefetch for the
+same repository and revision under different patterns is a different request and a
+different job, while two submissions whose patterns differ only in order or duplication
+are the same request. A submission that carries no patterns is identified exactly as it
+was before selections existed, so keys recorded by an earlier version keep matching.
+
 HTTP `202 Accepted` means only that a new job was queued. It is not evidence that the
 operation completed. Poll the returned job until a terminal state is observed.
 
@@ -80,9 +86,26 @@ GET /api/admin/v1/jobs/{job_id}
 ```
 
 The list is newest first and uses an opaque `next_cursor`. A job includes its state,
-phase, target, resolved commit when known, resume flag, byte/file counters, timestamps,
-principal, and safe failure classification/message. States are `queued`, `running`,
-`completed`, `failed`, and `cancelled`.
+phase, target, acquisition selection, resolved commit when known, resume flag,
+byte/file counters, timestamps, principal, terminal `outcome`, and safe failure
+classification/message. States are `queued`, `running`, `completed`, `failed`, and
+`cancelled`.
+
+`include` and `exclude` report the normalized selection the job acquires; both are
+empty for a whole-repository job.
+
+`outcome` says what a completed acquisition did to the archive, so a job that had
+nothing to transfer is distinguishable from one that transferred and moved no bytes:
+
+- `already_archived`: every path the selection covers was already archived. Nothing was
+  transferred; the byte and file counters stay `null` because no transfer was started.
+- `published`: the revision was published for the first time.
+- `extended`: an already published revision gained the paths it did not hold.
+
+`outcome` is `null` for `refresh`, `verify`, and `audit`, for any job that did not
+complete, and for records written before this field existed; its absence is not a
+failure. It is stored in the durable job record itself, so it survives index
+reconstruction and adds no other source of truth.
 
 Poll one job rather than repeatedly scanning all history:
 
@@ -91,7 +114,7 @@ while :; do
   job=$(curl --fail --silent --show-error \
     "$MODELKEEP_ADMIN_ENDPOINT/api/admin/v1/jobs/$job_id") || exit
   printf '%s\n' "$job" | jq \
-    '{state,phase,resumed,progress_bytes,total_bytes,progress_files,total_files,error_class,message}'
+    '{state,phase,resumed,outcome,progress_bytes,total_bytes,progress_files,total_files,error_class,message}'
   state=$(printf '%s\n' "$job" | jq -r '.state')
   case "$state" in
     completed) break ;;
@@ -116,6 +139,8 @@ Supported request bodies are:
 
 ```json
 {"kind":"prefetch","repo_type":"model","repo_id":"org/repo","revision":"<ref-or-commit>"}
+{"kind":"prefetch","repo_type":"model","repo_id":"org/repo","revision":"<ref-or-commit>",
+ "include":["Qwen3-Coder-Next-Q4_K_M/*"],"exclude":["*.gguf.part"]}
 {"kind":"refresh","repo_type":"model","repo_id":"org/repo","revision":"main"}
 {"kind":"verify","repo_type":"model","repo_id":"org/repo","revision":"<commit>"}
 {"kind":"audit"}
@@ -123,8 +148,36 @@ Supported request bodies are:
 
 `repo_type` may also be `dataset`; omission retains legacy model behavior. `prefetch`,
 `refresh`, and `verify` require both `repo_id` and `revision`. `audit` rejects target
-fields and checks the entire archive. The API currently acquires a complete repository
-snapshot; it does not support allow/ignore patterns.
+fields and checks the entire archive.
+
+### Acquisition selection
+
+`prefetch` optionally takes `include` and `exclude`, arrays of patterns passed to the
+official Hugging Face client as `allow_patterns` and `ignore_patterns`; ModelKeep does
+not match them itself. Omitting both acquires the whole repository, which remains the
+default ([`ADR-0020`](adr/0020-selection-scoped-revision-acquisition.md) decision 6).
+Selecting a subset is what keeps a request for one quantisation directory from costing
+the whole repository.
+
+Patterns are untrusted input and are validated before anything is queued. A pattern is
+rejected when it is empty, starts with `!` or `/`, contains a backslash or a control
+character, has an empty, `.`, `..`, or `.cache` path component, or begins with a
+`.modelkeep-` component. A trailing `/` is the official client's directory form and is
+accepted. The remaining patterns are sorted and de-duplicated. A rejected
+submission returns `400 {"error":"invalid_request"}` and the offending pattern is not
+echoed back into the response, job record, or logs.
+
+`include` or `exclude` on `refresh`, `verify`, or `audit` is rejected the same way
+`audit` rejects target fields: `400 {"error":"invalid_request"}`.
+
+`progress_bytes`, `total_bytes`, `progress_files`, and `total_files` describe the
+selected set, so progress is measured against what is actually being transferred.
+
+A filtered prefetch publishes a revision holding exactly the files it acquired. The
+archive records what it holds and asserts nothing about upstream completeness, so a
+later request for a path that revision does not hold consults upstream and extends the
+same revision (`outcome` `extended`) instead of re-acquiring the repository. To archive
+the rest of a repository, submit the same target without patterns.
 
 Prefer an immutable 40-character commit for deterministic prefetch and verify tasks.
 Use a mutable ref only when the requested operation is specifically to resolve or
@@ -165,7 +218,8 @@ resume belongs to a newly submitted job.
 
 ## Error handling
 
-- `400`: malformed target, revision, cursor, job ID, or idempotency key;
+- `400`: malformed target, revision, cursor, job ID, or idempotency key; an unsafe
+  acquisition pattern; a selection on a kind that does not acquire;
 - `401`: missing/invalid bearer authorization or missing trusted Tailscale capability;
 - `403`: state-changing request omitted `X-ModelKeep-CSRF: 1`;
 - `404`: requested repository or job does not exist;

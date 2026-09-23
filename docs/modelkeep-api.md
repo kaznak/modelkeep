@@ -59,16 +59,30 @@ resolved and recorded separately; advancing it does not replace an already publi
 immutable revision.
 
 A request for an archived snapshot is a warm read. A request for a missing ref or file
-can start upstream acquisition and publish a complete snapshot to durable storage.
-Consequently, an apparently read-only client command can consume substantial network
-and archive capacity. Before requesting an unknown large repository, establish its
-likely size and obtain authorization appropriate to that cost. ModelKeep currently
-acquires the complete snapshot and does not support allow/ignore patterns.
+starts upstream acquisition and publishes to durable storage. Consequently, an
+apparently read-only client command can consume substantial network and archive
+capacity. Before requesting an unknown large repository, establish its likely size and
+obtain authorization appropriate to that cost. Repository metadata for a revision the
+archive has never seen acquires the whole repository; a request for a single file the
+archive does not hold acquires that file.
+
+The archive records what it holds and asserts nothing about upstream completeness
+([`ADR-0020`](adr/0020-selection-scoped-revision-acquisition.md)). A revision may
+therefore hold a subset of the upstream repository — from a filtered prefetch through
+the [Admin API](admin-api.md), from a single-file request, or from an imported cache.
+Repository metadata reports exactly the archived set and never fabricates entries. A
+request for a path a revision does not hold is a miss, not a `404` from the archive:
+whether the path exists is upstream's answer, and when upstream has it the file is
+added to that same revision rather than published as a second one. A published path is
+never overwritten or removed.
 
 ModelKeep serves payloads itself and does not redirect a client to Hugging Face or
 Xet. Do not add fallback logic that silently changes `HF_ENDPOINT` or follows a
 payload path around ModelKeep. A warm archived revision is expected to remain
-downloadable while upstream access is unavailable.
+downloadable while upstream access is unavailable. That guarantee covers the files the
+archive holds; a request for a path it does not hold needs upstream, and fails with an
+upstream error (`502` when upstream is unreachable) rather than silently reporting the
+path as absent.
 
 ## Health and compatibility routes
 
