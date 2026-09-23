@@ -46,6 +46,12 @@ env:
   IMAGE_NAME: ${{ github.repository }}
   IS_RELEASE: ${{ startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch' }}
 
+# A normal release pushes main and then a v* tag for the same commit. Keep the newer
+# tag run and cancel the duplicate main run; amd64 and arm64 remain parallel below.
+concurrency:
+  group: release-image-${{ github.sha }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: Build ${{ matrix.arch }} image

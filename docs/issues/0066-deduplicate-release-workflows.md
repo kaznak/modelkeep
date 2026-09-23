@@ -55,3 +55,11 @@ Inspect the parsed workflow and confirm that concurrency is keyed by commit SHA 
 The release procedure pushes `main` before its tag, so the tag run is normally newer
 and becomes the surviving run. If the main run has already completed before tagging,
 GitHub Actions cannot retroactively reuse it and the tag run still validates again.
+
+## Implementation status
+
+Implemented workflow-level concurrency keyed by `github.sha`, with
+`cancel-in-progress: true`. `actionlint` accepts the workflow. Keep the issue open
+until the next main-then-tag release demonstrates that the tag run survives and the
+duplicate main run is cancelled while both architecture jobs still run in the
+surviving workflow.
