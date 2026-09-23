@@ -237,11 +237,18 @@ impl UpstreamFetcher for OfficialHfFetcher {
                             ),
                         })?;
                     }
-                    Some("result") | None => {
+                    Some("result") => {
                         result = Some(serde_json::from_value(value).map_err(|_| {
                             UpstreamError::InvalidOutput(InvalidOutputReason::MalformedResult)
                         })?);
                     }
+                    // Only explicitly typed events belong to the helper protocol.
+                    // The supported client and its transports may emit credential-free
+                    // JSON diagnostics while reopening an interrupted local_dir. Treating
+                    // an untyped object as a legacy result made those diagnostics fatal.
+                    // A helper that emits only diagnostics still fails safely below with
+                    // MissingResult.
+                    None => continue,
                     _ => {
                         return Err(UpstreamError::InvalidOutput(
                             InvalidOutputReason::UnsupportedEventType,
@@ -442,6 +449,11 @@ mod tests {
                 None,
                 InvalidOutputReason::UnsupportedEventType,
             ),
+            (
+                "echo '{\"resumed\":true,\"transport\":\"diagnostic\"}'".into(),
+                None,
+                InvalidOutputReason::MissingResult,
+            ),
             ("exit 0".into(), None, InvalidOutputReason::MissingResult),
             (
                 "echo '{\"type\":\"result\",\"commit\":\"bad\",\"files\":[\"config.json\"]}'".into(),
@@ -482,6 +494,44 @@ mod tests {
             error,
             UpstreamError::InvalidOutput(InvalidOutputReason::StagingMetadataUpdateFailed)
         ));
+    }
+
+    #[test]
+    fn untyped_json_diagnostic_is_ignored_before_typed_result() {
+        let commit = "a".repeat(40);
+        let script = format!(
+            "echo '{{\"resumed\":true,\"transport\":\"diagnostic\"}}'; echo '{{\"type\":\"result\",\"commit\":\"{commit}\",\"files\":[\"config.json\"]}}'"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        let staging = archive
+            .acquire_fetch_staging("public/model", "main", &[])
+            .unwrap();
+        let helper = directory.path().join("helper.sh");
+        fs::write(&helper, format!("#!/bin/sh\n{script}\n")).unwrap();
+        let mut permissions = fs::metadata(&helper).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o755);
+            fs::set_permissions(&helper, permissions).unwrap();
+        }
+        let fetcher = OfficialHfFetcher {
+            python: "/bin/sh".into(),
+            helper,
+        };
+        let fetched = fetcher
+            .fetch(&FetchRequest {
+                repo_type: RepositoryType::Model,
+                repo_id: "public/model".into(),
+                revision: "main".into(),
+                files: vec![],
+                staging: staging.path,
+                resume_commit: Some(commit.clone()),
+            })
+            .unwrap();
+        assert_eq!(fetched.commit, commit);
+        assert_eq!(fetched.files, vec!["config.json"]);
     }
 
     #[test]

@@ -32,7 +32,7 @@ if args.repo_type == "dataset":
     (data / "test.csv").write_bytes(b"split,value\ntest,dataset\n")
     (data / "train.csv").write_bytes(b"split,value\ntrain,dataset\n")
     files = ["README.md", "data/test.csv", "data/train.csv"]
-    print(json.dumps({"commit": COMMIT, "files": files}))
+    print(json.dumps({"type": "result", "commit": COMMIT, "files": files}))
     sys.exit(0)
 
 (output / "config.json").write_text('{"model_type":"modelkeep-fixture"}')
@@ -61,4 +61,4 @@ files = [
     "model.safetensors.index.json",
     "tokenizer.json",
 ]
-print(json.dumps({"commit": COMMIT, "files": files}))
+print(json.dumps({"type": "result", "commit": COMMIT, "files": files}))

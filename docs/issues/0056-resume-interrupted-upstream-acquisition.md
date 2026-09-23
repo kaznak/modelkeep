@@ -109,3 +109,18 @@ stdout to its discarded diagnostic stream. A regression test starts with retaine
 partial metadata and proves an untyped JSON diagnostic cannot enter the protocol
 channel. Repeat the completion portion of the QNAP drill with an image containing
 this fix before closing the issue.
+
+The v0.4.6 QNAP repeat adopted approximately 12 GiB of retained data and again failed
+with `MalformedResult` before transferring more bytes. This proved helper-side stdout
+redirection alone was not a sufficient trust boundary: the Rust parser still treated
+every untyped JSON object as a legacy result. The protocol now requires an explicit
+`type: "result"`; untyped JSON diagnostics are ignored, while a helper that never
+emits a typed result fails safely as `MissingResult`. The production fixture and
+contract tests use typed results and preserve this observed resume-only regression.
+
+The same drill also exposed that SIGTERM could leave the container waiting for an
+active management prefetch. Management jobs used Tokio's blocking pool, whose runtime
+shutdown waits indefinitely for blocking tasks. They now run on process-lifetime OS
+threads so container exit interrupts the worker and leaves recovery to the durable job
+record and staging lease. The black-box crash check submits a blocking Admin prefetch,
+sends SIGTERM to PID 1, and requires a successful process exit within five seconds.

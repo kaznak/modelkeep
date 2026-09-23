@@ -624,7 +624,13 @@ impl JobManager {
         drop(jobs);
         let manager = self.clone();
         let job_id = job.id.clone();
-        tokio::task::spawn_blocking(move || manager.run(&job_id, archive, pullthrough));
+        // Management work is deliberately detached from Tokio's blocking pool.
+        // Dropping a Tokio runtime waits indefinitely for active spawn_blocking tasks,
+        // which prevented the container's PID 1 from exiting while a prefetch helper
+        // was running. A detached OS thread is terminated with the container process;
+        // startup recovery then records the job as interrupted and preserves eligible
+        // staging for a later retry.
+        std::thread::spawn(move || manager.run(&job_id, archive, pullthrough));
         Ok((job, true))
     }
 

@@ -58,6 +58,41 @@ def start_server(binary, archive, helper=None):
     raise AssertionError("ModelKeep did not become ready")
 
 
+def start_admin_server(binary, archive, helper):
+    download_port = free_port()
+    admin_port = free_port()
+    download_endpoint = f"http://127.0.0.1:{download_port}"
+    admin_endpoint = f"http://127.0.0.1:{admin_port}"
+    environment = os.environ.copy()
+    environment["MODELKEEP_HF_PYTHON"] = sys.executable
+    environment["MODELKEEP_HF_HELPER"] = str(helper)
+    environment["MODELKEEP_ADMIN_ADDRESS"] = f"127.0.0.1:{admin_port}"
+    environment["MODELKEEP_ADMIN_TOKEN"] = "fixture-token"
+    environment.pop("MODELKEEP_TRUST_TAILSCALE_HEADERS", None)
+    process = subprocess.Popen(
+        [str(binary), "serve", str(archive), f"127.0.0.1:{download_port}"],
+        env=environment,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    for _ in range(200):
+        if process.poll() is not None:
+            raise AssertionError(process.stderr.read().decode(errors="replace"))
+        request = urllib.request.Request(
+            f"{admin_endpoint}/api/admin/v1/status",
+            headers={"Authorization": "Bearer fixture-token"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=0.2) as response:
+                if response.status == 200:
+                    return process, download_endpoint, admin_endpoint
+        except OSError:
+            time.sleep(0.025)
+    stop_server(process, force=True)
+    raise AssertionError("ModelKeep admin API did not become ready")
+
+
 def stop_server(process, force=False):
     if process.poll() is None:
         os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
@@ -214,6 +249,56 @@ def crash_recovery_check(current, crash_helper, resume_helper, root):
     )
 
 
+def active_prefetch_shutdown_check(current, crash_helper, root):
+    archive = root / "shutdown-archive"
+    process, _, admin_endpoint = start_admin_server(current, archive, crash_helper)
+    request = urllib.request.Request(
+        f"{admin_endpoint}/api/admin/v1/jobs",
+        data=json.dumps(
+            {
+                "kind": "prefetch",
+                "repo_type": "model",
+                "repo_id": "org/crash",
+                "revision": "main",
+            }
+        ).encode(),
+        headers={
+            "Authorization": "Bearer fixture-token",
+            "Content-Type": "application/json",
+            "X-ModelKeep-CSRF": "1",
+            "Idempotency-Key": "active-prefetch-shutdown",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=2) as response:
+        assert response.status == 202
+
+    checkpoint_states = []
+    for _ in range(200):
+        checkpoint, checkpoint_states = resumable_checkpoint(archive)
+        if checkpoint is not None:
+            break
+        time.sleep(0.025)
+    else:
+        stop_server(process, force=True)
+        raise AssertionError(
+            "admin prefetch did not reach its resumable checkpoint: "
+            + ("; ".join(checkpoint_states) or "no active fetch staging")
+        )
+
+    # Match a container runtime sending SIGTERM only to PID 1. The process must not
+    # wait for the detached long-running prefetch worker.
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    finally:
+        # The helper shares the test process group and may outlive the parent outside
+        # a container PID namespace. Clean it up without weakening the exit assertion.
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+    assert process.returncode == 0
+
+
 def upgrade_check(old, current, root):
     archive = root / "upgrade-archive"
     payload = b"archive-created-by-v0.2.1"
@@ -298,6 +383,7 @@ def main():
     current, old, crash_helper, resume_helper = map(Path, sys.argv[1:])
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
+        active_prefetch_shutdown_check(current, crash_helper, root)
         crash_recovery_check(current, crash_helper, resume_helper, root)
         upgrade_check(old, current, root)
 
