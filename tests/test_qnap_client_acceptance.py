@@ -42,8 +42,18 @@ class QnapClientAcceptanceTests(unittest.TestCase):
                 "request_timeout_seconds": 10,
                 "download_timeout_seconds": 7200,
             },
-            "site": {"image_digest": "sha256:" + "b" * 64},
-            "client": {},
+            "site": {
+                "operator": "operator",
+                "qnap_model": "QNAP",
+                "qts_version": "QuTS hero",
+                "container_station_version": "Container Station",
+                "archive_share_and_acl": "share and ACL",
+                "snapshot_mechanism_and_retention": "snapshot policy",
+                "external_backup_target": "backup target",
+                "image_tag": "registry.example/modelkeep:v1",
+                "image_digest": "sha256:" + "b" * 64,
+            },
+            "client": {"hostname": "client", "platform": "Linux"},
             "phases": {},
         }
 
@@ -79,7 +89,7 @@ class QnapClientAcceptanceTests(unittest.TestCase):
             + "/dir/a%20file%3F%23.bin",
         )
 
-    def test_finish_requires_every_hardware_phase(self):
+    def test_finish_requires_every_release_acceptance_phase(self):
         record = self.complete_record()
         record["phases"] = {"preflight": {"status": "passed"}}
         with tempfile.TemporaryDirectory() as temporary:
@@ -88,6 +98,43 @@ class QnapClientAcceptanceTests(unittest.TestCase):
             args = type("Args", (), {"record": str(path), "output": None})()
             with self.assertRaisesRegex(acceptance.AcceptanceError, "cold"):
                 acceptance.finish(args)
+
+    def test_finish_does_not_require_optional_restore_drill(self):
+        record = self.complete_record()
+        record["phases"] = {
+            name: {
+                "status": "passed",
+                "finished_at": "2026-09-23T00:00:00+00:00",
+            }
+            for name in acceptance.REQUIRED_PHASES
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "record.json"
+            output = Path(temporary) / "record.md"
+            path.write_text(json.dumps(record))
+            args = type(
+                "Args", (), {"record": str(path), "output": str(output)}
+            )()
+            acceptance.finish(args)
+            summary = output.read_text()
+            completed = json.loads(path.read_text())
+
+        self.assertIn("completed_at", completed)
+        self.assertIn("## Optional disaster-recovery drills", summary)
+        self.assertIn("| post-restore | not run |", summary)
+
+    def test_summary_records_completed_optional_restore_drill(self):
+        record = self.complete_record()
+        record["phases"]["post-restore"] = {
+            "status": "passed",
+            "finished_at": "2026-09-23T01:00:00+00:00",
+        }
+
+        summary = acceptance.render_summary(record)
+
+        self.assertIn(
+            "| post-restore | passed | 2026-09-23T01:00:00+00:00 |", summary
+        )
 
     def test_record_write_is_readable_and_validated(self):
         record = self.complete_record()

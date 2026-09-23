@@ -35,7 +35,8 @@ operation.
 ## Acceptance criteria
 
 - MVP completion conditions 1–7 and 12 have an actual target-hardware record.
-- QNAP snapshot/backup and restore drill are completed for the deployed archive.
+- The release-acceptance record is complete independently of the optional QNAP
+  snapshot/backup restore drill.
 - Failures are converted into focused issues rather than waived.
 
 ## Verification

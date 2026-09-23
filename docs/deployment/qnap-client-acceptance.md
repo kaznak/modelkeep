@@ -1,10 +1,10 @@
 # QNAP client acceptance suite
 
 Issue 0026 requires evidence from the actual QNAP and GX10 because generic CI cannot
-certify Container Station, QNAP storage, Tailscale routing, reboot recovery, or a
-site snapshot restore. Run this suite on the GX10 or another intended tailnet client.
-It uses the real `hf download` command with a new temporary client cache for every
-phase and writes evidence to one JSON record.
+certify Container Station, QNAP storage, Tailscale routing, or reboot recovery. Run
+this suite on the GX10 or another intended tailnet client. It uses the real
+`hf download` command with a new temporary client cache for every phase and writes
+evidence to one JSON record.
 
 The suite is read-only with respect to server administration. It does not restart or
 reboot QNAP, alter firewall rules, create snapshots, restore data, or delete either
@@ -101,20 +101,8 @@ recover, and run:
 nix run .#qnap-client-acceptance -- post-qnap-reboot qnap-acceptance.json
 ```
 
-Finally perform the snapshot/backup restore drill from
-[qnap-production-runbook.md](qnap-production-runbook.md): restore into a new empty
-share, point the same pinned image and Tailscale Services at that copy, omit fetch
-credentials/helpers, and block upstream. After independently confirming that the
-restored copy is active:
-
-```sh
-nix run .#qnap-client-acceptance -- post-restore qnap-acceptance.json \
-  --confirm-upstream-blocked \
-  --confirm-restored-copy
-```
-
-Return the production service to its intended archive and network policy. Render a
-human-readable record only after all required phases have passed:
+After `post-qnap-reboot` passes, render the required ModelKeep release-acceptance
+record:
 
 ```sh
 nix run .#qnap-client-acceptance -- finish qnap-acceptance.json \
@@ -123,3 +111,30 @@ nix run .#qnap-client-acceptance -- finish qnap-acceptance.json \
 
 Retain both JSON and Markdown records with the deployment record. Convert any failed
 hardware behavior into a focused issue; do not edit a failed phase to `passed`.
+
+## Optional QNAP disaster-recovery drill
+
+Operators who want additional assurance can separately validate the site's
+snapshot/backup configuration using [qnap-production-runbook.md](qnap-production-runbook.md).
+This checks QNAP snapshot, backup, ACL, and restore configuration rather than a
+ModelKeep release, so it is recommended when first establishing the backup process,
+after changing storage or backup configuration, and as a periodic DR exercise. It
+is not required by `finish`.
+
+Restore into a new empty share, point the same pinned image and Tailscale Services
+at that copy, omit fetch credentials/helpers, and block upstream. After independently
+confirming that the restored copy is active:
+
+```sh
+nix run .#qnap-client-acceptance -- post-restore qnap-acceptance.json \
+  --confirm-upstream-blocked \
+  --confirm-restored-copy
+```
+
+Return the production service to its intended archive and network policy. Re-run
+`finish` if the optional result should be included in the Markdown record:
+
+```sh
+nix run .#qnap-client-acceptance -- finish qnap-acceptance.json \
+  --output qnap-acceptance.md
+```

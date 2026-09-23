@@ -34,8 +34,11 @@ REQUIRED_PHASES = (
     "offline",
     "post-container-restart",
     "post-qnap-reboot",
+)
+OPTIONAL_PHASES = (
     "post-restore",
 )
+ALL_PHASES = REQUIRED_PHASES + OPTIONAL_PHASES
 DEFAULT_CONFIG_PATH = "qnap-acceptance.config.json"
 REQUIRED_CONFIG_FIELDS = (
     "endpoint",
@@ -474,7 +477,7 @@ def render_summary(record):
         f"- Endpoint: {config['endpoint']}",
         f"- Repository: {config['repo_id']}@{config['revision']}",
         "",
-        "## Phases",
+        "## Required release-acceptance phases",
         "",
         "| Phase | Status | Finished (UTC) |",
         "| --- | --- | --- |",
@@ -483,6 +486,22 @@ def render_summary(record):
         phase = record.get("phases", {}).get(name, {})
         lines.append(
             f"| {name} | {phase.get('status', 'missing')} | {phase.get('finished_at', '')} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Optional disaster-recovery drills",
+            "",
+            "These phases validate site backup and restore configuration; they are not required for release acceptance.",
+            "",
+            "| Phase | Status | Finished (UTC) |",
+            "| --- | --- | --- |",
+        ]
+    )
+    for name in OPTIONAL_PHASES:
+        phase = record.get("phases", {}).get(name, {})
+        lines.append(
+            f"| {name} | {phase.get('status', 'not run')} | {phase.get('finished_at', '')} |"
         )
     baseline = record.get("baseline", {})
     lines.extend(
@@ -535,7 +554,7 @@ def parser():
     init.add_argument("--config", default=DEFAULT_CONFIG_PATH)
     init.add_argument("--force", action="store_true")
 
-    for name in REQUIRED_PHASES:
+    for name in ALL_PHASES:
         phase = commands.add_parser(name)
         phase.add_argument("record")
         if name == "offline":

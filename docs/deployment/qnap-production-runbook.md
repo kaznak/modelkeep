@@ -19,8 +19,9 @@ restore drill date, repo, commit, result, operator:
 
 Run the phased [QNAP client acceptance suite](qnap-client-acceptance.md) from the
 GX10 to capture cold/warm/offline downloads, Range behavior, the LAN/Tailscale
-boundary, restart/reboot recovery, and the restored archive download in a single
-machine-readable record.
+boundary, and restart/reboot recovery in a machine-readable release-acceptance
+record. The restored archive download is an optional DR phase in that same tool,
+not a requirement for each ModelKeep release.
 
 CI runs the filesystem-independent restore drill on native amd64 and arm64 Linux. It
 does not certify unrecorded QNAP firmware, ACL, snapshot, or filesystem behavior.
@@ -106,8 +107,10 @@ without `HF_TOKEN` or fetch-helper variables, run `modelkeep verify`, clear a te
 client cache, block Internet access, and download an explicit restored commit. Record
 the snapshot identity, image digest, verification output, and result.
 
-Use the acceptance suite's `post-restore` phase for the empty-client download and
-byte comparison after the server-side verification has succeeded.
+Optionally use the acceptance suite's `post-restore` phase for the empty-client
+download and byte comparison after the server-side verification has succeeded. Run
+this drill when first establishing the backup process, after storage/ACL/backup
+configuration changes, and periodically according to the site's DR policy.
 
 ## Archive integrity audit
 
