@@ -72,6 +72,20 @@ comparing the archive against upstream.
    it. It is acquisition state, not a durable claim, and is not recorded in the
    published manifest.
 
+   Adopting expired staging still requires the repository type, repository, requested
+   revision, and resolved commit to match; that is not relaxed. On the selection,
+   staging is adopted when its recorded selection is unrestricted, or identical to the
+   request's. An unrestricted acquisition already covered every path a narrower request
+   wants, so its retained bytes belong to the same paths of the same commit. The
+   acquisition that adopts it stays restricted to the request's own selection, and
+   publication lists only what the helper reports, so retained files outside that
+   selection are never published as part of it. Two different restricted selections are
+   not adopted for each other.
+
+   Requiring the selections to be equal would discard the retained bytes of an
+   interrupted repository-wide acquisition as soon as a client asked for one file of it,
+   which is the operational loss ADR-0017 exists to prevent.
+
 6. Whole-repository acquisition remains the default. A request that carries no selection
    behaves exactly as it does today.
 
@@ -147,7 +161,9 @@ first write into an already published revision directory.
 - Extension tests: an extension adds files, never rewrites a published path, and leaves
   either the old or the new manifest live after an induced crash, with no unlisted file
   served.
-- Resume tests: staging recorded under a different selection is not adopted; staging
-  under the same selection is.
+- Resume tests: staging recorded under an unrestricted selection is adopted by a
+  narrower request and restricts the acquisition to that request; two different
+  restricted selections are not adopted for each other; a different repository,
+  revision, or resolved commit is never adopted.
 - A request for a file a previously imported revision does not hold extends that
   revision rather than re-acquiring the repository.

@@ -767,7 +767,7 @@ impl Archive {
             if metadata.repo_type != repo_type
                 || metadata.repo_id != repo_id
                 || metadata.requested_revision != requested_revision
-                || metadata.files != files
+                || !staging_selection_is_adoptable(&metadata.files, files)
                 || metadata.resolved_commit.is_none()
             {
                 continue;
@@ -790,12 +790,26 @@ impl Archive {
             match fs::rename(&old, &claimed) {
                 Ok(()) => {
                     write_staging_lease(&claimed, &operation)?;
+                    let resolved_commit = metadata.resolved_commit.clone();
+                    if metadata.files != files {
+                        // An unrestricted staging adopted by a narrower request
+                        // is driven by that request from here on, so the
+                        // identity the acquisition records its resolved commit
+                        // under is the requesting one.
+                        write_fetch_staging_metadata(
+                            &claimed,
+                            &FetchStagingMetadata {
+                                files: files.to_vec(),
+                                ..metadata
+                            },
+                        )?;
+                    }
                     sync_directory(&self.root.join("tmp"))?;
                     spawn_lease_heartbeat(claimed.clone());
                     return Ok(FetchStaging {
                         path: claimed,
                         resumed: true,
-                        resolved_commit: metadata.resolved_commit,
+                        resolved_commit,
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -1611,6 +1625,20 @@ pub(crate) fn record_fetch_resolved_commit_for_type(
     }
     metadata.resolved_commit = Some(commit.into());
     write_fetch_staging_metadata(staging, &metadata)
+}
+
+/// Whether staging recorded under `recorded` may be adopted by a request whose
+/// selection identity is `requested`.
+///
+/// An unrestricted acquisition already covered every path a narrower request
+/// asks for, so the partial bytes it left are bytes of those same paths at the
+/// same commit; adopting them is what keeps an interrupted large fetch from
+/// starting over (ADR-0017). Two different restricted selections still never
+/// share staging. Adoption never decides what gets published: the acquisition
+/// runs under the requesting selection and only helper-reported files reach the
+/// manifest.
+fn staging_selection_is_adoptable(recorded: &[String], requested: &[String]) -> bool {
+    recorded.is_empty() || recorded == requested
 }
 
 fn read_fetch_staging_metadata(staging: &Path) -> ArchiveResult<FetchStagingMetadata> {
@@ -2672,6 +2700,75 @@ mod tests {
         assert!(output.contains("org/model"));
         assert!(output.contains("main"));
         assert!(output.contains(&"a".repeat(40)));
+    }
+
+    /// ADR-0017: an interrupted unrestricted acquisition already covered every
+    /// path a narrower request asks for, so its partial bytes are resumable.
+    #[test]
+    fn unrestricted_fetch_staging_is_adopted_by_a_narrower_request() {
+        let (archive, _directory) = archive();
+        let commit = "a".repeat(40);
+        let original = archive
+            .acquire_fetch_staging("org/model", "main", &[])
+            .unwrap();
+        fs::write(original.path.join("partial.bin"), b"partial").unwrap();
+        record_fetch_resolved_commit(&original.path, "org/model", "main", &[], &commit).unwrap();
+        assert!(archive.preserve_fetch_staging(&original.path).unwrap());
+
+        let wanted = vec!["partial.bin".to_string()];
+        let resumed = archive
+            .acquire_fetch_staging("org/model", "main", &wanted)
+            .unwrap();
+        assert!(resumed.resumed);
+        assert_eq!(resumed.resolved_commit, Some(commit.clone()));
+        assert_eq!(
+            fs::read(resumed.path.join("partial.bin")).unwrap(),
+            b"partial"
+        );
+        // The adopted staging carries the requesting identity from here on.
+        record_fetch_resolved_commit(&resumed.path, "org/model", "main", &wanted, &commit).unwrap();
+        // A different resolved commit is still refused.
+        assert!(matches!(
+            record_fetch_resolved_commit(
+                &resumed.path,
+                "org/model",
+                "main",
+                &wanted,
+                &"b".repeat(40)
+            ),
+            Err(ArchiveError::IntegrityMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn unrestricted_fetch_staging_for_another_identity_is_not_adopted() {
+        let (archive, _directory) = archive();
+        let commit = "a".repeat(40);
+        for (repo_type, repo_id, revision) in [
+            (RepositoryType::Model, "org/other", "main"),
+            (RepositoryType::Model, "org/model", "dev"),
+            (RepositoryType::Dataset, "org/model", "main"),
+        ] {
+            let staging = archive
+                .acquire_fetch_staging_for_type(repo_type, repo_id, revision, &[])
+                .unwrap();
+            record_fetch_resolved_commit_for_type(
+                &staging.path,
+                repo_type,
+                repo_id,
+                revision,
+                &[],
+                &commit,
+            )
+            .unwrap();
+            assert!(archive.preserve_fetch_staging(&staging.path).unwrap());
+        }
+
+        let fresh = archive
+            .acquire_fetch_staging("org/model", "main", &["partial.bin".to_string()])
+            .unwrap();
+        assert!(!fresh.resumed);
+        assert_eq!(fresh.resolved_commit, None);
     }
 
     #[test]

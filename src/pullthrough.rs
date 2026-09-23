@@ -715,9 +715,13 @@ impl PullThrough {
                 });
             }
         }
-        // The normalized selection is part of the staging identity, so staging
-        // recorded under a different selection is never adopted (ADR-0020
-        // decision 5, ADR-0017).
+        // The normalized selection is part of the staging identity: staging
+        // recorded under a different restricted selection is never adopted,
+        // while staging left by an unrestricted acquisition is, because it
+        // already covered these paths at this commit and resuming it is what
+        // keeps an interrupted large fetch from starting over (ADR-0020
+        // decision 5, ADR-0017). The acquisition still runs under this
+        // request's selection, so only what the helper reports is published.
         let staging = self
             .archive
             .acquire_fetch_staging_for_type(
@@ -2057,6 +2061,135 @@ mod tests {
         assert!(archive
             .resolve_file("org/model", commit, "partial.bin")
             .is_err());
+    }
+
+    /// Drives an unrestricted acquisition to a resumable checkpoint and loses
+    /// it, which is what a crash during a metadata-route fetch leaves behind.
+    fn interrupt_unrestricted_fetch(
+        archive: &Archive,
+        repo_id: &str,
+        revision: &str,
+        commit: &str,
+    ) {
+        let interrupted = PullThrough::new(
+            archive.clone(),
+            Arc::new(InterruptedSelectionFetcher {
+                commit: commit.into(),
+            }),
+        );
+        assert_eq!(
+            interrupted.ensure_selected_for_type(
+                RepositoryType::Model,
+                repo_id,
+                revision,
+                &FileSelection::all(),
+            ),
+            Err(PullThroughError::UpstreamUnavailable)
+        );
+    }
+
+    fn manifest_paths(archive: &Archive, repo_id: &str, commit: &str) -> Vec<String> {
+        let manifest: serde_json::Value =
+            serde_json::from_str(&archive.manifest(repo_id, commit).unwrap()).unwrap();
+        manifest["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["path"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// The crash-recovery path of ADR-0017: an interrupted unrestricted fetch
+    /// leaves partial bytes, and the narrow request that follows resumes them
+    /// instead of paying for the transfer again.
+    #[test]
+    fn unrestricted_staging_is_resumed_by_a_narrower_request() {
+        let commit = "cccccccccccccccccccccccccccccccccccccccc";
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        interrupt_unrestricted_fetch(&archive, "org/model", "main", commit);
+
+        let fetcher = Arc::new(SelectiveFetcher::new(
+            commit,
+            &[("a.bin", b"aaa"), ("b.bin", b"bbb")],
+        ));
+        let requests = fetcher.requests.clone();
+        let pull = PullThrough::new(archive.clone(), fetcher);
+        pull.ensure_selected_for_type(
+            RepositoryType::Model,
+            "org/model",
+            "main",
+            &selection(&["a.bin"], &[]),
+        )
+        .unwrap();
+
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded[0].resume_commit.as_deref(), Some(commit));
+        // The acquisition still runs under the requesting selection.
+        assert_eq!(recorded[0].files, vec!["a.bin".to_string()]);
+    }
+
+    /// Adopting wider staging must not widen what gets published: only the
+    /// files the helper reported reach the manifest.
+    #[test]
+    fn a_resumed_unrestricted_staging_publishes_only_reported_files() {
+        let commit = "cccccccccccccccccccccccccccccccccccccccc";
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        interrupt_unrestricted_fetch(&archive, "org/model", "main", commit);
+
+        let fetcher = Arc::new(SelectiveFetcher::new(
+            commit,
+            &[("a.bin", b"aaa"), ("b.bin", b"bbb")],
+        ));
+        let requests = fetcher.requests.clone();
+        let pull = PullThrough::new(archive.clone(), fetcher);
+        pull.ensure_selected_for_type(
+            RepositoryType::Model,
+            "org/model",
+            "main",
+            &selection(&["a.bin"], &[]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            requests.lock().unwrap()[0].resume_commit.as_deref(),
+            Some(commit)
+        );
+        assert_eq!(
+            manifest_paths(&archive, "org/model", commit),
+            vec!["a.bin".to_string()]
+        );
+        // The leftover the abandoned unrestricted fetch wrote is not published.
+        assert!(archive
+            .resolve_file("org/model", commit, "partial.bin")
+            .is_err());
+        assert!(archive.resolve_file("org/model", commit, "b.bin").is_err());
+        assert!(archive.is_complete_revision("org/model", commit).unwrap());
+        assert_eq!(archive.verify_revision("org/model", commit).unwrap(), 1);
+    }
+
+    /// Breadth is the only relaxed dimension: another repository or another
+    /// requested revision is still a different staging identity.
+    #[test]
+    fn unrestricted_staging_for_another_identity_is_not_resumed() {
+        let commit = "cccccccccccccccccccccccccccccccccccccccc";
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        interrupt_unrestricted_fetch(&archive, "org/other", "main", commit);
+        interrupt_unrestricted_fetch(&archive, "org/model", "dev", commit);
+
+        let fetcher = Arc::new(SelectiveFetcher::new(commit, &[("a.bin", b"aaa")]));
+        let requests = fetcher.requests.clone();
+        let pull = PullThrough::new(archive.clone(), fetcher);
+        pull.ensure_selected_for_type(
+            RepositoryType::Model,
+            "org/model",
+            "main",
+            &selection(&["a.bin"], &[]),
+        )
+        .unwrap();
+        assert_eq!(requests.lock().unwrap()[0].resume_commit, None);
     }
 
     #[test]
