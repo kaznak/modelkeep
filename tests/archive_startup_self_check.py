@@ -391,6 +391,78 @@ def admin_status(admin):
         return json.loads(response.read())
 
 
+def admin_call(admin, path, method="GET", csrf=False, token=ADMIN_TOKEN):
+    """One management request, returning its status and decoded body.
+
+    A refusal is an answer here, not an exception: every authorization, CSRF and
+    unsafe-name assertion below is about the status code the service chose.
+    """
+    headers = {}
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
+    if csrf:
+        headers["X-ModelKeep-CSRF"] = "1"
+    request = urllib.request.Request(
+        f"{admin}{path}", headers=headers, method=method
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            return response.status, json.loads(response.read())
+    except urllib.error.HTTPError as error:
+        body = error.read()
+        return error.code, json.loads(body) if body else {}
+
+
+def trigger_self_check(admin):
+    """Runs the self-check through the API and returns its fresh result."""
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
+        status, report = admin_call(
+            admin, "/api/admin/v1/self-check", method="POST", csrf=True
+        )
+        # The startup check may still be in flight; a second walk of the same
+        # archive is refused rather than duplicated.
+        if status == 409:
+            time.sleep(0.05)
+            continue
+        assert status == 200, (status, report)
+        return report
+    raise AssertionError("the self-check never became triggerable")
+
+
+def leave_retained_staging(archive, name, expires_at, commit, payload):
+    """Staging the temporary area retains, with its own measurable bytes.
+
+    Returns the directory and the total byte/file count of everything written
+    into it, so the listing's measurement is compared against an independent
+    count rather than against a second copy of the walk it proves.
+    """
+    staging = archive / "tmp" / name
+    (staging / "nested").mkdir(parents=True)
+    written = []
+    target = staging / "nested" / "partial.bin"
+    target.write_bytes(payload)
+    written.append(payload)
+    if expires_at is not None:
+        lease = f"nonce=fixture\npid=1\nexpires_at={expires_at}\n".encode()
+        (staging / ".modelkeep-staging-lease").write_bytes(lease)
+        written.append(lease)
+    if commit is not None:
+        identity = json.dumps(
+            {
+                "version": 1,
+                "repo_type": "model",
+                "repo_id": "org/model",
+                "requested_revision": "main",
+                "files": [],
+                "resolved_commit": commit,
+            }
+        ).encode()
+        (staging / ".modelkeep-fetch.json").write_bytes(identity)
+        written.append(identity)
+    return staging, sum(len(entry) for entry in written), len(written)
+
+
 def check_startup_reports_findings_without_delaying_serving(binary, archive, log_path):
     """The check runs at startup, beside serving, and only reports."""
     damage_missing_file(archive)
@@ -573,17 +645,55 @@ def check_startup_isolates_an_unremovable_staging_entry(binary, root, log_path):
     )
     before = tree_digest(archive, skip=("tmp", "state"))
     block_removal(blocked)
+    adoptable = []
 
     try:
         with log_path.open("wb") as log:
             # Startup reaching readiness at all is the first assertion: under
             # `restart: unless-stopped` an abort here is a crash loop.
-            with server(binary, archive, log) as (endpoint, _admin):
+            with server(binary, archive, log) as (endpoint, admin):
                 with urllib.request.urlopen(
                     f"{endpoint}/org/model/resolve/main/config.json", timeout=5
                 ) as response:
                     assert response.status == 200
                     assert response.read() == b"{}"
+
+                adoptable.extend(sorted((archive / "tmp").glob("fetch-abandoned-*")))
+                assert len(adoptable) == 1, adoptable
+
+                # Issue 0081: what recovery could not reclaim and what the
+                # self-check counts are reconciled from the API alone. The
+                # listing names the entry, says it is the one recovery skipped,
+                # and repeats the action and failure kind the
+                # `staging_recovery_skipped` event reported.
+                status, listing = admin_call(admin, "/api/admin/v1/staging")
+                assert status == 200, listing
+                entries = {item["name"]: item for item in listing["items"]}
+                stuck = entries["stuck-blocked"]
+                assert stuck["retention"] == "not_reclaimable", stuck
+                assert stuck["recovery_skipped_action"] == "discard", stuck
+                assert stuck["recovery_skipped_io_kind"] == "permission_denied", stuck
+                assert stuck["adoptable"] is False, stuck
+                kept = entries[adoptable[0].name]
+                assert kept["retention"] == "resumable", kept
+                assert kept["adoptable"] is True, kept
+                assert kept["commit"] == HEALTHY_COMMIT, kept
+                assert kept["size_bytes"] >= len(RETAINED_PARTIAL), kept
+                assert listing["retained_by_kind"] == {
+                    "not_reclaimable": 1,
+                    "resumable": 1,
+                }, listing
+
+                # The self-check's own findings are readable through the API,
+                # and they name the same directories the listing does.
+                report = trigger_self_check(admin)
+                counted = sorted(
+                    finding["path"]
+                    for finding in report["findings"]
+                    if finding["finding"] == "orphaned_staging"
+                )
+                assert counted == sorted(entries), (counted, sorted(entries))
+                assert report["orphaned_staging_directories"] == 2, report
 
         events = [
             json.loads(line)["fields"]
@@ -614,7 +724,6 @@ def check_startup_isolates_an_unremovable_staging_entry(binary, root, log_path):
         # recovery has: the one it discards and the one it renames for resume.
         assert not removable.exists(), "a reclaimable entry survived recovery"
         assert not resumable.exists(), "an identified download was not renamed"
-        adoptable = sorted((archive / "tmp").glob("fetch-abandoned-*"))
         assert len(adoptable) == 1, adoptable
         assert (adoptable[0] / "partial.bin").read_bytes() == RETAINED_PARTIAL
 
@@ -644,6 +753,182 @@ def check_startup_isolates_an_unremovable_staging_entry(binary, root, log_path):
     )
 
 
+def check_operator_acts_on_retained_staging_through_the_api(binary, root, log_path):
+    """Issue 0081: the detector's findings are actionable without `rm -rf`.
+
+    Three retained shapes are left behind, one of each kind startup leaves for an
+    operator, and every step of the procedure the runbook documents is performed
+    through the management API against the packaged binary: list, judge, refuse
+    what must not be removed, remove one, and re-verify.
+    """
+    archive = build_archive(binary, root / "operator")
+    resumable, resumable_bytes, resumable_files = leave_retained_staging(
+        archive,
+        "fetch-abandoned-operator",
+        0,
+        HEALTHY_COMMIT,
+        b"resumable-partial-bytes" * 64,
+    )
+    live, _live_bytes, _live_files = leave_retained_staging(
+        archive,
+        ".fetch-active-operator-live",
+        int(time.time()) + 3600,
+        HEALTHY_COMMIT,
+        b"in-flight-bytes",
+    )
+    unreadable, unreadable_bytes, unreadable_files = leave_retained_staging(
+        archive, "fetch-abandoned-unreadable", None, HEALTHY_COMMIT, b"kept-for-inspection"
+    )
+    revision = archive / "models/org/model/revisions" / HEALTHY_COMMIT
+    before = tree_digest(archive, skip=("tmp", "state"))
+
+    with log_path.open("wb") as log:
+        with server(binary, archive, log) as (endpoint, admin):
+            # 1. What is retained, why, and how much each one holds.
+            status, listing = admin_call(admin, "/api/admin/v1/staging")
+            assert status == 200, listing
+            entries = {item["name"]: item for item in listing["items"]}
+            assert sorted(entries) == sorted(
+                [
+                    ".fetch-active-operator-live",
+                    "fetch-abandoned-operator",
+                    "fetch-abandoned-unreadable",
+                ]
+            ), listing
+            assert listing["retained_by_kind"] == {
+                "active": 1,
+                "resumable": 1,
+                "unreadable_lease": 1,
+            }, listing
+
+            kept = entries["fetch-abandoned-operator"]
+            assert kept["retention"] == "resumable", kept
+            assert kept["adoptable"] is True, kept
+            assert kept["removable"] is True, kept
+            assert kept["repo_type"] == "model", kept
+            assert kept["repo_id"] == "org/model", kept
+            assert kept["requested_revision"] == "main", kept
+            assert kept["commit"] == HEALTHY_COMMIT, kept
+            assert kept["selection"] == [], kept
+            # The size is the staging directory's own, which is the figure Issue
+            # 0082 needs; the archive filesystem's free space is not it.
+            assert kept["size_bytes"] == resumable_bytes, kept
+            assert kept["file_count"] == resumable_files, kept
+            assert kept["size_complete"] is True, kept
+            assert kept["age_seconds"] >= 0, kept
+            assert kept["lease_expires_in_seconds"] == 0, kept
+
+            inspect = entries["fetch-abandoned-unreadable"]
+            assert inspect["retention"] == "unreadable_lease", inspect
+            assert inspect["adoptable"] is False, inspect
+            assert inspect["size_bytes"] == unreadable_bytes, inspect
+            assert inspect["file_count"] == unreadable_files, inspect
+
+            running = entries[".fetch-active-operator-live"]
+            assert running["retention"] == "active", running
+            assert running["removable"] is False, running
+            assert running["lease_expires_in_seconds"] > 0, running
+
+            # 2. The management plane's own rules apply to the removal.
+            assert (
+                admin_call(
+                    admin,
+                    "/api/admin/v1/staging/fetch-abandoned-operator",
+                    method="DELETE",
+                    csrf=True,
+                    token=None,
+                )[0]
+                == 401
+            )
+            assert (
+                admin_call(
+                    admin,
+                    "/api/admin/v1/staging/fetch-abandoned-operator",
+                    method="DELETE",
+                )[0]
+                == 403
+            )
+
+            # 3. A live acquisition's staging is not removable, and the refusal
+            #    says how long the lease still has.
+            status, refused = admin_call(
+                admin,
+                "/api/admin/v1/staging/.fetch-active-operator-live",
+                method="DELETE",
+                csrf=True,
+            )
+            assert status == 409, refused
+            assert refused["error"] == "staging_active", refused
+            assert refused["lease_expires_in_seconds"] > 0, refused
+            assert live.is_dir(), "a live acquisition's staging was removed"
+
+            # 4. No name reaches out of `tmp`, including one naming a published
+            #    revision that removal would otherwise destroy.
+            for name in (
+                f"..%2Fmodels%2Forg%2Fmodel%2Frevisions%2F{HEALTHY_COMMIT}",
+                "..%2F..%2Fmodels",
+                "..",
+                "nested%2Fpath",
+            ):
+                status, body = admin_call(
+                    admin, f"/api/admin/v1/staging/{name}", method="DELETE", csrf=True
+                )
+                assert status == 400, (name, status, body)
+                assert body["error"] == "invalid_request", (name, body)
+            assert revision.is_dir(), "a rejected name reached a published revision"
+
+            # 5. One named directory is removed, and nothing published moves.
+            status, removed = admin_call(
+                admin,
+                "/api/admin/v1/staging/fetch-abandoned-operator",
+                method="DELETE",
+                csrf=True,
+            )
+            assert status == 200, removed
+            assert removed["name"] == "fetch-abandoned-operator", removed
+            assert removed["retention"] == "resumable", removed
+            assert removed["size_bytes"] == resumable_bytes, removed
+            assert not resumable.exists()
+            assert tree_digest(archive, skip=("tmp", "state")) == before
+            with urllib.request.urlopen(
+                f"{endpoint}/org/model/resolve/main/config.json", timeout=5
+            ) as response:
+                assert response.status == 200
+                assert response.read() == b"{}"
+
+            assert (
+                admin_call(
+                    admin,
+                    "/api/admin/v1/staging/fetch-abandoned-operator",
+                    method="DELETE",
+                    csrf=True,
+                )[0]
+                == 404
+            )
+
+            # 6. Re-verification is a request, not a restart: the fresh result
+            #    no longer counts what was removed, and the status route then
+            #    reports that same fresh result.
+            report = trigger_self_check(admin)
+            counted = sorted(
+                finding["path"]
+                for finding in report["findings"]
+                if finding["finding"] == "orphaned_staging"
+            )
+            assert counted == ["fetch-abandoned-unreadable"], report
+            assert report["orphaned_staging_directories"] == 1, report
+            assert report["staging_directories"] == 2, report
+            summary = admin_status(admin)["self_check"]
+            assert summary["orphaned_staging_directories"] == 1, summary
+            assert summary["findings_by_kind"] == {"orphaned_staging": 1}, summary
+
+            assert unreadable.is_dir(), "an entry nobody named was removed"
+    print(
+        "operator: listed three retention kinds, refused a live lease and every "
+        "unsafe name, removed one directory and re-verified through the API"
+    )
+
+
 def main():
     binary = Path(sys.argv[1])
     with tempfile.TemporaryDirectory() as temporary:
@@ -658,6 +943,9 @@ def main():
         )
         check_startup_isolates_an_unremovable_staging_entry(
             binary, root, root / "stuck.log"
+        )
+        check_operator_acts_on_retained_staging_through_the_api(
+            binary, root, root / "operator.log"
         )
         archive, _ = check_duration_is_measured_against_revision_count(binary, root)
         check_startup_reports_findings_without_delaying_serving(

@@ -63,6 +63,12 @@ archive bytes, archive filesystem capacity/low-space state, and authenticated
 principal. Agents should check this before submitting work and stop if `ready` is
 false or `pullthrough_enabled` is false for `prefetch` or `refresh`.
 
+`self_check` carries the stored archive self-check result: its `status`
+(`never_run`, `running`, `clean`, or `findings`), counts, and `findings_by_kind`.
+This route never starts an archive walk, which is why the result is stored; the
+findings themselves are on the self-check route below, and `self_check` reports no
+staging size, because measuring one means walking a directory.
+
 ### Repository inventory
 
 ```http
@@ -331,15 +337,138 @@ Every client request waiting on the acquisition is answered `502`, and any manag
 job running it reaches terminal `cancelled`. Other acquisitions are unaffected, and
 serving already archived files is unaffected.
 
+## Retained fetch staging
+
+```http
+GET /api/admin/v1/staging
+```
+
+Lists the staging directories the archive's temporary area holds, which is what the
+self-check counts as `orphaned_staging` plus any acquisition currently running. The
+count alone cannot say which of them is which, and the reasons carry different
+actions, so every entry names its own:
+
+```json
+{"items":[{"name":"fetch-abandoned-4bb1baf7182d415883bc6d0576a909d3",
+           "retention":"resumable","removable":true,"adoptable":true,
+           "repo_type":"model","repo_id":"org/repo","requested_revision":"main",
+           "commit":"<40-character commit>","selection":[],
+           "size_bytes":31138512896,"file_count":12,"size_complete":true,
+           "age_seconds":25007,"lease_expires_in_seconds":0,
+           "recovery_skipped_action":null,"recovery_skipped_io_kind":null}],
+ "total_bytes":31138512896,"retained_by_kind":{"resumable":1}}
+```
+
+`retention` is one of:
+
+- `active`: the lease has not expired, so a live acquisition owns the directory. It
+  is not retained state and cannot be removed.
+- `resumable`: identified staging recording a resolved commit, which recovery keeps
+  **on purpose** so a later matching acquisition adopts its bytes
+  ([`ADR-0017`](adr/0017-resumable-fetch-staging.md)). This is an asset, not
+  garbage: `commit` and `selection` say what a prefetch would have to request to
+  reuse it, and `size_bytes` says what resuming saves.
+- `unreadable_lease`: the lease is absent or unrecognizable, which recovery
+  preserves for manual inspection
+  ([`ADR-0009`](adr/0009-staging-ownership-and-recovery.md)). Nothing adopts it, so
+  `adoptable` is false however much identity it carries.
+- `not_reclaimable`: this process's startup recovery attempted the entry and could
+  not reclaim it. `recovery_skipped_action` and `recovery_skipped_io_kind` repeat
+  what its `staging_recovery_skipped` event reported, which is what makes that event
+  and the self-check's count reconcilable from the API alone.
+- `stale`: the lease expired and nothing records a commit a resume could use.
+
+`retained_by_kind` summarizes the classes the way the self-check summarizes finding
+classes. A self-check finding's `path` is the entry's `name`, so the two routes join
+on it without reading container logs.
+
+`size_bytes` and `file_count` are the directory's **own measured** contents, not the
+archive filesystem's free space. `size_complete` is false when part of the directory
+could not be read, which makes `size_bytes` a lower bound. Measuring walks the
+directory, so it happens on this explicit request and never on a status poll.
+
+`name` is the entry's own name, bounded as untrusted text: a name under a shared
+volume need not have been chosen by ModelKeep. `removable` is false when the name is
+not one this service will act on, or when the entry is `active`.
+
+```http
+DELETE /api/admin/v1/staging/{name}
+X-ModelKeep-CSRF: 1
+```
+
+Removes one named staging directory. The response is `200` with
+`{"name":"...","retention":"...","size_bytes":N,"file_count":N}` describing what was
+removed.
+
+- `400 {"error":"invalid_request"}`: the name is not one ordinary component directly
+  under the temporary area, or it does not name a directory. Traversal, absolute and
+  nested names are refused, and the rejected name is not echoed back.
+- `404 {"error":"not_found"}`: no such staging directory.
+- `409 {"error":"staging_active","lease_expires_in_seconds":N}`: the lease has not
+  expired, so a live acquisition owns it. Stop the acquisition first
+  (`DELETE /api/admin/v1/acquisitions/{id}`) and retry after the lease expires.
+
+Removal is explicit, destructive, and one directory per request. ModelKeep never
+removes staging automatically, on a schedule, under disk pressure, or as a side
+effect of another operation ([`ADR-0004`](adr/0004-no-automatic-archive-gc.md),
+[`ADR-0007`](adr/0007-explicit-revision-deletion.md)). `models` and `datasets` are
+unreachable from this route: it takes a name, not a path, and no published revision,
+ref or manifest is affected by it. A successful removal logs `staging_removed`; a
+refusal logs `staging_removal_refused`.
+
+Removing `resumable` staging discards bytes a later acquisition would otherwise have
+reused, and nothing warns twice. Read `commit`, `selection` and `size_bytes` first,
+and prefer submitting a prefetch for that target when the recorded commit is still
+the one you want: the acquisition adopts the bytes instead of transferring them
+again.
+
+## Archive self-check
+
+```http
+GET /api/admin/v1/self-check
+POST /api/admin/v1/self-check
+X-ModelKeep-CSRF: 1
+```
+
+`GET` returns the stored result, `POST` runs the check now and returns the fresh
+one. Both answer with the `self_check` summary fields from the status route plus
+`findings`:
+
+```json
+{"status":"findings","completed_at":1790249413,"duration_ms":22,
+ "repositories_checked":2,"revisions_checked":402,"files_checked":403,
+ "refs_checked":2,"staging_directories":3,"orphaned_staging_directories":3,
+ "oldest_orphaned_staging_age_seconds":25007,"filtered_internal_paths":0,
+ "finding_count":3,"findings_by_kind":{"orphaned_staging":3},
+ "findings":[{"finding":"orphaned_staging","repo_type":"model",
+              "repo_id":"org/repo","commit":"<commit>","path":"fetch-abandoned-...",
+              "reference":null,"age_seconds":25007,
+              "detail":"fetch staging is left behind in the temporary area"}]}
+```
+
+`status` is `never_run` before the first check and `running` while one is in flight;
+`findings` is empty in both cases. `finding` is one of `invalid_manifest`,
+`missing_file`, `size_mismatch`, `unsafe_path`, `dangling_ref`, `orphaned_staging`,
+or `unreadable_archive`. For `orphaned_staging`, `path` is the staging directory's
+name, which is the `name` the staging listing reports.
+
+The check reads manifests and file metadata, never file contents, never contacts
+upstream, and repairs nothing: no finding causes a deletion, a re-acquisition, or a
+write to a published revision. `POST` walks the archive, so do not poll it; it
+returns `409 {"error":"self_check_running"}` rather than starting a second walk, and
+`duration_ms` from a previous run is how long the walk takes on this archive.
+Digest verification remains the `verify` and `audit` jobs.
+
 ## Error handling
 
 - `400`: malformed target, revision, cursor, job ID, or idempotency key; an unsafe
   acquisition pattern; a selection on a kind that does not acquire;
 - `401`: missing/invalid bearer authorization or missing trusted Tailscale capability;
 - `403`: state-changing request omitted `X-ModelKeep-CSRF: 1`;
-- `404`: requested repository or job does not exist, or no acquisition is in flight
-  under the given identifier;
-- `409`: idempotency conflict;
+- `404`: requested repository, job, or staging directory does not exist, or no
+  acquisition is in flight under the given identifier;
+- `409`: idempotency conflict; a staging removal whose lease has not expired
+  (`staging_active`); a self-check that is already running (`self_check_running`);
 - `500`: internal metadata/storage error.
 
 A cancellation request never answers `409`. What it found is reported in the

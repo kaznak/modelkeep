@@ -38,6 +38,8 @@ headers, bearer tokens, signed URLs, or upstream error payloads.
 | `incomplete_fetch_preserved` | WARN | `repo_id`, `requested_revision` |
 | `incomplete_fetch_recovered` | INFO | `repo_id`, `requested_revision`, `recovery_action`; resumable staging also has immutable `commit` |
 | `staging_recovery_skipped` | WARN | `staging` (bounded directory name only), `recovery_action`, `error_class=recovery_skipped`, `io_kind` |
+| `staging_removed` | INFO | `staging` (bounded directory name only), `retention`, `size_bytes`, `file_count` |
+| `staging_removal_refused` | WARN | `staging` (bounded directory name only), `error_class` (`staging_conflict` or `unsafe_path`); a refused live lease also has `lease_expires_in_seconds` |
 | `fetch_staging_conflict` | WARN | `repo_type`, `repo_id`, `requested_revision`, `staging` (directory name only), `lease_expires_in_seconds`, `error_class=staging_conflict` |
 | `acquisition_progress` | INFO | `request_kind`, `repo_id`, `requested_revision`, `path`, `phase`, `acquired_bytes`, `total_bytes` |
 | `acquisition_deadline_exceeded` | WARN | `request_kind`, `repo_id`, `requested_revision`, `path`, `deadline_seconds`, `acquired_bytes` |
@@ -310,6 +312,33 @@ then no entry was attempted at all; that is the one remaining
 the entries discarded and never the ones skipped, so a startup that skipped
 something reports it only through this event.
 
+`staging_removed` (INFO) is the one way staging leaves the temporary area other
+than through recovery or an adoption: an operator named one directory through the
+management API and it was removed (Issue 0081). It is INFO rather than DEBUG
+because the removal is destructive and explicit, so it belongs in the record of
+what was done to the deployment. `retention` is the class the entry was in when
+it was removed — `resumable`, `unreadable_lease`, `not_reclaimable` or `stale` —
+and `size_bytes` with `file_count` are what the directory held, measured before
+it was removed. The entry's own name is reported, bounded as Issue 0085 bounds
+one, and never the archive path it sat under. Nothing published is involved: the
+route reaches only one entry directly under the temporary area, and no published
+revision is reachable from it.
+
+`staging_removal_refused` (WARN) names a removal that was not performed.
+`error_class=staging_conflict` is the same class `fetch_staging_conflict` uses,
+for the same reason: the lease has not expired, so a live acquisition owns the
+directory, and `lease_expires_in_seconds` says how long that will remain true.
+`error_class=unsafe_path` is a name that is not one ordinary component directly
+under the temporary area — a traversal attempt, an absolute path, a nested path,
+or a name carrying a control character. The refused name is reported bounded and
+is never echoed into the HTTP response.
+
+There is deliberately **no automatic removal event**, because there is no
+automatic removal: staging is never removed on a schedule, under disk pressure,
+or as a side effect of another operation (core invariant 4, ADR-0007). What
+recovery reclaims at startup is still reported by `incomplete_fetch_recovered`
+and `archive_recovery_completed`.
+
 ## Archive self-check
 
 The self-check runs once at startup, beside serving, and emits one
@@ -326,6 +355,13 @@ directories, and findings by class — are on the Admin status route and in the
 report `modelkeep self-check` prints, neither of which a restart writes to a
 log. `archive_self_check_started` exists for the same reason at DEBUG: a check
 in flight is answered by the status route without logging.
+
+The same three events are emitted by a check an operator triggers through
+`POST /api/admin/v1/self-check` (Issue 0081), which is the check running, not a
+second kind of check. That route and `GET /api/admin/v1/self-check` also return
+the findings themselves, so acting on one no longer requires reading these events
+or running the CLI inside the container. The status route keeps reporting the
+stored result and starts no walk of its own.
 
 `archive_self_check_finding.finding` is one of `invalid_manifest`,
 `missing_file`, `size_mismatch`, `unsafe_path`, `dangling_ref`,

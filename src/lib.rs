@@ -526,11 +526,160 @@ pub enum SelfCheckState {
     Completed(Box<SelfCheckReport>),
 }
 
+/// Why a staging directory is still held in the archive's temporary area.
+///
+/// The self-check's `orphaned_staging` count is every staging directory whose
+/// lease is expired or absent, and after Issues 0083 and 0087 that set holds
+/// entries whose right action differs: one is an asset a later acquisition can
+/// resume, one is kept for inspection, one is something startup recovery could
+/// not reclaim, and one is stale junk. This names which, because the count
+/// cannot (Issue 0081).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StagingRetention {
+    /// The lease has not expired, so a live acquisition owns it (ADR-0009).
+    /// This is the one class that is not retained state at all.
+    Active,
+    /// Identified staging recording a resolved commit, which recovery keeps on
+    /// purpose so a matching later acquisition can adopt its bytes (ADR-0017).
+    Resumable,
+    /// The lease is absent or unrecognizable, which recovery preserves for
+    /// conservative manual inspection (ADR-0009).
+    UnreadableLease,
+    /// Startup recovery in this process attempted this entry and could not
+    /// reclaim it; it is what `staging_recovery_skipped` reported (Issue 0087).
+    NotReclaimable,
+    /// The lease expired and nothing records a commit a resume could be pinned
+    /// to, so no acquisition will ever adopt it.
+    Stale,
+}
+
+impl StagingRetention {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Resumable => "resumable",
+            Self::UnreadableLease => "unreadable_lease",
+            Self::NotReclaimable => "not_reclaimable",
+            Self::Stale => "stale",
+        }
+    }
+}
+
+/// One staging directory in the temporary area, with what an operator needs to
+/// choose between resuming it and discarding it (Issue 0081).
+///
+/// `size_bytes` is the directory's own measured size. It is the figure Issue
+/// 0082 needs and the archive filesystem's free space is not: the bytes an
+/// interrupted acquisition already holds are these. Measuring walks the
+/// directory, so it happens on this explicit request and never on a status poll.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RetainedStaging {
+    /// The entry's own name, bounded as untrusted text (Issue 0085). It is what
+    /// a removal names, and `removable` is false when it is not a name this
+    /// process will act on.
+    pub name: String,
+    pub retention: StagingRetention,
+    /// Whether an explicit removal request for this name can be accepted.
+    pub removable: bool,
+    /// Whether a matching later acquisition can adopt these bytes (ADR-0017).
+    pub adoptable: bool,
+    pub repo_type: Option<RepositoryType>,
+    pub repo_id: Option<String>,
+    pub requested_revision: Option<String>,
+    pub commit: Option<String>,
+    /// The recorded fetch selection; empty means the whole repository, which any
+    /// narrower request can adopt (ADR-0020).
+    pub selection: Vec<String>,
+    pub size_bytes: u64,
+    pub file_count: usize,
+    /// False when part of the directory could not be read, so `size_bytes` is a
+    /// lower bound rather than the measurement.
+    pub size_complete: bool,
+    pub age_seconds: u64,
+    /// Seconds until the lease expires; `0` for an expired or absent lease.
+    pub lease_expires_in_seconds: u64,
+    /// The `recovery_action` of the `staging_recovery_skipped` event this entry
+    /// produced during this process's startup recovery, if it produced one.
+    pub recovery_skipped_action: Option<&'static str>,
+    /// The `io_kind` that skip reported, without the path it happened on.
+    pub recovery_skipped_io_kind: Option<&'static str>,
+}
+
+/// What one explicit staging removal removed (Issue 0081).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RemovedStaging {
+    pub name: String,
+    pub retention: StagingRetention,
+    pub size_bytes: u64,
+    pub file_count: usize,
+}
+
+/// Why an explicit staging removal was refused.
+#[derive(Debug)]
+pub enum StagingRemovalError {
+    /// The name is not one safe component directly under the temporary area.
+    UnsafeName,
+    /// No entry of that name exists.
+    NotFound,
+    /// The entry exists but is not a directory, so it is not staging.
+    NotDirectory,
+    /// The lease has not expired: a live acquisition owns it.
+    Active {
+        expires_in_seconds: u64,
+    },
+    Io(io::Error),
+}
+
+impl fmt::Display for StagingRemovalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsafeName => formatter.write_str("unsafe staging name"),
+            Self::NotFound => formatter.write_str("no such staging directory"),
+            Self::NotDirectory => formatter.write_str("staging entry is not a directory"),
+            Self::Active { expires_in_seconds } => write!(
+                formatter,
+                "staging lease has not expired: {expires_in_seconds}s remaining"
+            ),
+            Self::Io(error) => write!(formatter, "staging removal I/O error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for StagingRemovalError {}
+
+/// What startup recovery could not do to one staging entry (Issue 0087).
+///
+/// Kept per entry name for the life of the process so the fact
+/// `staging_recovery_skipped` reported can be read back from the management API.
+/// That is what makes the event and the self-check's count reconcilable without
+/// reading container logs or running a CLI inside the container (Issue 0081).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SkippedStagingRecord {
+    action: &'static str,
+    io_kind: &'static str,
+}
+
+/// One staging directory's measured size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StagingUsage {
+    size_bytes: u64,
+    file_count: usize,
+    complete: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Archive {
     pub(crate) root: PathBuf,
     readiness: Arc<Mutex<Option<bool>>>,
     self_check: Arc<Mutex<SelfCheckState>>,
+    /// What this process's startup recovery could not reclaim, by entry name.
+    skipped_staging: Arc<Mutex<BTreeMap<String, SkippedStagingRecord>>>,
+    /// How many staging size walks this process has performed (Issue 0081).
+    ///
+    /// A status poll must never start one, which is why the stored self-check
+    /// result exists; a counter makes that assertable rather than assumed.
+    staging_scans: Arc<AtomicU64>,
 }
 
 impl Archive {
@@ -543,6 +692,8 @@ impl Archive {
             root,
             readiness: Arc::new(Mutex::new(None)),
             self_check: Arc::new(Mutex::new(SelfCheckState::NeverRun)),
+            skipped_staging: Arc::new(Mutex::new(BTreeMap::new())),
+            staging_scans: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -556,6 +707,8 @@ impl Archive {
             root,
             readiness: Arc::new(Mutex::new(None)),
             self_check: Arc::new(Mutex::new(SelfCheckState::NeverRun)),
+            skipped_staging: Arc::new(Mutex::new(BTreeMap::new())),
+            staging_scans: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -670,6 +823,11 @@ impl Archive {
     pub fn recover_incomplete(&self) -> ArchiveResult<usize> {
         let staging_root = self.root.join("tmp");
         let mut recovered = 0;
+        // This run's outcome is the current one, so an earlier run's skips are
+        // dropped rather than reported again by the management API.
+        if let Ok(mut skipped) = self.skipped_staging.lock() {
+            skipped.clear();
+        }
         for entry in fs::read_dir(&staging_root)? {
             let (name, outcome) = match entry {
                 Ok(entry) => (
@@ -687,7 +845,25 @@ impl Archive {
             match outcome {
                 Ok(true) => recovered += 1,
                 Ok(false) => {}
-                Err(skipped) => report_skipped_staging_entry(&name, skipped),
+                Err(skipped) => {
+                    // The same fact the event reports is kept for the
+                    // management API, which is what makes it reconcilable
+                    // against the self-check's count without reading the log
+                    // (Issue 0081). A failure the iterator raised before it
+                    // named anything has no entry to record it under.
+                    if !name.is_empty() {
+                        if let Ok(mut records) = self.skipped_staging.lock() {
+                            records.insert(
+                                name.clone(),
+                                SkippedStagingRecord {
+                                    action: skipped.action,
+                                    io_kind: staging_io_kind(&skipped.error),
+                                },
+                            );
+                        }
+                    }
+                    report_skipped_staging_entry(&name, skipped)
+                }
             }
         }
         Ok(recovered)
@@ -1679,6 +1855,254 @@ impl Archive {
             }
             report.findings.push(finding);
         }
+    }
+
+    /// Lists the staging directories the temporary area still holds.
+    ///
+    /// Issue 0073 added a detector and no actuator: the self-check counts
+    /// staging whose lease is expired or absent, and a count cannot say which of
+    /// those the entry is or what it holds. This answers both, per entry, with
+    /// the identity ADR-0017 already stores and a measured size, so the choice
+    /// between resuming and discarding can be made from the API.
+    ///
+    /// This is an explicit read, not a poll: it measures every entry, so it
+    /// walks `tmp` — and only `tmp`. Nothing here removes, renames or repairs
+    /// anything.
+    pub fn list_retained_staging(&self) -> ArchiveResult<Vec<RetainedStaging>> {
+        let staging_root = self.root.join("tmp");
+        let skipped = self
+            .skipped_staging
+            .lock()
+            .map(|records| records.clone())
+            .unwrap_or_default();
+        let now = unix_timestamp();
+        let mut items = Vec::new();
+        for entry in fs::read_dir(&staging_root)? {
+            let Ok(entry) = entry else { continue };
+            // `DirEntry::file_type` does not follow a symlink, so a link to a
+            // directory is never listed as staging and never becomes a removal
+            // target, whatever it points at.
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let raw_name = entry.file_name().to_string_lossy().into_owned();
+            let path = entry.path();
+            let expires_at = read_lease_expiry(&path).ok();
+            let identity = read_fetch_staging_metadata(&path).ok();
+            let usage = self.measure_staging_usage(&path);
+            let age_seconds = staging_age_seconds(&entry);
+            let active = expires_at.is_some_and(|expires_at| expires_at > now);
+            let record = skipped.get(&raw_name).copied();
+            let adoptable = !active
+                && expires_at.is_some()
+                && staging_is_adoptable(&raw_name, identity.as_ref());
+            let retention = classify_staging_retention(
+                active,
+                expires_at.is_some(),
+                record.is_some(),
+                adoptable,
+            );
+            // The name is whatever created the directory, which on a shared
+            // volume need not have been ModelKeep, so it is reported as bounded
+            // untrusted text (Issue 0085). A name that bounding would alter is
+            // not one a removal will accept either.
+            let name = bounded_archive_detail(&raw_name);
+            // The removal validates the same way, so a name this alters is
+            // reported and never accepted as a removal target.
+            let removable = !active && validate_staging_name(&raw_name).is_ok();
+            items.push(RetainedStaging {
+                name,
+                retention,
+                removable,
+                adoptable,
+                repo_type: identity.as_ref().map(|identity| identity.repo_type),
+                repo_id: identity.as_ref().map(|identity| identity.repo_id.clone()),
+                requested_revision: identity
+                    .as_ref()
+                    .map(|identity| identity.requested_revision.clone()),
+                commit: identity
+                    .as_ref()
+                    .and_then(|identity| identity.resolved_commit.clone()),
+                selection: identity
+                    .as_ref()
+                    .map(|identity| identity.files.clone())
+                    .unwrap_or_default(),
+                size_bytes: usage.size_bytes,
+                file_count: usage.file_count,
+                size_complete: usage.complete,
+                age_seconds,
+                lease_expires_in_seconds: expires_at
+                    .map_or(0, |expires_at| expires_at.saturating_sub(now)),
+                recovery_skipped_action: record.map(|record| record.action),
+                recovery_skipped_io_kind: record.map(|record| record.io_kind),
+            });
+        }
+        // Oldest first: age is what the self-check's oldest-orphan figure names,
+        // so the entry that figure refers to is the first one listed.
+        items.sort_by(|left, right| {
+            right
+                .age_seconds
+                .cmp(&left.age_seconds)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        Ok(items)
+    }
+
+    /// Removes one named staging directory, explicitly and one at a time.
+    ///
+    /// ADR-0007's reasoning holds here even though no published revision is
+    /// involved: removal is never automatic, never a consequence of disk
+    /// pressure, and never a side effect of another operation (core invariant
+    /// 4). It takes a name, not a path: the name addresses one entry directly
+    /// under the temporary area, so `models` and `datasets` are unreachable from
+    /// it. Staging whose lease has not expired belongs to a live acquisition and
+    /// is refused, which is the same boundary recovery respects (ADR-0009).
+    pub fn remove_retained_staging(
+        &self,
+        name: &str,
+    ) -> Result<RemovedStaging, StagingRemovalError> {
+        if validate_staging_name(name).is_err() {
+            tracing::warn!(
+                event = "staging_removal_refused",
+                staging = %bounded_archive_detail(name),
+                error_class = "unsafe_path",
+                "refused a staging removal for an unsafe name"
+            );
+            return Err(StagingRemovalError::UnsafeName);
+        }
+        let staging_root = self.root.join("tmp");
+        let path = staging_root.join(name);
+        // `symlink_metadata` does not follow a link, so a link under the
+        // temporary area is refused as "not a directory" rather than followed to
+        // whatever it names.
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                StagingRemovalError::NotFound
+            } else {
+                StagingRemovalError::Io(error)
+            }
+        })?;
+        if !metadata.is_dir() {
+            return Err(StagingRemovalError::NotDirectory);
+        }
+        let now = unix_timestamp();
+        let expires_at = read_lease_expiry(&path).ok();
+        if let Some(expires_at) = expires_at.filter(|expires_at| *expires_at > now) {
+            let expires_in_seconds = expires_at - now;
+            tracing::warn!(
+                event = "staging_removal_refused",
+                staging = %bounded_archive_detail(name),
+                error_class = "staging_conflict",
+                lease_expires_in_seconds = expires_in_seconds,
+                "refused a staging removal whose lease has not expired"
+            );
+            return Err(StagingRemovalError::Active { expires_in_seconds });
+        }
+        let identity = read_fetch_staging_metadata(&path).ok();
+        let skipped = self
+            .skipped_staging
+            .lock()
+            .is_ok_and(|records| records.contains_key(name));
+        let retention = classify_staging_retention(
+            false,
+            expires_at.is_some(),
+            skipped,
+            expires_at.is_some() && staging_is_adoptable(name, identity.as_ref()),
+        );
+        let usage = self.measure_staging_usage(&path);
+        // An acquisition that adopts expired staging claims it by renaming it
+        // (ADR-0017), so a concurrent adoption makes this entry disappear rather
+        // than change under the removal. That is "no such staging directory",
+        // not a storage failure. The remaining window between reading the lease
+        // and removing is the one recovery has always had, and the lease is what
+        // bounds it.
+        fs::remove_dir_all(&path).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                StagingRemovalError::NotFound
+            } else {
+                StagingRemovalError::Io(error)
+            }
+        })?;
+        sync_directory(&staging_root).map_err(StagingRemovalError::Io)?;
+        if let Ok(mut records) = self.skipped_staging.lock() {
+            records.remove(name);
+        }
+        tracing::info!(
+            event = "staging_removed",
+            staging = %bounded_archive_detail(name),
+            retention = retention.as_str(),
+            size_bytes = usage.size_bytes,
+            file_count = usage.file_count,
+            "removed one retained fetch staging directory on request"
+        );
+        Ok(RemovedStaging {
+            name: bounded_archive_detail(name),
+            retention,
+            size_bytes: usage.size_bytes,
+            file_count: usage.file_count,
+        })
+    }
+
+    /// How many staging size walks this process has performed.
+    ///
+    /// The management status route reports the stored self-check result so a
+    /// poll starts no archive walk; this makes that a fact a test can assert
+    /// rather than a property of the code as currently written. Nothing in the
+    /// service reads it, so it is compiled only for the tests that do.
+    #[cfg(test)]
+    pub(crate) fn staging_scans(&self) -> u64 {
+        self.staging_scans.load(Ordering::Relaxed)
+    }
+
+    /// Measures one staging directory without leaving it.
+    ///
+    /// Issue 0082 needs the size of the directory itself: the bytes an
+    /// interrupted acquisition holds are there, not in the archive filesystem's
+    /// free space, which is what the original report measured. A symlink is
+    /// measured as the link it is and never traversed, so the figure cannot
+    /// include anything outside the directory. The walk is bounded, because the
+    /// contents of a shared scratch volume are untrusted input.
+    fn measure_staging_usage(&self, path: &Path) -> StagingUsage {
+        const ENTRY_LIMIT: usize = 1_000_000;
+        self.staging_scans.fetch_add(1, Ordering::Relaxed);
+        let mut usage = StagingUsage {
+            size_bytes: 0,
+            file_count: 0,
+            complete: true,
+        };
+        let mut examined = 0usize;
+        let mut pending = vec![path.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = fs::read_dir(&directory) else {
+                // An unreadable part of the directory makes the total a lower
+                // bound; it is reported as one rather than as a measurement.
+                usage.complete = false;
+                continue;
+            };
+            for entry in entries {
+                let Ok(entry) = entry else {
+                    usage.complete = false;
+                    continue;
+                };
+                examined += 1;
+                if examined > ENTRY_LIMIT {
+                    usage.complete = false;
+                    return usage;
+                }
+                // `DirEntry::metadata` does not follow a symlink.
+                let Ok(metadata) = entry.metadata() else {
+                    usage.complete = false;
+                    continue;
+                };
+                if metadata.is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    usage.size_bytes = usage.size_bytes.saturating_add(metadata.len());
+                    usage.file_count += 1;
+                }
+            }
+        }
+        usage
     }
 
     pub fn create_fetch_staging(&self) -> ArchiveResult<PathBuf> {
@@ -2813,6 +3237,86 @@ fn report_skipped_staging_entry(name: &str, skipped: SkippedStagingEntry) {
         io_kind = staging_io_kind(&skipped.error),
         "startup recovery could not reclaim one staging entry"
     );
+}
+
+/// Which retention class one staging directory falls in (Issue 0081).
+///
+/// The order is the order the actions differ in. A live lease is not retained
+/// state at all. An entry recovery attempted and could not reclaim is next,
+/// because someone has to look at that one and nothing else will. Then the two
+/// classes recovery keeps on purpose: unrecognizable lease metadata, preserved
+/// for inspection (ADR-0009), and identified staging a later acquisition can
+/// adopt (ADR-0017). What is left records nothing a resume could use.
+fn classify_staging_retention(
+    active: bool,
+    lease_readable: bool,
+    recovery_skipped: bool,
+    adoptable: bool,
+) -> StagingRetention {
+    if active {
+        StagingRetention::Active
+    } else if recovery_skipped {
+        StagingRetention::NotReclaimable
+    } else if !lease_readable {
+        StagingRetention::UnreadableLease
+    } else if adoptable {
+        StagingRetention::Resumable
+    } else {
+        StagingRetention::Stale
+    }
+}
+
+/// Whether a later acquisition could adopt this staging directory's bytes.
+///
+/// Adoption is what `acquire_fetch_staging_for_type` does, so this reports the
+/// conditions that function requires: one of the two staging name forms it
+/// scans, valid identity, and a recorded commit a resume can be pinned to
+/// (ADR-0017). Whether some future request's selection matches is not knowable
+/// here, and an unrestricted selection is adoptable by any of them (ADR-0020).
+/// A readable lease is required by the caller, because the acquisition path
+/// skips staging whose lease it cannot read (ADR-0009).
+fn staging_is_adoptable(name: &str, identity: Option<&FetchStagingMetadata>) -> bool {
+    (name.starts_with("fetch-abandoned-") || name.starts_with(".fetch-active-"))
+        && identity.is_some_and(|identity| identity.resolved_commit.is_some())
+}
+
+/// Validates a staging directory name supplied by an operator.
+///
+/// The name is untrusted input and addresses one entry directly under the
+/// archive's temporary area. Anything that is not a single ordinary path
+/// component is refused, so no name can reach a parent directory, an absolute
+/// path, or the `models` and `datasets` namespaces (ADR-0007: destructive
+/// operations never accept arbitrary paths).
+///
+/// A name that differs from its bounded rendering is refused as well. ModelKeep
+/// names its own staging `fetch-abandoned-<id>` and `.fetch-active-<id>`, so this
+/// only rejects a name something else on a shared volume chose, and rejecting it
+/// keeps one set of names: what a listing reports as removable is exactly what a
+/// removal will act on, rather than a display name that no longer addresses the
+/// directory it came from.
+fn validate_staging_name(name: &str) -> ArchiveResult<()> {
+    validate_component(name)?;
+    let mut components = Path::new(name).components();
+    let single_ordinary =
+        matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none();
+    if name.len() > 255
+        || name.starts_with("..")
+        || !single_ordinary
+        || bounded_archive_detail(name) != name
+    {
+        return Err(ArchiveError::InvalidPath(name.into()));
+    }
+    Ok(())
+}
+
+/// Age of one staging entry, from its own modification time.
+fn staging_age_seconds(entry: &fs::DirEntry) -> u64 {
+    entry
+        .metadata()
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .map_or(0, |age| age.as_secs())
 }
 
 /// The kind of an I/O failure, without the path it happened on.

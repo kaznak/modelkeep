@@ -130,6 +130,95 @@ non-zero status identify revisions that failed verification. A killed container,
 missing JSON output, or any other incomplete run is not a successful audit; schedule
 a replacement run. The audit is read-only and never repairs or deletes data.
 
+## Acting on the archive self-check
+
+The self-check runs once at startup and reports; it repairs nothing. Do the whole
+procedure through the Admin API. **Do not delete staging by hand with a recursive
+shell removal against `/data/tmp`, and do not restart the service to refresh the
+result** — those were the only options before the routes below existed, and both are
+worse than the supported ones: a hand removal can destroy resumable bytes and can
+reach paths the API refuses, and a restart re-reads the whole archive rather than
+answering the question.
+
+Read the origin as [`admin-api.md`](../admin-api.md) describes; never put the
+hostname or token in a tracked command.
+
+1. Read the stored result. `self_check.status` is `clean`, `findings`, `never_run`,
+   or `running`:
+
+   ```sh
+   curl --fail --silent --show-error \
+     "$MODELKEEP_ADMIN_ENDPOINT/api/admin/v1/status" | jq '.self_check'
+   ```
+
+2. Read the findings themselves. This is stored state too, not a new walk:
+
+   ```sh
+   curl --fail --silent --show-error \
+     "$MODELKEEP_ADMIN_ENDPOINT/api/admin/v1/self-check" \
+     | jq '.findings | group_by(.finding) | map({(.[0].finding): .})'
+   ```
+
+   A finding other than `orphaned_staging` concerns a published revision or ref: run
+   `verify` for that revision, restore from backup if it fails, and do not delete
+   anything on the strength of the finding alone.
+
+3. For `orphaned_staging`, list the retained staging. Each finding's `path` is an
+   entry's `name`, so the two views join on it:
+
+   ```sh
+   curl --fail --silent --show-error \
+     "$MODELKEEP_ADMIN_ENDPOINT/api/admin/v1/staging" \
+     | jq '.retained_by_kind, [.items[] | {name,retention,size_bytes,age_seconds,
+            repo_id,commit,adoptable,removable,recovery_skipped_io_kind}]'
+   ```
+
+4. Decide per entry from its `retention`, because the right action differs:
+
+   - `active`: a live acquisition owns it. Leave it. `GET
+     /api/admin/v1/acquisitions` says what is running.
+   - `resumable`: identified staging holding a resolved commit. **It is an asset.**
+     If `commit` is still the revision you want, submit a `prefetch` for that
+     `repo_id` and `commit` (whole repository, or the recorded `selection` or
+     narrower): the acquisition adopts these bytes instead of transferring
+     `size_bytes` again. Remove it only when the recorded commit is no longer wanted.
+   - `unreadable_lease`: kept for inspection. Nothing will adopt it. Look at its
+     contents before removing it; its identity may be wrong or absent.
+   - `not_reclaimable`: startup recovery tried and failed.
+     `recovery_skipped_io_kind` says why — `permission_denied` is usually a foreign
+     uid under the share, `not_empty` a concurrent writer, `out_of_space` or
+     `read_only` a storage problem to fix first. Fix that cause, then remove it.
+   - `stale`: nothing records a commit a resume could use. Remove it.
+
+5. Remove one entry, named, with CSRF:
+
+   ```sh
+   curl --fail --silent --show-error -X DELETE \
+     -H 'X-ModelKeep-CSRF: 1' \
+     "$MODELKEEP_ADMIN_ENDPOINT/api/admin/v1/staging/$name"
+   ```
+
+   `409 staging_active` means the lease has not expired: stop the acquisition with
+   `DELETE /api/admin/v1/acquisitions/{id}` and retry after the lease expires (120
+   seconds). `400 invalid_request` means the name is not one entry under
+   `/data/tmp`; the route reaches nothing else, and `models` and `datasets` are not
+   addressable through it. Removal is never automatic and never affects a published
+   revision.
+
+6. Re-verify without a restart:
+
+   ```sh
+   curl --fail --silent --show-error -X POST \
+     -H 'X-ModelKeep-CSRF: 1' \
+     "$MODELKEEP_ADMIN_ENDPOINT/api/admin/v1/self-check" \
+     | jq '{status,finding_count,findings_by_kind,orphaned_staging_directories,
+            oldest_orphaned_staging_age_seconds,duration_ms}'
+   ```
+
+   The walk costs I/O proportional to the archive, so run it after acting, not on a
+   poll. `409 self_check_running` means one is already in flight. The status route
+   then reports this fresh result.
+
 ## Management job history maintenance
 
 Management job history is stored as one JSON record per job under
@@ -153,10 +242,14 @@ previous image digest; it never edits or restores the archive merely for an app
 rollback.
 
 - Disk full: stop acquisition; add capacity or explicitly remove only a reviewed,
-  unreferenced revision. Never run automatic GC.
+  unreferenced revision. Never run automatic GC. Check retained fetch staging first
+  with `GET /api/admin/v1/staging`, which reports each directory's measured size:
+  reclaiming a `stale` or no-longer-wanted directory there costs no archived data.
 - Mount loss/read-only mount: stop the container and repair mount/ACL; do not accept a
   newly created empty `/data` as production.
 - Interrupted acquisition: restart after storage repair; identified expired fetch
   staging can be resumed, while other recovery removes only safe expired staging.
+  What a restart left behind is listed by `GET /api/admin/v1/staging`; act on it as
+  "Acting on the archive self-check" above describes.
 - Failed upgrade: retain logs, restore the previous image, run readiness and verify.
 - Suspected corruption: stop writes, snapshot, verify read-only, and restore separately.

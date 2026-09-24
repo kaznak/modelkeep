@@ -32,7 +32,8 @@ use crate::{
         TRANSFER_WAIT_PHASE,
     },
     validate_repository_id, validate_revision_ref, Archive, ArchiveError, ArchiveResult,
-    RepositorySummary, RepositoryType, SelfCheckState,
+    RepositorySummary, RepositoryType, RetainedStaging, SelfCheckFinding, SelfCheckReport,
+    SelfCheckState, StagingRemovalError,
 };
 
 const ADMIN_CAPABILITY: &str = "io.modelkeep/cap/admin";
@@ -255,21 +256,92 @@ impl SelfCheckSummary {
         match state {
             SelfCheckState::NeverRun => Self::idle("never_run"),
             SelfCheckState::Running => Self::idle("running"),
-            SelfCheckState::Completed(report) => Self {
-                status: report.status(),
-                completed_at: report.completed_at,
-                duration_ms: report.duration_ms,
-                repositories_checked: report.repositories_checked,
-                revisions_checked: report.revisions_checked,
-                files_checked: report.files_checked,
-                refs_checked: report.refs_checked,
-                staging_directories: report.staging_directories,
-                orphaned_staging_directories: report.orphaned_staging_directories,
-                oldest_orphaned_staging_age_seconds: report.oldest_orphaned_staging_age_seconds,
-                filtered_internal_paths: report.filtered_internal_paths,
-                finding_count: report.findings.len(),
-                findings_by_kind: report.findings_by_kind(),
+            SelfCheckState::Completed(report) => Self::from_report(&report),
+        }
+    }
+
+    fn from_report(report: &SelfCheckReport) -> Self {
+        Self {
+            status: report.status(),
+            completed_at: report.completed_at,
+            duration_ms: report.duration_ms,
+            repositories_checked: report.repositories_checked,
+            revisions_checked: report.revisions_checked,
+            files_checked: report.files_checked,
+            refs_checked: report.refs_checked,
+            staging_directories: report.staging_directories,
+            orphaned_staging_directories: report.orphaned_staging_directories,
+            oldest_orphaned_staging_age_seconds: report.oldest_orphaned_staging_age_seconds,
+            filtered_internal_paths: report.filtered_internal_paths,
+            finding_count: report.findings.len(),
+            findings_by_kind: report.findings_by_kind(),
+        }
+    }
+}
+
+/// The staging listing, with the totals that make it reconcilable.
+///
+/// `retained_by_kind` is deliberately shaped like the self-check's
+/// `findings_by_kind`: the counts the two routes report are about the same
+/// directories, so they are summarized the same way and joined by entry name.
+#[derive(Debug, Serialize)]
+struct StagingListView {
+    items: Vec<RetainedStaging>,
+    total_bytes: u64,
+    retained_by_kind: BTreeMap<&'static str, usize>,
+}
+
+impl StagingListView {
+    fn new(items: Vec<RetainedStaging>) -> Self {
+        let mut retained_by_kind = BTreeMap::new();
+        let mut total_bytes = 0u64;
+        for item in &items {
+            *retained_by_kind
+                .entry(item.retention.as_str())
+                .or_insert(0usize) += 1;
+            total_bytes = total_bytes.saturating_add(item.size_bytes);
+        }
+        Self {
+            items,
+            total_bytes,
+            retained_by_kind,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct StagingActiveBody {
+    error: &'static str,
+    lease_expires_in_seconds: u64,
+}
+
+/// The self-check result with its findings.
+///
+/// The summary is the same object `status` reports, so the two routes cannot
+/// disagree about the counts, and the findings are what `status` deliberately
+/// leaves out.
+#[derive(Debug, Serialize)]
+struct SelfCheckView {
+    #[serde(flatten)]
+    summary: SelfCheckSummary,
+    findings: Vec<SelfCheckFinding>,
+}
+
+impl SelfCheckView {
+    fn from_state(state: SelfCheckState) -> Self {
+        match state {
+            SelfCheckState::Completed(report) => Self::from_report(&report),
+            state => Self {
+                summary: SelfCheckSummary::from_state(state),
+                findings: Vec::new(),
             },
+        }
+    }
+
+    fn from_report(report: &SelfCheckReport) -> Self {
+        Self {
+            summary: SelfCheckSummary::from_report(report),
+            findings: report.findings.clone(),
         }
     }
 }
@@ -1394,6 +1466,15 @@ pub fn router(
             "/api/admin/v1/acquisitions/{id}",
             axum::routing::delete(cancel_acquisition),
         )
+        .route("/api/admin/v1/staging", get(list_staging))
+        .route(
+            "/api/admin/v1/staging/{name}",
+            axum::routing::delete(remove_staging),
+        )
+        .route(
+            "/api/admin/v1/self-check",
+            get(self_check_result).post(run_self_check),
+        )
         .with_state(state))
 }
 
@@ -1641,6 +1722,144 @@ async fn cancel_acquisition(
             Json(ErrorBody { error: "not_found" }),
         )
             .into_response(),
+    }
+}
+
+/// Lists the fetch staging the temporary area still holds (Issue 0081).
+///
+/// The self-check reports how many staging directories have no live lease; this
+/// reports which they are, why each one is retained, and how much each holds, so
+/// the choice between resuming and discarding can be made from the API instead
+/// of by reading `.modelkeep-fetch.json` files over `docker exec`.
+///
+/// Measuring a directory walks it, which is why this is its own explicit route
+/// and not a field on `status`.
+async fn list_staging(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+    if !authorized(&state.config, &headers) {
+        return unauthorized(&state.config);
+    }
+    match state.archive.list_retained_staging() {
+        Ok(items) => Json(StagingListView::new(items)).into_response(),
+        Err(error) => archive_error(error),
+    }
+}
+
+/// Removes one named staging directory (Issue 0081).
+///
+/// Destructive and explicit: one entry per request, named, never on a schedule
+/// and never as a side effect of another operation (core invariant 4). It
+/// carries the same authorization and CSRF requirement as every other
+/// state-changing management request (ADR-0015), and refuses staging whose lease
+/// has not expired, which is the boundary that protects a live acquisition
+/// (ADR-0009). No published revision is reachable from it.
+async fn remove_staging(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Response {
+    if !authorized(&state.config, &headers) {
+        return unauthorized(&state.config);
+    }
+    if !csrf_authorized(&headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: "csrf_required",
+            }),
+        )
+            .into_response();
+    }
+    match state.archive.remove_retained_staging(&name) {
+        Ok(removed) => Json(removed).into_response(),
+        // The rejected name is not echoed back, exactly as a rejected
+        // acquisition pattern is not.
+        Err(StagingRemovalError::UnsafeName) | Err(StagingRemovalError::NotDirectory) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: "invalid_request",
+            }),
+        )
+            .into_response(),
+        Err(StagingRemovalError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody { error: "not_found" }),
+        )
+            .into_response(),
+        Err(StagingRemovalError::Active { expires_in_seconds }) => (
+            StatusCode::CONFLICT,
+            Json(StagingActiveBody {
+                error: "staging_active",
+                lease_expires_in_seconds: expires_in_seconds,
+            }),
+        )
+            .into_response(),
+        Err(StagingRemovalError::Io(error)) => archive_error(ArchiveError::Io(error)),
+    }
+}
+
+/// Reports the stored self-check result including its findings (Issue 0081).
+///
+/// `status` carries the counts, which is all a poll needs; the findings name the
+/// revisions, refs and staging directories those counts are about, and before
+/// this route the only way to read one was `modelkeep self-check` inside the
+/// container. This reads stored state and starts no walk.
+async fn self_check_result(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+    if !authorized(&state.config, &headers) {
+        return unauthorized(&state.config);
+    }
+    Json(SelfCheckView::from_state(state.archive.self_check_state())).into_response()
+}
+
+/// Runs the self-check now and answers with the fresh result (Issue 0081).
+///
+/// The stored result is from startup on purpose, so re-verifying after acting on
+/// a finding previously required a restart or a CLI inside the container. The
+/// check reads manifests and file metadata and repairs nothing, but it walks the
+/// archive, so it is a state-changing request in the only sense that matters
+/// here: it is explicitly asked for, it replaces the stored result, and it costs
+/// I/O. It therefore carries the CSRF requirement, and runs on a blocking task
+/// so the walk does not occupy an async worker.
+async fn run_self_check(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+    if !authorized(&state.config, &headers) {
+        return unauthorized(&state.config);
+    }
+    if !csrf_authorized(&headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: "csrf_required",
+            }),
+        )
+            .into_response();
+    }
+    // A check already in flight is answered rather than duplicated: two walks of
+    // the same archive would double the I/O and report the same thing.
+    if matches!(state.archive.self_check_state(), SelfCheckState::Running) {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorBody {
+                error: "self_check_running",
+            }),
+        )
+            .into_response();
+    }
+    let archive = state.archive.clone();
+    match tokio::task::spawn_blocking(move || archive.self_check()).await {
+        Ok(report) => Json(SelfCheckView::from_report(&report)).into_response(),
+        Err(error) => {
+            tracing::error!(
+                event = "admin_archive_error",
+                error = %error,
+                "management archive query failed"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody {
+                    error: "archive_error",
+                }),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -4636,5 +4855,671 @@ mod tests {
         assert_eq!(again["cancellation"], "already_terminal");
         assert_eq!(again["state"], "cancelled");
         fetcher.release();
+    }
+    const STAGING_COMMIT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    /// One staging directory left in the temporary area, as an interrupted
+    /// acquisition or a foreign writer under a shared volume would leave it.
+    ///
+    /// The byte and file totals are accumulated from what this writes, so the
+    /// listing's measurement is compared against an independent count rather
+    /// than against a second copy of the walk it is meant to prove.
+    struct Staging {
+        path: PathBuf,
+        bytes: u64,
+        files: usize,
+    }
+
+    fn leave_staging(
+        root: &std::path::Path,
+        name: &str,
+        expires_at: Option<u64>,
+        commit: Option<&str>,
+        payload: &[u8],
+    ) -> Staging {
+        let path = root.join("tmp").join(name);
+        fs::create_dir_all(path.join("nested")).unwrap();
+        let mut staging = Staging {
+            path: path.clone(),
+            bytes: 0,
+            files: 0,
+        };
+        let mut write = |target: PathBuf, contents: &[u8]| {
+            fs::write(&target, contents).unwrap();
+            staging.bytes += contents.len() as u64;
+            staging.files += 1;
+        };
+        write(path.join("nested/partial.bin"), payload);
+        if let Some(expires_at) = expires_at {
+            let lease = format!("nonce=fixture\npid=1\nexpires_at={expires_at}\n");
+            write(path.join(".modelkeep-staging-lease"), lease.as_bytes());
+        }
+        if let Some(commit) = commit {
+            let identity = serde_json::json!({
+                "version": 1,
+                "repo_type": "model",
+                "repo_id": "org/model",
+                "requested_revision": "main",
+                "files": [],
+                "resolved_commit": commit,
+            })
+            .to_string();
+            write(path.join(".modelkeep-fetch.json"), identity.as_bytes());
+        }
+        staging
+    }
+
+    fn publish_fixture_revision(archive: &Archive) {
+        archive
+            .publish_revision(PublishRequest {
+                repo_id: "org/model".into(),
+                requested_revision: "main".into(),
+                commit: STAGING_COMMIT.into(),
+                files: vec![ArchiveFile {
+                    path: "config.json".into(),
+                    bytes: b"{}".to_vec(),
+                }],
+            })
+            .unwrap();
+        archive
+            .update_ref("org/model", "main", STAGING_COMMIT)
+            .unwrap();
+    }
+
+    /// Digest of the published archive namespaces, names and bytes included.
+    fn published_digest(root: &std::path::Path) -> String {
+        fn walk(path: &std::path::Path, base: &std::path::Path, entries: &mut Vec<String>) {
+            let mut children: Vec<_> = match fs::read_dir(path) {
+                Ok(entries) => entries.filter_map(Result::ok).collect(),
+                Err(_) => return,
+            };
+            children.sort_by_key(std::fs::DirEntry::file_name);
+            for child in children {
+                let relative = child
+                    .path()
+                    .strip_prefix(base)
+                    .unwrap()
+                    .display()
+                    .to_string();
+                if child.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    entries.push(format!("{relative}\0dir"));
+                    walk(&child.path(), base, entries);
+                } else {
+                    let bytes = fs::read(child.path()).unwrap_or_default();
+                    entries.push(format!(
+                        "{relative}\0{}",
+                        Sha256::digest(&bytes)
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<String>()
+                    ));
+                }
+            }
+        }
+        let mut entries = Vec::new();
+        for namespace in ["models", "datasets"] {
+            walk(&root.join(namespace), root, &mut entries);
+        }
+        Sha256::digest(entries.join("\n").as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    async fn json_body(response: Response) -> serde_json::Value {
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
+    }
+
+    fn staging_request(method: &str, name: &str, csrf: bool, token: Option<&str>) -> Request<Body> {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(format!("/api/admin/v1/staging/{name}"));
+        if let Some(token) = token {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        if csrf {
+            request = request.header("x-modelkeep-csrf", "1");
+        }
+        request.body(Body::empty()).unwrap()
+    }
+
+    fn future_expiry() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3_600
+    }
+
+    #[tokio::test]
+    async fn management_lists_retained_staging_by_retention_kind_and_measured_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        publish_fixture_revision(&archive);
+        let root = directory.path();
+        let resumable = leave_staging(
+            root,
+            "fetch-abandoned-resumable",
+            Some(0),
+            Some(STAGING_COMMIT),
+            &vec![b'r'; 4_096],
+        );
+        let live = leave_staging(
+            root,
+            ".fetch-active-live",
+            Some(future_expiry()),
+            Some(STAGING_COMMIT),
+            b"live",
+        );
+        let unreadable = leave_staging(
+            root,
+            "fetch-abandoned-unreadable",
+            None,
+            Some(STAGING_COMMIT),
+            b"kept-for-inspection",
+        );
+        let stale = leave_staging(root, "stale-junk", Some(0), None, b"junk");
+        let app = router(
+            archive.clone(),
+            Config::token("127.0.0.1:0".parse().unwrap(), "secret"),
+            None,
+        )
+        .unwrap();
+
+        let denied = app
+            .clone()
+            .oneshot(request("/api/admin/v1/staging", None))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let listed = app
+            .oneshot(request("/api/admin/v1/staging", Some("secret")))
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed = json_body(listed).await;
+        let items = listed["items"].as_array().unwrap();
+        assert_eq!(items.len(), 4, "{listed}");
+        let by_name: BTreeMap<&str, &serde_json::Value> = items
+            .iter()
+            .map(|item| (item["name"].as_str().unwrap(), item))
+            .collect();
+
+        // Four directories with no live lease between them would be one
+        // `orphaned_staging` count of three plus one live acquisition, and the
+        // right action differs for every one of them.
+        assert_eq!(
+            listed["retained_by_kind"],
+            serde_json::json!({
+                "active": 1,
+                "resumable": 1,
+                "stale": 1,
+                "unreadable_lease": 1,
+            }),
+            "{listed}"
+        );
+
+        let entry = by_name["fetch-abandoned-resumable"];
+        assert_eq!(entry["retention"], "resumable");
+        assert_eq!(entry["adoptable"], true);
+        assert_eq!(entry["removable"], true);
+        assert_eq!(entry["repo_id"], "org/model");
+        assert_eq!(entry["repo_type"], "model");
+        assert_eq!(entry["requested_revision"], "main");
+        assert_eq!(entry["commit"], STAGING_COMMIT);
+        assert_eq!(entry["selection"], serde_json::json!([]));
+        // The size Issue 0082 needs is this directory's own, measured, not the
+        // archive filesystem's free space.
+        assert_eq!(entry["size_bytes"], resumable.bytes);
+        assert_eq!(entry["file_count"], resumable.files);
+        assert_eq!(entry["size_complete"], true);
+        assert_eq!(entry["lease_expires_in_seconds"], 0);
+        assert!(entry["recovery_skipped_action"].is_null());
+
+        let entry = by_name[".fetch-active-live"];
+        assert_eq!(entry["retention"], "active");
+        assert_eq!(entry["removable"], false);
+        assert_eq!(entry["adoptable"], false);
+        assert_eq!(entry["size_bytes"], live.bytes);
+        assert!(entry["lease_expires_in_seconds"].as_u64().unwrap() > 0);
+
+        let entry = by_name["fetch-abandoned-unreadable"];
+        assert_eq!(entry["retention"], "unreadable_lease");
+        // ADR-0009 keeps it for inspection and no acquisition adopts it, so
+        // saying it is resumable would send an operator to a resume that never
+        // happens.
+        assert_eq!(entry["adoptable"], false);
+        assert_eq!(entry["removable"], true);
+        assert_eq!(entry["size_bytes"], unreadable.bytes);
+
+        let entry = by_name["stale-junk"];
+        assert_eq!(entry["retention"], "stale");
+        assert_eq!(entry["adoptable"], false);
+        assert_eq!(entry["removable"], true);
+        assert!(entry["repo_id"].is_null());
+        assert_eq!(entry["size_bytes"], stale.bytes);
+
+        assert_eq!(
+            listed["total_bytes"].as_u64().unwrap(),
+            resumable.bytes + live.bytes + unreadable.bytes + stale.bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn named_staging_is_removed_while_published_revisions_are_untouched() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        publish_fixture_revision(&archive);
+        let root = directory.path();
+        let resumable = leave_staging(
+            root,
+            "fetch-abandoned-removable",
+            Some(0),
+            Some(STAGING_COMMIT),
+            &vec![b'p'; 2_048],
+        );
+        let live = leave_staging(
+            root,
+            ".fetch-active-running",
+            Some(future_expiry()),
+            Some(STAGING_COMMIT),
+            b"in-flight",
+        );
+        let app = router(
+            archive.clone(),
+            Config::token("127.0.0.1:0".parse().unwrap(), "secret"),
+            None,
+        )
+        .unwrap();
+        let published = published_digest(root);
+
+        // Same authorization and CSRF requirements as every other
+        // state-changing management request (ADR-0015).
+        let unauthenticated = app
+            .clone()
+            .oneshot(staging_request(
+                "DELETE",
+                "fetch-abandoned-removable",
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        let no_csrf = app
+            .clone()
+            .oneshot(staging_request(
+                "DELETE",
+                "fetch-abandoned-removable",
+                false,
+                Some("secret"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(no_csrf.status(), StatusCode::FORBIDDEN);
+
+        // A lease that has not expired is a live acquisition, whatever else the
+        // operator believes about the directory.
+        let refused = app
+            .clone()
+            .oneshot(staging_request(
+                "DELETE",
+                ".fetch-active-running",
+                true,
+                Some("secret"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        let refused = json_body(refused).await;
+        assert_eq!(refused["error"], "staging_active");
+        assert!(refused["lease_expires_in_seconds"].as_u64().unwrap() > 0);
+        assert!(
+            live.path.is_dir(),
+            "a live acquisition's staging was removed"
+        );
+        assert!(live.path.join("nested/partial.bin").is_file());
+
+        let missing = app
+            .clone()
+            .oneshot(staging_request(
+                "DELETE",
+                "fetch-abandoned-absent",
+                true,
+                Some("secret"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let removed = app
+            .clone()
+            .oneshot(staging_request(
+                "DELETE",
+                "fetch-abandoned-removable",
+                true,
+                Some("secret"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(removed.status(), StatusCode::OK);
+        let removed = json_body(removed).await;
+        assert_eq!(removed["name"], "fetch-abandoned-removable");
+        assert_eq!(removed["retention"], "resumable");
+        assert_eq!(removed["size_bytes"], resumable.bytes);
+        assert_eq!(removed["file_count"], resumable.files);
+        assert!(!resumable.path.exists());
+
+        // Removing staging is not archive deletion: every published revision,
+        // ref and manifest is byte-for-byte what it was, and the revision still
+        // resolves.
+        assert_eq!(published_digest(root), published);
+        assert!(archive
+            .is_complete_revision("org/model", STAGING_COMMIT)
+            .unwrap());
+        assert!(live.path.is_dir());
+
+        let again = app
+            .oneshot(staging_request(
+                "DELETE",
+                "fetch-abandoned-removable",
+                true,
+                Some("secret"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(again.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn staging_removal_refuses_every_name_that_leaves_the_temporary_area() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        publish_fixture_revision(&archive);
+        let root = directory.path();
+        let published = published_digest(root);
+        let revision = root.join("models/org/model/revisions").join(STAGING_COMMIT);
+        assert!(revision.is_dir());
+        // A symlink under the temporary area must not be followed either.
+        std::os::unix::fs::symlink(&revision, root.join("tmp/linked-revision")).unwrap();
+        let app = router(
+            archive.clone(),
+            Config::token("127.0.0.1:0".parse().unwrap(), "secret"),
+            None,
+        )
+        .unwrap();
+
+        // Each of these is a name an operator could type or a client could
+        // construct; none of them may reach outside `tmp`. The published
+        // revision is the target that would be destroyed if the name were
+        // joined to the temporary area without validation.
+        for name in [
+            "..%2Fmodels%2Forg%2Fmodel%2Frevisions%2Faaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "..%2F..%2Fmodels",
+            "..%2Fmodels",
+            "%2E%2E%2Fmodels",
+            "..",
+            ".",
+            "%2Fetc%2Fpasswd",
+            "nested%2Fpath",
+            "fetch%00abandoned",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(staging_request("DELETE", name, true, Some("secret")))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{name} was not refused as an unsafe name"
+            );
+            let body = json_body(response).await;
+            assert_eq!(body["error"], "invalid_request");
+            // The rejected name is never echoed back.
+            assert!(!body.to_string().contains("models"), "{name}: {body}");
+        }
+
+        // A safe component that names an archive namespace is still only ever
+        // looked for under `tmp`, where it does not exist.
+        let namespace = app
+            .clone()
+            .oneshot(staging_request("DELETE", "models", true, Some("secret")))
+            .await
+            .unwrap();
+        assert_eq!(namespace.status(), StatusCode::NOT_FOUND);
+
+        let linked = app
+            .clone()
+            .oneshot(staging_request(
+                "DELETE",
+                "linked-revision",
+                true,
+                Some("secret"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(linked.status(), StatusCode::BAD_REQUEST);
+
+        // A name something else on a shared volume chose is reported as one that
+        // cannot be removed, and the removal agrees: a listing that offered a
+        // display name a removal would not accept would be worse than not
+        // offering it.
+        fs::create_dir(root.join("tmp/foreign  name")).unwrap();
+        let listed = app
+            .clone()
+            .oneshot(request("/api/admin/v1/staging", Some("secret")))
+            .await
+            .unwrap();
+        let listed = json_body(listed).await;
+        let foreign = listed["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "foreign name")
+            .unwrap_or_else(|| panic!("{listed}"));
+        assert_eq!(foreign["removable"], false, "{foreign}");
+        let refused = app
+            .clone()
+            .oneshot(staging_request(
+                "DELETE",
+                "foreign%20%20name",
+                true,
+                Some("secret"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert!(root.join("tmp/foreign  name").is_dir());
+
+        assert!(
+            revision.is_dir(),
+            "a rejected name reached a published revision"
+        );
+        assert_eq!(published_digest(root), published);
+    }
+
+    #[tokio::test]
+    async fn a_status_poll_never_starts_a_staging_walk() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        publish_fixture_revision(&archive);
+        let measured = leave_staging(
+            directory.path(),
+            "fetch-abandoned-measured",
+            Some(0),
+            Some(STAGING_COMMIT),
+            &vec![b'm'; 1_024],
+        );
+        let app = router(
+            archive.clone(),
+            Config::token("127.0.0.1:0".parse().unwrap(), "secret"),
+            None,
+        )
+        .unwrap();
+
+        for _ in 0..3 {
+            let status = app
+                .clone()
+                .oneshot(request("/api/admin/v1/status", Some("secret")))
+                .await
+                .unwrap();
+            assert_eq!(status.status(), StatusCode::OK);
+            let status = json_body(status).await;
+            // The stored self-check result is what a poll reports; that is why
+            // it is stored.
+            assert!(status["self_check"].is_object());
+        }
+        assert_eq!(
+            archive.staging_scans(),
+            0,
+            "a status poll measured staging, which is an archive walk a poll must not start"
+        );
+
+        // Nor does the check itself measure sizes: every restart runs it.
+        archive.self_check();
+        let triggered = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/v1/self-check")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .header("x-modelkeep-csrf", "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(triggered.status(), StatusCode::OK);
+        assert_eq!(archive.staging_scans(), 0);
+
+        // The listing is the route that measures, because that is the answer it
+        // exists to give.
+        let listed = app
+            .oneshot(request("/api/admin/v1/staging", Some("secret")))
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(listed).await["items"][0]["size_bytes"],
+            measured.bytes
+        );
+        assert_eq!(archive.staging_scans(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_self_check_is_triggerable_and_its_findings_name_the_staging_listed() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        publish_fixture_revision(&archive);
+        leave_staging(
+            directory.path(),
+            "fetch-abandoned-reported",
+            Some(0),
+            Some(STAGING_COMMIT),
+            b"partial",
+        );
+        let app = router(
+            archive.clone(),
+            Config::token("127.0.0.1:0".parse().unwrap(), "secret"),
+            None,
+        )
+        .unwrap();
+        let trigger = |csrf: bool, token: Option<&'static str>| {
+            let app = app.clone();
+            async move {
+                let mut request = Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/v1/self-check");
+                if let Some(token) = token {
+                    request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+                }
+                if csrf {
+                    request = request.header("x-modelkeep-csrf", "1");
+                }
+                app.oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // Before the first run the route says so rather than inventing a result.
+        let stored = app
+            .clone()
+            .oneshot(request("/api/admin/v1/self-check", Some("secret")))
+            .await
+            .unwrap();
+        assert_eq!(stored.status(), StatusCode::OK);
+        let stored = json_body(stored).await;
+        assert_eq!(stored["status"], "never_run");
+        assert_eq!(stored["findings"], serde_json::json!([]));
+
+        assert_eq!(trigger(true, None).await.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            trigger(false, Some("secret")).await.status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let fresh = trigger(true, Some("secret")).await;
+        assert_eq!(fresh.status(), StatusCode::OK);
+        let fresh = json_body(fresh).await;
+        assert_eq!(fresh["status"], "findings");
+        assert_eq!(fresh["orphaned_staging_directories"], 1);
+        assert_eq!(
+            fresh["findings_by_kind"],
+            serde_json::json!({"orphaned_staging": 1})
+        );
+        let finding = &fresh["findings"][0];
+        assert_eq!(finding["finding"], "orphaned_staging");
+        // The finding's `path` is the entry's name, which is what the staging
+        // listing keys on: that join is the reconciliation, and it needs no log
+        // and no CLI inside the container.
+        assert_eq!(finding["path"], "fetch-abandoned-reported");
+        assert!(finding["age_seconds"].is_number());
+
+        let listed = app
+            .clone()
+            .oneshot(request("/api/admin/v1/staging", Some("secret")))
+            .await
+            .unwrap();
+        let listed = json_body(listed).await;
+        assert_eq!(listed["items"][0]["name"], finding["path"]);
+        assert_eq!(listed["items"][0]["retention"], "resumable");
+
+        // A status poll now reports the fresh result, without having triggered
+        // it and without a restart.
+        let status = app
+            .clone()
+            .oneshot(request("/api/admin/v1/status", Some("secret")))
+            .await
+            .unwrap();
+        let status = json_body(status).await;
+        assert_eq!(status["self_check"]["status"], "findings");
+        assert_eq!(status["self_check"]["orphaned_staging_directories"], 1);
+
+        // Acting on the finding and re-verifying it is one request each.
+        let removed = app
+            .clone()
+            .oneshot(staging_request(
+                "DELETE",
+                "fetch-abandoned-reported",
+                true,
+                Some("secret"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(removed.status(), StatusCode::OK);
+
+        let after = json_body(trigger(true, Some("secret")).await).await;
+        assert_eq!(after["status"], "clean");
+        assert_eq!(after["orphaned_staging_directories"], 0);
+        assert_eq!(after["findings"], serde_json::json!([]));
+        let stored = app
+            .oneshot(request("/api/admin/v1/self-check", Some("secret")))
+            .await
+            .unwrap();
+        assert_eq!(json_body(stored).await["status"], "clean");
     }
 }
