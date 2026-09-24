@@ -89,24 +89,34 @@ volume, and Xet working.
 So the working hypothesis is that the plain HTTP path stages partial data somewhere the
 reporter does not see, while the Xet path stages it where it does.
 
-**The mechanism is not established.** Two candidates were checked and neither explains
-Measurement A:
+**The mechanism is not established.** The candidates checked so far are ruled out, and one of
+them turned out to be a real defect of its own.
 
 - The reporter globs `*.incomplete` non-recursively under
-  `<output>/.cache/huggingface/download`. The client's `incomplete_path` builds
-  `metadata_path.parent / "{short_hash}.{etag}.incomplete"`, and `metadata_path.parent`
-  mirrors the repository's subdirectory structure, so files in subdirectories are indeed
-  missed. But `Qwen/Qwen2.5-3B-Instruct`'s shards are at the repository root, where the glob
-  does match.
+  `<output>/.cache/huggingface/download`. **Measured**, and recorded in
+  [`hugging-face-partial-download-layout-2026-09-24.md`](../observations/hugging-face-partial-download-layout-2026-09-24.md):
+  the client's `incomplete_path` puts a root-level file's partial data directly under
+  `download/` and a subdirectory file's under a subdirectory of the same shape, so
+  `onnx/model.onnx` is invisible to that glob while `config.json` is not. **That is a defect
+  reachable by inspection — a selection whose large files live in subdirectories has none of
+  its in-flight bytes counted — but it does not explain Measurement A**, whose
+  `Qwen/Qwen2.5-3B-Instruct` shards are at the repository root where the glob does match.
 - The helper passes `local_dir`, so the local-folder layout applies in both measurements. The
   blob-cache layout, whose incomplete files live somewhere else entirely, is not in play.
 
+So the glob is excluded as the cause of Measurement A and is being fixed on its own merits.
+What remains unexplained is where roughly 2.68 GB of that job's bytes were while the reported
+figure did not count them.
+
 ## Scope
 
-1. Establish the mechanism before changing the reporter. Reproduce Measurement A's shape with
-   Xet disabled for the helper process and inspect the staging layout on disk while the
-   transfer runs. Record the finding as an observation under `docs/observations/`, keeping the
-   upstream client behaviour separate from ModelKeep's policy.
+1. Establish the mechanism. **Partly done**: the staging layout is measured and recorded in
+   [`hugging-face-partial-download-layout-2026-09-24.md`](../observations/hugging-face-partial-download-layout-2026-09-24.md),
+   which excludes the glob as Measurement A's cause. What is left is a transfer of
+   Measurement A's shape with Xet disabled and then enabled, **comparing the staging
+   directory's actual size** rather than the archive filesystem's free space — measuring the
+   shared volume's free space is what made the original report wrong. This needs the
+   deployment.
 2. Count the bytes of files in flight on both paths.
 3. Fix the non-recursive glob regardless of whether it explains Measurement A. A repository
    whose large files live in subdirectories is under-reported today, and that is a defect
@@ -119,7 +129,8 @@ Measurement A:
 ## Acceptance criteria
 
 - The mechanism behind Measurement A is named in an observation record, with the on-disk
-  staging layout that produced it.
+  staging layout that produced it. **Still open.** The layout is recorded and the glob is
+  excluded; where Measurement A's missing bytes were is not established.
 - For an acquisition whose selection is dominated by a few large files, reported progress
   tracks bytes arriving rather than file completions, on both transfer paths. A test drives a
   fixture whose files are large relative to the reporting interval and asserts the reported
