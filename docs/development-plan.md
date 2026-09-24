@@ -910,6 +910,7 @@ MVP 後の候補:
 - ~~Hubのfieldをそのmeaningで報告し、ModelKeepのdigestは独自propertyへ — [Issue 0079](https://github.com/kaznak/modelkeep/commit/3e95df9)~~
 - ~~起動時のarchive自己検査（上流非依存・自動修復なし） — [Issue 0073](https://github.com/kaznak/modelkeep/commit/c6f5120)~~。運用手段は[Issue 0081](issues/0081-give-the-operator-actions-for-what-the-self-check-reports.md)
 - ~~構造化eventリファレンスの完成とずれを防ぐcheck — [Issue 0075](https://github.com/kaznak/modelkeep/commit/628a079)~~
+- ~~全archive failureのlogging（`_ => {}`の除去と、失敗対象を名指しする境界づけ済みfield） — [Issue 0085](https://github.com/kaznak/modelkeep/commit/0f465c9)~~。0083のconflictが「どこから来たか」をlogが答えられなかったdefect
 - ~~cancellation testのflakiness除去（pidの存在待ちから値待ちへ） — [Issue 0080](https://github.com/kaznak/modelkeep/commit/fe66666)~~。原因はtest側で、空pidが`/proc/`に解決してアサーション2件を空振りさせていた
 - ~~失効したactive fetch stagingの解放（lease判定を両marker classで対称にし、staging collisionをpublication conflictと別classに） — [Issue 0083](https://github.com/kaznak/modelkeep/commit/ead60a6)、[job classの分離](https://github.com/kaznak/modelkeep/commit/08d94ab)~~。実機で8.94 GBのstagingが全再投入を0秒で拒否していた defect
 - ~~中断した上流取得の安全な再開 — [Issue 0056](https://github.com/kaznak/modelkeep/commit/41cbe67)~~。実機drillで73,025,919,893 bytesの選択を force-stop し、8,943,738,646 bytesを引き継いで`outcome: published`まで完走（転送は12.25%減）
