@@ -991,7 +991,8 @@ fn status_for_pullthrough_error(error: PullThroughError) -> StatusCode {
         PullThroughError::UnsafePath => StatusCode::BAD_REQUEST,
         PullThroughError::UpstreamInvalidOutput(_)
         | PullThroughError::Integrity
-        | PullThroughError::Conflict => StatusCode::INTERNAL_SERVER_ERROR,
+        | PullThroughError::Conflict
+        | PullThroughError::StagingConflict => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 

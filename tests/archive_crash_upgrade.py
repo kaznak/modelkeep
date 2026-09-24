@@ -559,7 +559,11 @@ def killed_acquisition_resume_check(current, root):
             assert killed.is_dir(), "recovery reclaimed staging whose lease was live"
             refused = await_terminal_job(admin, submit_prefetch(admin, "killed-live"))
             assert refused["state"] == "failed", refused
+            # The job record names the collision as its own class, and never as
+            # the publication conflict it is not (Issue 0083).
+            assert refused["error_class"] == "staging_conflict", refused
             assert "publication" not in (refused["message"] or ""), refused
+            assert "staging" in (refused["message"] or ""), refused
             assert killed.is_dir(), "a refused acquisition removed the staging"
             assert (
                 transfer_records(transfers) == first

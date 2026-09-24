@@ -139,8 +139,13 @@ For an acquisition that failed for a reason its class does not give on its own,
 reports, so the Admin API and the container log agree. This is what replaced
 `upstream acquisition failed`, which said nothing an operator could act on.
 The `error_class` of the job record stays at the granularity the Admin API
-already defines (`upstream`, `not_found`, `authorization`, …); the helper's finer
-class is in `upstream_fetch_failed.error_class` and at the start of the reason.
+already defines (`upstream`, `not_found`, `authorization`, `integrity`, `storage`,
+`unsafe_path`, `conflict`, `staging_conflict`, `referenced`, `cancelled`,
+`interrupted`, `upstream_disabled`); the helper's finer class is in
+`upstream_fetch_failed.error_class` and at the start of the reason.
+`conflict` is a publication the archive refused, and `staging_conflict` is fetch
+staging held by a running acquisition ("Fetch staging collisions and recovery"
+below): a job that never published anything is never reported under `conflict`.
 What keeps this text free of credentials is not that the error carries no
 payload — it now does — but that the reason can only have come from the helper's
 own sanitizer by way of ModelKeep's bounding: the only way to obtain one is to
@@ -221,10 +226,11 @@ long that refusal can still last, which is bounded by the 120-second lease.
 It is deliberately not a publication conflict. Nothing is being published when it
 happens, and the revision may exist nowhere, so `error_class=staging_conflict`
 names the acquisition that holds the work rather than the archive (Issue 0083).
-The `error_class` of a management job record stays at the coarser granularity the
-management API defines (`conflict`), as it does for an upstream failure whose finer
-class lives in `upstream_fetch_failed.error_class`; the job's message names staging
-and never claims a publication.
+A management job refused this way carries the same class: its `error_class` is
+`staging_conflict` and its `message` names staging, while `conflict` keeps its
+older and narrower meaning of a publication the archive refused. The two are
+separate classes because they send an operator to different places — one to the
+acquisition that is running, one to the archive.
 
 Staging left behind by a process that was killed emits nothing at the time — the
 process is gone. It is reclaimed by whichever comes first:

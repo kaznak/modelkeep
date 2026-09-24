@@ -552,12 +552,15 @@ pub enum PullThroughError {
     Integrity,
     Storage,
     /// Another operation already holds the work this acquisition needed: a
-    /// published revision it would have published over, or fetch staging held by
-    /// a running acquisition (Issue 0083).
-    ///
-    /// The two are different subsystems, so neither the message nor the
-    /// `fetch_staging_conflict` event calls a staging collision a publication.
+    /// published revision it would have published over.
     Conflict,
+    /// Fetch staging for this identity is held by a running acquisition
+    /// (Issue 0083).
+    ///
+    /// This is a different subsystem from publication: nothing was being
+    /// published, and a revision of this repository need not exist. It has its
+    /// own class so an operator is not sent to look at the archive.
+    StagingConflict,
     /// The acquisition was stopped on request (Issue 0076).
     ///
     /// It is an interruption, not a miss and not a failure of upstream: nothing
@@ -581,9 +584,8 @@ impl std::fmt::Display for PullThroughError {
             Self::UnsafePath => "unsafe archive path",
             Self::Integrity => "archive integrity failure",
             Self::Storage => "archive storage failure",
-            Self::Conflict => {
-                "archive conflict: another operation holds this revision or its fetch staging"
-            }
+            Self::Conflict => "archive publication conflict",
+            Self::StagingConflict => "fetch staging is held by a running acquisition",
             Self::Cancelled => "acquisition cancelled",
         };
         formatter.write_str(message)
@@ -2016,7 +2018,7 @@ fn fetch_staging_failure(
     error: FetchStagingError,
 ) -> PullThroughError {
     match error {
-        FetchStagingError::InFlight(_) => PullThroughError::Conflict,
+        FetchStagingError::InFlight(_) => PullThroughError::StagingConflict,
         FetchStagingError::Archive(error) => {
             log_archive_failure(repo_type, repo_id, requested_revision, "stage", error)
         }
@@ -2703,7 +2705,7 @@ mod tests {
 
         let error = pull.ensure("org/model", "main", &[]).unwrap_err();
 
-        assert_eq!(error, PullThroughError::Conflict);
+        assert_eq!(error, PullThroughError::StagingConflict);
         // Nothing was published and no revision of this repository exists.
         assert!(!error.to_string().contains("publi"), "{error}");
         let output = writer.output();

@@ -1982,6 +1982,7 @@ fn classify_pullthrough_error(
         PullThroughError::Storage => "storage",
         PullThroughError::UnsafePath => "unsafe_path",
         PullThroughError::Conflict => "conflict",
+        PullThroughError::StagingConflict => "staging_conflict",
         // A job whose own cancellation stopped the acquisition never reaches a
         // failure record: its record is already terminal `cancelled`. This class
         // is what another job or request sharing the same acquisition sees.
@@ -2161,6 +2162,25 @@ mod tests {
             message,
             "upstream invalid output: helper returned an empty snapshot"
         );
+    }
+
+    /// Issue 0083: a job refused because staging is held by a running
+    /// acquisition is not reported as a publication conflict.
+    ///
+    /// Both directions are asserted, so swapping the two classes or the two
+    /// messages fails here: an operator reading `conflict` must be looking at
+    /// the archive, and one reading `staging_conflict` at an acquisition.
+    #[test]
+    fn a_staging_collision_is_classified_apart_from_a_publication_conflict() {
+        let (class, message) = classify_pullthrough_error(PullThroughError::StagingConflict);
+        assert_eq!(class, "staging_conflict");
+        assert!(message.contains("staging"), "{message}");
+        assert!(!message.contains("publi"), "{message}");
+
+        let (class, message) = classify_pullthrough_error(PullThroughError::Conflict);
+        assert_eq!(class, "conflict");
+        assert!(message.contains("publication"), "{message}");
+        assert!(!message.contains("staging"), "{message}");
     }
 
     /// Issue 0084: the job record carries the reason, not only the class.
