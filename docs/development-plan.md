@@ -910,6 +910,8 @@ MVP 後の候補:
 - ~~Hubのfieldをそのmeaningで報告し、ModelKeepのdigestは独自propertyへ — [Issue 0079](https://github.com/kaznak/modelkeep/commit/3e95df9)~~
 - ~~起動時のarchive自己検査（上流非依存・自動修復なし） — [Issue 0073](https://github.com/kaznak/modelkeep/commit/c6f5120)~~。運用手段は[Issue 0081](issues/0081-give-the-operator-actions-for-what-the-self-check-reports.md)
 - ~~構造化eventリファレンスの完成とずれを防ぐcheck — [Issue 0075](https://github.com/kaznak/modelkeep/commit/628a079)~~
+- ~~失効したactive fetch stagingの解放（lease判定を両marker classで対称にし、staging collisionをpublication conflictと別classに） — [Issue 0083](https://github.com/kaznak/modelkeep/commit/ead60a6)、[job classの分離](https://github.com/kaznak/modelkeep/commit/08d94ab)~~。実機で8.94 GBのstagingが全再投入を0秒で拒否していた defect
+- ~~中断した上流取得の安全な再開 — [Issue 0056](https://github.com/kaznak/modelkeep/commit/41cbe67)~~。実機drillで73,025,919,893 bytesの選択を force-stop し、8,943,738,646 bytesを引き継いで`outcome: published`まで完走（転送は12.25%減）
 - ~~acquisition失敗の理由を残す（helperがsanitizeしたtyped failure eventと、class別のupstream error） — [Issue 0084](https://github.com/kaznak/modelkeep/commit/0722668)、[job recordへの到達](https://github.com/kaznak/modelkeep/commit/178c228)~~。`error_class: "failed"`一語への収束をやめ、`SanitizedReason`型でcredential-safeを構成として保証
 - ~~委譲先clientに書けるcacheを与える（tmpfsのmode明示とXet chunk cacheのmounted volume配置） — [Issue 0086](https://github.com/kaznak/modelkeep/commit/ed4ed73)~~。root所有0755のtmpfsに`HF_HOME`を置いていたため、10001で走るcontainerではXet転送が全て`EACCES`で失敗していた
 
