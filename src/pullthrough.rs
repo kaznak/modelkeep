@@ -6,8 +6,8 @@ use serde::Serialize;
 
 use crate::singleflight::{Joined, SingleFlight};
 use crate::upstream::{
-    CancelOutcome, Cancellation, FetchProgress, FetchRequest, FileSelection, InvalidOutputReason,
-    InventoryRequest, UpstreamError, UpstreamFetcher, UpstreamRepositoryFiles,
+    CancelOutcome, Cancellation, FetchProgress, FetchRequest, FileSelection, HelperFailureClass,
+    InvalidOutputReason, InventoryRequest, UpstreamError, UpstreamFetcher, UpstreamRepositoryFiles,
 };
 use crate::{is_hf_commit, Archive, ArchiveError, RepositoryType, SourceFile, UpstreamFile};
 
@@ -1905,6 +1905,11 @@ fn upstream_error_class(error: &UpstreamError) -> &'static str {
         UpstreamError::Storage => "storage",
         UpstreamError::Failed => "failed",
         UpstreamError::Io(_) => "io",
+        // A class the helper established for itself (Issue 0084). A reported
+        // class and the same class carried by a bare variant report the same
+        // name, so the event's vocabulary does not depend on which path
+        // produced it.
+        UpstreamError::HelperFailure(failure) => failure.class().as_str(),
         // A cancelled acquisition is reported by `acquisition_cancelled`, not as
         // an upstream failure; this arm exists so the mapping stays total.
         UpstreamError::Cancelled => "cancelled",
@@ -1918,6 +1923,11 @@ fn log_fetch_failure(
     operation: &str,
     error: &UpstreamError,
 ) {
+    // `safe_reason` is the sanitized reason the helper reported for itself
+    // (Issue 0084), or ModelKeep's own description when the failure did not come
+    // from one. Raw helper output still never reaches a log: helper stderr stays
+    // discarded, and the reported diagnostic was sanitized in the helper, where
+    // the exception and its context are known.
     tracing::warn!(
         event = "upstream_fetch_failed",
         repo_type = %repo_type,
@@ -1925,6 +1935,7 @@ fn log_fetch_failure(
         requested_revision = %requested_revision,
         operation,
         error_class = upstream_error_class(error),
+        safe_reason = %error.safe_reason(),
         "upstream fetch failed"
     );
 }
@@ -1970,6 +1981,21 @@ impl From<UpstreamError> for PullThroughError {
             UpstreamError::InvalidOutput(reason) => Self::UpstreamInvalidOutput(reason),
             UpstreamError::Storage => Self::Storage,
             UpstreamError::Failed | UpstreamError::Io(_) => Self::UpstreamFailed,
+            // A reported class decides the request-facing answer (Issue 0084).
+            // `PullThroughError` is deliberately a payload-free `Copy` error, so
+            // the class maps onto the answers that already exist and the
+            // sanitized diagnostic travels in the structured event rather than
+            // in the error value: rate limiting is an upstream that would not
+            // serve this acquisition now, which is what `UpstreamUnavailable`
+            // already means to a client.
+            UpstreamError::HelperFailure(failure) => match failure.class() {
+                HelperFailureClass::Unavailable | HelperFailureClass::RateLimited => {
+                    Self::UpstreamUnavailable
+                }
+                HelperFailureClass::NotFound => Self::UpstreamNotFound,
+                HelperFailureClass::Unauthorized => Self::UpstreamUnauthorized,
+                HelperFailureClass::ClientFailure => Self::UpstreamFailed,
+            },
             UpstreamError::Cancelled => Self::Cancelled,
         }
     }
@@ -2634,6 +2660,143 @@ mod tests {
         assert!(output.contains("invalid_output"));
         assert!(!output.contains("signed-url-secret"));
         assert!(!output.contains("bearer-secret"));
+    }
+
+    struct ReportedFailureFetcher(UpstreamError);
+
+    impl UpstreamFetcher for ReportedFailureFetcher {
+        fn fetch(&self, _request: &FetchRequest) -> Result<FetchedRevision, UpstreamError> {
+            Err(match &self.0 {
+                UpstreamError::HelperFailure(failure) => {
+                    UpstreamError::HelperFailure(failure.clone())
+                }
+                UpstreamError::InvalidOutput(reason) => UpstreamError::InvalidOutput(*reason),
+                other => panic!("unsupported fixture error {other:?}"),
+            })
+        }
+    }
+
+    /// Issue 0084: the class and the sanitized reason the helper established both
+    /// reach the structured event, so the failure that took a day of
+    /// investigation is legible in one log read.
+    #[test]
+    fn fetch_failure_event_carries_the_reported_class_and_reason() {
+        let (writer, _guard) = capture_logs();
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let failure = crate::upstream::HelperFailure::reported(
+            HelperFailureClass::ClientFailure,
+            Some("PermissionError"),
+            Some("PermissionError: [Errno 13] Permission denied: '/hf-home/hub'"),
+        );
+        let pull = PullThrough::new(
+            archive,
+            Arc::new(ReportedFailureFetcher(UpstreamError::HelperFailure(
+                failure,
+            ))),
+        );
+
+        assert_eq!(
+            pull.ensure("org/model", "main", &[]),
+            Err(PullThroughError::UpstreamFailed)
+        );
+
+        let output = writer.output();
+        assert!(output.contains("upstream_fetch_failed"), "{output}");
+        assert!(
+            output.contains(r#""error_class":"client_failure""#),
+            "{output}"
+        );
+        assert!(!output.contains(r#""error_class":"failed""#), "{output}");
+        assert!(
+            output
+                .contains("upstream client failure: PermissionError: [Errno 13] Permission denied"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn each_reported_class_is_recorded_under_its_own_name() {
+        for (class, expected_name, expected_error) in [
+            (
+                HelperFailureClass::Unavailable,
+                "unavailable",
+                PullThroughError::UpstreamUnavailable,
+            ),
+            (
+                HelperFailureClass::NotFound,
+                "not_found",
+                PullThroughError::UpstreamNotFound,
+            ),
+            (
+                HelperFailureClass::Unauthorized,
+                "unauthorized",
+                PullThroughError::UpstreamUnauthorized,
+            ),
+            (
+                HelperFailureClass::RateLimited,
+                "rate_limited",
+                PullThroughError::UpstreamUnavailable,
+            ),
+            (
+                HelperFailureClass::ClientFailure,
+                "client_failure",
+                PullThroughError::UpstreamFailed,
+            ),
+        ] {
+            let (writer, guard) = capture_logs();
+            let root = tempfile::tempdir().unwrap();
+            let archive = Archive::new(root.path()).unwrap();
+            let pull = PullThrough::new(
+                archive,
+                Arc::new(ReportedFailureFetcher(UpstreamError::HelperFailure(
+                    crate::upstream::HelperFailure::from_class(class),
+                ))),
+            );
+
+            assert_eq!(pull.ensure("org/model", "main", &[]), Err(expected_error));
+
+            let output = writer.output();
+            assert!(
+                output.contains(&format!(r#""error_class":"{expected_name}""#)),
+                "{class:?} was not recorded as {expected_name}: {output}"
+            );
+            drop(guard);
+        }
+    }
+
+    /// A helper that failed without reporting why is reported as the helper's own
+    /// contract failure, which is a different thing an operator does a different
+    /// thing about than an upstream failure whose class nobody established.
+    #[test]
+    fn a_helper_that_reported_nothing_is_a_contract_failure() {
+        let (writer, _guard) = capture_logs();
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let pull = PullThrough::new(
+            archive,
+            Arc::new(ReportedFailureFetcher(UpstreamError::InvalidOutput(
+                InvalidOutputReason::MissingFailureEvent,
+            ))),
+        );
+
+        assert_eq!(
+            pull.ensure("org/model", "main", &[]),
+            Err(PullThroughError::UpstreamInvalidOutput(
+                InvalidOutputReason::MissingFailureEvent
+            ))
+        );
+
+        let output = writer.output();
+        assert!(
+            output.contains(r#""error_class":"invalid_output""#),
+            "{output}"
+        );
+        assert!(
+            output.contains("helper failed without reporting a failure event"),
+            "{output}"
+        );
+        assert!(!output.contains("upstream acquisition failed"), "{output}");
     }
 
     struct DuplicateOutputFetcher;

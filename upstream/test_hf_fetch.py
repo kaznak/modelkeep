@@ -459,5 +459,217 @@ class HfFetchTests(unittest.TestCase):
         self.assertFalse(download_called)
 
 
+class HttpFailure(hf_fetch.HfHubHTTPError):
+    """An HTTP failure carrying the status the client attached.
+
+    `__init__` is replaced rather than delegated because the two supported
+    client versions declare different constructor signatures for it; the
+    helper's classification depends only on the exception type and on
+    `response.status_code`, which is what this reproduces.
+    """
+
+    def __init__(self, message, status):
+        Exception.__init__(self, message)
+        self.response = SimpleNamespace(status_code=status)
+
+
+class GatedFailure(hf_fetch.GatedRepoError):
+    def __init__(self, message):
+        Exception.__init__(self, message)
+        self.response = SimpleNamespace(status_code=403)
+
+
+class MissingRepositoryFailure(hf_fetch.RepositoryNotFoundError):
+    def __init__(self, message):
+        Exception.__init__(self, message)
+        self.response = None
+
+
+class MissingRevisionFailure(hf_fetch.RevisionNotFoundError):
+    def __init__(self, message):
+        Exception.__init__(self, message)
+        self.response = None
+
+
+class FailureReportingTests(unittest.TestCase):
+    """Issue 0084: a failed acquisition has to say why, without saying a secret."""
+
+    TOKEN = "hf_" + "A1b2C3d4E5f6G7h8I9j0"
+    SIGNATURE = "f" * 64
+    SIGNED_URL = (
+        "https://cas-bridge.xethub.hf.co/xet-bridge-us/deadbeef/0123456789abcdef"
+        "?X-Amz-Signature=" + SIGNATURE + "&X-Amz-Credential=AKIAEXAMPLEKEY%2Fus-east-1"
+    )
+
+    def test_token_and_signed_url_shaped_strings_never_reach_the_event(self):
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJtb2RlbGtlZXAifQ.c2lnbmF0dXJl"
+        error = RuntimeError(
+            "xet_get failed for "
+            + self.SIGNED_URL
+            + " with Authorization: Bearer "
+            + self.TOKEN
+            + " and x-xet-access-token: "
+            + jwt
+            + " (token="
+            + self.TOKEN
+            + ")"
+        )
+        serialized = json.dumps(hf_fetch.failure_event(error))
+        for secret in (
+            self.TOKEN,
+            self.SIGNATURE,
+            self.SIGNED_URL,
+            jwt,
+            "X-Amz-Signature",
+            "AKIAEXAMPLEKEY",
+        ):
+            self.assertNotIn(secret, serialized)
+        # The endpoint identity survives, because telling a hub failure from a
+        # CAS failure is the point of keeping a reason at all.
+        self.assertIn("https://cas-bridge.xethub.hf.co/<redacted>", serialized)
+        self.assertIn(hf_fetch.REDACTED_TOKEN, serialized)
+
+    def test_a_url_is_reduced_to_its_endpoint_without_userinfo(self):
+        self.assertEqual(
+            hf_fetch.sanitized_text("see https://user:secret@host.example:8443/a/b?c=d end"),
+            "see https://host.example:8443/<redacted> end",
+        )
+        self.assertNotIn(
+            "secret", hf_fetch.sanitized_text("https://user:secret@host.example/x")
+        )
+        self.assertEqual(hf_fetch.sanitized_text("scheme://"), hf_fetch.REDACTED_URL)
+
+    def test_permission_denied_in_the_transfer_is_a_client_failure_with_its_reason(self):
+        """The Issue 0086 shape: the client could not write its own cache.
+
+        This is the failure that used to be recorded as `failed` with nothing
+        else. It now names the class, the exception and what the client said.
+        """
+        api = MovingRefApi()
+
+        def unwritable_cache(**kwargs):
+            raise PermissionError(13, "Permission denied", "/hf-home/hub")
+
+        with tempfile.TemporaryDirectory() as output:
+            with self.assertRaises(PermissionError) as raised:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    hf_fetch.acquire(
+                        "org/model",
+                        COMMIT_A,
+                        output,
+                        api=api,
+                        download=unwritable_cache,
+                    )
+
+        event = hf_fetch.failure_event(raised.exception)
+        self.assertEqual(event["class"], hf_fetch.CLASS_CLIENT_FAILURE)
+        self.assertEqual(event["exception"], "PermissionError")
+        self.assertIn("Permission denied", event["message"])
+        self.assertIn("/hf-home/hub", event["message"])
+        self.assertEqual(
+            hf_fetch.EXIT_CODES[event["class"]],
+            14,
+        )
+
+    def test_every_class_is_reported_with_its_own_exit_code(self):
+        cases = [
+            (GatedFailure("gated"), hf_fetch.CLASS_UNAUTHORIZED, 12),
+            (MissingRepositoryFailure("no repo"), hf_fetch.CLASS_NOT_FOUND, 11),
+            (hf_fetch.EntryNotFoundError("no file"), hf_fetch.CLASS_NOT_FOUND, 11),
+            (MissingRevisionFailure("no revision"), hf_fetch.CLASS_NOT_FOUND, 11),
+            (HttpFailure("not found", 404), hf_fetch.CLASS_NOT_FOUND, 11),
+            (HttpFailure("unauthorized", 401), hf_fetch.CLASS_UNAUTHORIZED, 12),
+            (HttpFailure("forbidden", 403), hf_fetch.CLASS_UNAUTHORIZED, 12),
+            (HttpFailure("too many requests", 429), hf_fetch.CLASS_RATE_LIMITED, 13),
+            (HttpFailure("bad gateway", 502), hf_fetch.CLASS_UNAVAILABLE, 10),
+            (HttpFailure("teapot", 418), hf_fetch.CLASS_CLIENT_FAILURE, 14),
+            (ConnectionError("refused"), hf_fetch.CLASS_UNAVAILABLE, 10),
+            (TimeoutError("timed out"), hf_fetch.CLASS_UNAVAILABLE, 10),
+            (ValueError("unsafe upstream path"), hf_fetch.CLASS_CLIENT_FAILURE, 14),
+        ]
+        for error, expected_class, expected_code in cases:
+            with self.subTest(error=type(error).__name__, status=str(error)):
+                stream = io.StringIO()
+                code = hf_fetch.report_failure(error, stream=stream)
+                lines = stream.getvalue().splitlines()
+                self.assertEqual(len(lines), 1)
+                event = json.loads(lines[0])
+                self.assertEqual(event["type"], "failure")
+                self.assertEqual(event["version"], 1)
+                self.assertEqual(event["class"], expected_class)
+                self.assertEqual(event["exception"], type(error).__name__)
+                self.assertEqual(code, expected_code)
+
+    def test_a_gated_repository_is_authorization_not_absence(self):
+        """`GatedRepoError` subclasses `RepositoryNotFoundError` upstream, so the
+        order of the checks is the difference between the two answers."""
+        self.assertTrue(
+            issubclass(hf_fetch.GatedRepoError, hf_fetch.RepositoryNotFoundError)
+        )
+        self.assertEqual(
+            hf_fetch.failure_class(GatedFailure("gated")),
+            hf_fetch.CLASS_UNAUTHORIZED,
+        )
+
+    def test_an_unclassifiable_exception_still_reports_its_type_and_message(self):
+        class XetRuntimeFailure(Exception):
+            pass
+
+        event = hf_fetch.failure_event(XetRuntimeFailure("cas shard write refused"))
+        self.assertEqual(event["class"], hf_fetch.CLASS_CLIENT_FAILURE)
+        self.assertEqual(event["exception"], "XetRuntimeFailure")
+        self.assertEqual(
+            event["message"], "XetRuntimeFailure: cas shard write refused"
+        )
+
+    def test_the_immediate_cause_is_reported_with_the_failure(self):
+        cause = OSError(28, "No space left on device")
+        error = RuntimeError("transfer aborted")
+        error.__cause__ = cause
+        message = hf_fetch.failure_event(error)["message"]
+        self.assertIn("RuntimeError: transfer aborted", message)
+        self.assertIn("No space left on device", message)
+
+    def test_a_reported_message_is_one_bounded_printable_line(self):
+        error = RuntimeError(
+            'first\n{"event":"archive_published","repo_id":"org/forged"}\t'
+            + "x" * 4096
+        )
+        event = hf_fetch.failure_event(error)
+        self.assertNotIn("\n", event["message"])
+        self.assertNotIn("\t", event["message"])
+        self.assertTrue(event["message"].endswith(hf_fetch.TRUNCATION_MARKER))
+        self.assertEqual(
+            len(event["message"]),
+            hf_fetch.MESSAGE_LIMIT + len(hf_fetch.TRUNCATION_MARKER),
+        )
+        self.assertEqual(len(json.dumps(event).splitlines()), 1)
+
+    def test_the_failure_event_goes_to_the_protocol_channel(self):
+        protocol = io.StringIO()
+        diagnostics = io.StringIO()
+        with contextlib.redirect_stdout(protocol), contextlib.redirect_stderr(
+            diagnostics
+        ):
+            code = hf_fetch.report_failure(ConnectionError("refused"))
+        self.assertEqual(code, 10)
+        self.assertEqual(json.loads(protocol.getvalue())["class"], "unavailable")
+        self.assertEqual(diagnostics.getvalue(), "")
+
+    def test_every_class_has_an_exit_code_and_no_code_is_shared(self):
+        classes = (
+            hf_fetch.CLASS_UNAVAILABLE,
+            hf_fetch.CLASS_NOT_FOUND,
+            hf_fetch.CLASS_UNAUTHORIZED,
+            hf_fetch.CLASS_RATE_LIMITED,
+            hf_fetch.CLASS_CLIENT_FAILURE,
+        )
+        self.assertEqual(sorted(hf_fetch.EXIT_CODES), sorted(classes))
+        self.assertEqual(len(set(hf_fetch.EXIT_CODES.values())), len(classes))
+        # Exit 1 is reserved for a helper that failed without reporting a class:
+        # the parent reports that as the helper's own contract failure.
+        self.assertNotIn(1, hf_fetch.EXIT_CODES.values())
+
+
 if __name__ == "__main__":
     unittest.main()

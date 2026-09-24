@@ -9,14 +9,227 @@ import re
 import sys
 import threading
 import time
+import urllib.parse
 from pathlib import Path
 
 from huggingface_hub import HfApi, snapshot_download
-from huggingface_hub.utils import GatedRepoError, HfHubHTTPError, RepositoryNotFoundError
+from huggingface_hub.utils import (
+    EntryNotFoundError,
+    GatedRepoError,
+    HfHubHTTPError,
+    RepositoryNotFoundError,
+    RevisionNotFoundError,
+)
 from tqdm.auto import tqdm
 
 
 COMMIT_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
+
+
+# --- Failure reporting (Issue 0084) -----------------------------------------
+#
+# A failed acquisition has to say why. The helper is the only place that holds
+# both the client's exception and the context needed to classify it, so the
+# class is decided here and reported as a typed event on the same stdout
+# protocol channel the Rust parent already drains. The parent never recovers a
+# reason by pattern matching helper text, and helper stderr stays discarded:
+# this event is the whole diagnostic surface, which is why the message is
+# sanitized before it leaves this process.
+
+FAILURE_EVENT_VERSION = 1
+
+#: The longest sanitized message reported for one exception. A client message
+#: is untrusted, unbounded text; a bound keeps one failure from flooding the
+#: parent's log or management state.
+MESSAGE_LIMIT = 400
+EXCEPTION_NAME_LIMIT = 80
+#: How many links of the exception chain are reported. The immediate cause is
+#: routinely where the real reason is (a transport wrapping an OS error), and a
+#: bound keeps a deep chain from crowding out the failure itself.
+CAUSE_DEPTH = 2
+
+#: Upstream could not be reached or could not answer.
+CLASS_UNAVAILABLE = "unavailable"
+#: Upstream answered that the repository, revision or file does not exist.
+CLASS_NOT_FOUND = "not_found"
+#: Upstream refused the credentials, or the repository is gated for them.
+CLASS_UNAUTHORIZED = "unauthorized"
+#: Upstream refused because the caller asked too often.
+CLASS_RATE_LIMITED = "rate_limited"
+#: The transfer or the client itself failed. This is also the honest answer for
+#: an exception the helper cannot classify: the exception type and its sanitized
+#: message are reported rather than a guessed class, because reporting
+#: "unavailable" for an authorization problem would be worse than reporting
+#: that only the client's own words are known.
+CLASS_CLIENT_FAILURE = "client_failure"
+
+#: The exit code for each class, so a parent that reads only the status still
+#: learns the class. Codes 10, 11 and 12 are the ones the helper contract
+#: already defined.
+EXIT_CODES = {
+    CLASS_UNAVAILABLE: 10,
+    CLASS_NOT_FOUND: 11,
+    CLASS_UNAUTHORIZED: 12,
+    CLASS_RATE_LIMITED: 13,
+    CLASS_CLIENT_FAILURE: 14,
+}
+
+REDACTED = "<redacted>"
+REDACTED_URL = "<redacted-url>"
+REDACTED_TOKEN = "<redacted-token>"
+TRUNCATION_MARKER = "...[truncated]"
+
+URL_PATTERN = re.compile(r"\b[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s\"'<>`]*")
+
+
+def redacted_url(match):
+    """Reduces one URL to its endpoint identity.
+
+    A signed URL carries its capability in the userinfo, path, query and
+    fragment; the scheme, host and port are the endpoint identity an operator
+    needs in order to tell a hub failure from a CAS failure, and they carry no
+    signature. This is a structural reduction rather than a search for secrets:
+    `urlsplit().hostname` drops userinfo, and everything after the authority is
+    discarded whatever it contained.
+    """
+    try:
+        parts = urllib.parse.urlsplit(match.group(0))
+        host = parts.hostname or ""
+        port = "" if parts.port is None else f":{parts.port}"
+    except ValueError:
+        return REDACTED_URL
+    if not parts.scheme or not host:
+        return REDACTED_URL
+    return f"{parts.scheme}://{host}{port}/{REDACTED}"
+
+
+#: Secret shapes that survive the URL reduction because they appear as bare
+#: text: Hugging Face access tokens, JWT-shaped bearer material, an HTTP
+#: authorization scheme and its credential, and any `name: value` pair whose
+#: name says the value is a credential.
+SECRET_PATTERNS = (
+    (re.compile(r"\bhf_[A-Za-z0-9_]{4,}"), REDACTED_TOKEN),
+    (
+        re.compile(r"\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*"),
+        REDACTED_TOKEN,
+    ),
+    (
+        re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]+"),
+        r"\1 " + REDACTED_TOKEN,
+    ),
+    (
+        re.compile(
+            r"(?i)\b([A-Za-z0-9_-]*"
+            r"(?:authorization|token|secret|password|passwd|signature|credential"
+            r"|api[_-]?key)"
+            r"[A-Za-z0-9_-]*)\s*[:=]\s*[^\s,;)\]}\"']+"
+        ),
+        r"\1=" + REDACTED,
+    ),
+)
+
+
+def sanitized_text(value, limit=MESSAGE_LIMIT):
+    """One bounded, single-line, credential-free rendering of `value`.
+
+    URLs are reduced first so that a secret carried inside one is removed with
+    it rather than having to be recognized on its own. Anything unprintable is
+    replaced before whitespace is collapsed, so a message can neither span
+    lines nor forge a log record, and the result is truncated so that it cannot
+    flood one.
+    """
+    text = "" if value is None else str(value)
+    text = URL_PATTERN.sub(redacted_url, text)
+    for pattern, replacement in SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    text = "".join(character if character.isprintable() else " " for character in text)
+    text = " ".join(text.split())
+    if len(text) > limit:
+        text = text[:limit].rstrip() + TRUNCATION_MARKER
+    return text
+
+
+def failure_class(error):
+    """The class of failure `error` is, as the helper can establish it.
+
+    `GatedRepoError` is checked before `RepositoryNotFoundError` because the
+    official client makes the former a subclass of the latter: a gated
+    repository is an authorization answer, not a missing one. A status code is
+    only consulted when the client attached a response, and an exception the
+    helper cannot place degrades to `CLASS_CLIENT_FAILURE` rather than to a
+    guess.
+    """
+    if isinstance(error, GatedRepoError):
+        return CLASS_UNAUTHORIZED
+    if isinstance(
+        error, (RepositoryNotFoundError, RevisionNotFoundError, EntryNotFoundError)
+    ):
+        return CLASS_NOT_FOUND
+    status = getattr(getattr(error, "response", None), "status_code", None)
+    if (
+        isinstance(error, HfHubHTTPError)
+        and isinstance(status, int)
+        and not isinstance(status, bool)
+    ):
+        if status == 404:
+            return CLASS_NOT_FOUND
+        if status in (401, 403):
+            return CLASS_UNAUTHORIZED
+        if status == 429:
+            return CLASS_RATE_LIMITED
+        if 500 <= status <= 599:
+            return CLASS_UNAVAILABLE
+        return CLASS_CLIENT_FAILURE
+    if isinstance(error, (ConnectionError, TimeoutError)):
+        return CLASS_UNAVAILABLE
+    return CLASS_CLIENT_FAILURE
+
+
+def failure_message(error, depth=CAUSE_DEPTH):
+    """The sanitized reason, including the immediate cause when there is one.
+
+    Each link is named by its exception type so that an unclassified failure
+    still says what raised it, which is the difference between a reason and a
+    blank.
+    """
+    parts = []
+    seen = set()
+    current = error
+    while current is not None and len(parts) < depth:
+        if id(current) in seen:
+            break
+        seen.add(id(current))
+        name = sanitized_text(type(current).__name__, EXCEPTION_NAME_LIMIT)
+        detail = sanitized_text(current)
+        parts.append(f"{name}: {detail}" if detail else name)
+        current = current.__cause__ or current.__context__
+    return sanitized_text(" caused by ".join(parts))
+
+
+def failure_event(error):
+    return {
+        "type": "failure",
+        "version": FAILURE_EVENT_VERSION,
+        "class": failure_class(error),
+        "exception": sanitized_text(type(error).__name__, EXCEPTION_NAME_LIMIT),
+        "message": failure_message(error),
+    }
+
+
+def report_failure(error, stream=None):
+    """Reports `error` on the protocol channel and answers its exit code.
+
+    Writing to stdout is deliberate: it is the channel the parent drains, so a
+    failure report can never block on a pipe nobody is reading, and it is the
+    only channel the parent keeps.
+    """
+    event = failure_event(error)
+    print(
+        json.dumps(event, separators=(",", ":")),
+        file=stream or sys.stdout,
+        flush=True,
+    )
+    return EXIT_CODES[event["class"]]
 
 
 class ProgressReporter:
@@ -389,17 +602,9 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (RepositoryNotFoundError,) :
-        sys.exit(11)
-    except GatedRepoError:
-        sys.exit(12)
-    except HfHubHTTPError as error:
-        if error.response is not None and error.response.status_code == 404:
-            sys.exit(11)
-        if error.response is not None and error.response.status_code in (401, 403):
-            sys.exit(12)
-        sys.exit(1)
-    except (ConnectionError, TimeoutError):
-        sys.exit(10)
-    except Exception:
-        sys.exit(1)
+    # Every failure is reported before it becomes an exit code (Issue 0084).
+    # `SystemExit` and `KeyboardInterrupt` are deliberately not caught: argparse
+    # exits through the former, and a cancellation is the parent stopping this
+    # process, which is an interruption rather than an acquisition failure.
+    except Exception as error:
+        sys.exit(report_failure(error))

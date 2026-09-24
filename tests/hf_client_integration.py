@@ -360,6 +360,103 @@ def revision_directory(archive, repo_id, commit):
     return archive / "models" / namespace / repo / "revisions" / commit
 
 
+# A helper that fails the way Issue 0084 is about: it reports one failure event
+# on the protocol channel and exits with that class's code. The event itself is
+# produced by the production helper's own sanitizer, so what this asserts is what
+# the real helper would emit rather than a hand-written approximation.
+FAILING_UPSTREAM_HELPER = '''#!/usr/bin/env python3
+import os
+import sys
+
+sys.stdout.write(os.environ["MODELKEEP_FAILURE_EVENT"] + "\\n")
+sys.stdout.flush()
+sys.exit(int(os.environ["MODELKEEP_FAILURE_EXIT_CODE"]))
+'''
+
+
+def assert_a_failed_acquisition_records_why(binary, root, actual_helper):
+    """Issue 0084, end to end through the real helper's sanitizer.
+
+    The exception carries a Hugging Face access token, an HTTP authorization
+    header and a signed CAS URL, which is exactly the material the discarded
+    stderr stream used to protect. The production helper classifies and sanitizes
+    it, ModelKeep records the class, and neither the job record nor the server
+    log may contain any of the credential material.
+
+    The failure shape is the one Issue 0086 turned out to be: the client could
+    not write its cache, so the transfer raised a permission error. Before this,
+    the class recorded for it was `failed`.
+    """
+    helper_module = load_module(actual_helper)
+    token = "hf_" + "A1b2C3d4E5f6G7h8I9j0"
+    signature = "f" * 64
+    signed_url = (
+        "https://cas-bridge.xethub.hf.co/xet-bridge-us/deadbeef/0123456789abcdef"
+        f"?X-Amz-Signature={signature}&X-Amz-Credential=AKIAEXAMPLEKEY%2Fus-east-1"
+    )
+    secrets = (token, signature, signed_url, "X-Amz-Signature", "AKIAEXAMPLEKEY")
+    cause = ConnectionResetError(f"reset while streaming {signed_url}")
+    error = PermissionError(
+        13,
+        f"Permission denied; Authorization: Bearer {token}",
+        "/hf-home/hub",
+    )
+    error.__cause__ = cause
+
+    event = helper_module.failure_event(error)
+    assert event["class"] == helper_module.CLASS_CLIENT_FAILURE, event
+    assert event["exception"] == "PermissionError", event
+    assert "Permission denied" in event["message"], event
+    serialized = json.dumps(event)
+    for secret in secrets:
+        assert secret not in serialized, (secret, serialized)
+
+    failure_archive = root / "failure-archive"
+    failing_helper = root / "failing-upstream-helper.py"
+    failing_helper.write_text(FAILING_UPSTREAM_HELPER)
+    admin_endpoints = []
+    failure_logs = []
+    with server(
+        binary,
+        failure_archive,
+        failing_helper,
+        captured_logs=failure_logs,
+        admin_endpoints=admin_endpoints,
+        extra_environment={
+            "MODELKEEP_FAILURE_EVENT": serialized,
+            "MODELKEEP_FAILURE_EXIT_CODE": str(
+                helper_module.EXIT_CODES[event["class"]]
+            ),
+        },
+    ):
+        admin_endpoint = admin_endpoints[0]
+        submitted = admin_call(
+            admin_endpoint,
+            "/api/admin/v1/jobs",
+            body={
+                "kind": "prefetch",
+                "repo_type": "model",
+                "repo_id": REPO_ID,
+                "revision": COMMIT,
+            },
+            idempotency_key="hf-client-integration-failure-reason",
+        )
+        job = await_job(admin_endpoint, submitted["id"])
+        assert job["state"] == "failed", job
+
+    recorded = json.dumps(job)
+    logs = failure_logs[0]
+    for secret in secrets:
+        assert secret not in recorded, (secret, recorded)
+        assert secret not in logs, (secret, logs)
+    # The class is the one the helper established, not the bucket every
+    # unclassified failure used to land in.
+    assert '"error_class":"client_failure"' in logs, logs
+    assert '"error_class":"failed"' not in logs, logs
+    assert '"safe_reason":"upstream client failure: PermissionError:' in logs, logs
+    assert "Permission denied" in logs, logs
+
+
 def assert_a_client_filter_narrows_the_first_acquisition(
     binary, root, actual_helper, populated
 ):
@@ -941,6 +1038,7 @@ def main():
             assert_a_client_filter_narrows_the_first_acquisition(
                 binary, root, actual_helper, archive
             )
+            assert_a_failed_acquisition_records_why(binary, root, actual_helper)
 
             # Released archives can outlive the writer that created their manifest.
             # Simulate an old manifest that accidentally listed transient downloader

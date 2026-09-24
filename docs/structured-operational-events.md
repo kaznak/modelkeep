@@ -14,7 +14,7 @@ headers, bearer tokens, signed URLs, or upstream error payloads.
 | `archive_miss` | INFO | request fields |
 | `upstream_fetch_started` | INFO | `repo_id`, `requested_revision`, `operation`, `resumed`, `selected` |
 | `upstream_fetch_finished` | INFO | fetch fields plus immutable `commit` |
-| `upstream_fetch_failed` | WARN | fetch fields plus credential-safe `error_class` |
+| `upstream_fetch_failed` | WARN | fetch fields plus credential-safe `error_class` and `safe_reason` |
 | `upstream_metadata_answered` | INFO | `repo_id`, `requested_revision`, immutable `commit`, `files` |
 | `upstream_file_list_recorded` | INFO | `repo_id`, immutable `commit`, `files` |
 | `archive_verification_failed` | WARN | `repo_id` and immutable `commit`, or `requested_revision` and `operation`; credential-safe `error_class` |
@@ -103,11 +103,30 @@ write it is reported by `archive_storage_failed` with
 serving.
 
 `upstream_fetch_failed.error_class` is one of `unavailable`, `not_found`,
-`unauthorized`, `invalid_output`, `storage`, `failed`, or `io`. The upstream diagnostic itself
-is intentionally excluded because helper output can contain credentials or signed
-URLs. Detailed helper diagnostics are available only through their separately
-redacted diagnostic path. An acquisition stopped on request is not an upstream
-failure and never appears here; it is reported by `acquisition_cancelled`.
+`unauthorized`, `rate_limited`, `client_failure`, `invalid_output`, `storage`,
+`failed`, or `io`. The first five are the classes the fetch helper establishes for
+itself: upstream could not answer, upstream said the repository or revision does
+not exist, upstream refused the credentials, upstream refused because it was asked
+too often, and the transfer or the official client itself failed.
+`client_failure` is also the class for an exception the helper could not place,
+because reporting `unavailable` for an authorization problem would be worse than
+reporting that only the client's own words are known. `invalid_output` is the
+helper's own contract failure, which includes a helper that failed without
+reporting why. An acquisition stopped on request is not an upstream failure and
+never appears here; it is reported by `acquisition_cancelled`.
+
+`upstream_fetch_failed.safe_reason` is the one-line reason (Issue 0084): the
+sanitized diagnostic the helper reported for this failure, prefixed by ModelKeep's
+description of the class, or that description alone when the failure did not come
+from a helper report. The helper sanitizes it in the helper, which is the only
+place that holds the exception and the context needed to recognize a credential:
+it reduces every URL to its scheme, host and port, redacts token-shaped and
+authorization-header-shaped material, and bounds the result to one printable line.
+ModelKeep bounds what it stores as untrusted input — unprintable characters
+removed, whitespace collapsed, length capped — but never tries to re-derive that
+judgement by pattern matching text it did not raise. Raw helper stdout and stderr
+still never reach a log: helper stderr remains discarded, and an I/O failure is
+reported by its kind rather than by a message that would carry local paths.
 
 For an invalid fetch-helper contract, `admin_job_failed.error_class` is `upstream`
 and `safe_reason` contains only ModelKeep's fixed description of the rejected

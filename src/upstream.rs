@@ -368,6 +368,173 @@ impl FetchProgress {
     }
 }
 
+/// The version of the helper failure event this parent understands.
+const FAILURE_EVENT_VERSION: u32 = 1;
+
+/// The longest reported diagnostic ModelKeep keeps, in characters.
+///
+/// The helper bounds its own message; this bound is what makes the parent's
+/// state independent of a helper that does not.
+const REPORTED_DETAIL_LIMIT: usize = 400;
+
+/// The class of failure the fetch helper reported for itself (Issue 0084).
+///
+/// The class is the helper's answer, not something the parent infers: only the
+/// helper holds the client exception and the context needed to place it. Each
+/// class is one an operator acts on differently, which is why there is no class
+/// here for a distinction nothing branches on. A failure the helper could not
+/// place is reported as [`Self::ClientFailure`] together with the exception
+/// type, which is honest, rather than guessed into one of the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelperFailureClass {
+    /// Upstream could not be reached or could not answer.
+    Unavailable,
+    /// Upstream answered that the repository, revision or file does not exist.
+    NotFound,
+    /// Upstream refused the credentials, or the repository is gated for them.
+    Unauthorized,
+    /// Upstream refused because it was asked too often.
+    RateLimited,
+    /// The transfer or the official client itself failed, including a failure
+    /// the helper could not classify.
+    ClientFailure,
+}
+
+impl HelperFailureClass {
+    pub const ALL: [Self; 5] = [
+        Self::Unavailable,
+        Self::NotFound,
+        Self::Unauthorized,
+        Self::RateLimited,
+        Self::ClientFailure,
+    ];
+
+    /// The stable name the helper protocol and the structured events use.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::NotFound => "not_found",
+            Self::Unauthorized => "unauthorized",
+            Self::RateLimited => "rate_limited",
+            Self::ClientFailure => "client_failure",
+        }
+    }
+
+    /// ModelKeep's own description of the class, used when the helper reported
+    /// no diagnostic of its own.
+    const fn safe_reason(self) -> &'static str {
+        match self {
+            Self::Unavailable => "upstream unavailable",
+            Self::NotFound => "upstream repository or revision not found",
+            Self::Unauthorized => "upstream authorization failed",
+            Self::RateLimited => "upstream rate limited the acquisition",
+            Self::ClientFailure => "upstream client failure",
+        }
+    }
+
+    /// The class a reported name denotes, or `None` for a name this parent does
+    /// not implement. An unknown class is a helper contract failure rather than
+    /// a class silently treated as something else.
+    fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|class| class.as_str() == value)
+    }
+}
+
+/// A failure the fetch helper classified and sanitized for itself.
+///
+/// The diagnostic text originates in the helper because that is where the
+/// exception and its context are known; ModelKeep does not re-derive that
+/// judgement by pattern matching text it did not raise. What the parent does is
+/// bound the report structurally as untrusted input: unprintable characters are
+/// removed so a report cannot forge a log record, whitespace is collapsed so it
+/// cannot span lines, and the length is capped so it cannot flood them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelperFailure {
+    class: HelperFailureClass,
+    exception: Option<String>,
+    message: Option<String>,
+}
+
+impl HelperFailure {
+    /// A class with no diagnostic of its own: what an exit code alone reports.
+    pub fn from_class(class: HelperFailureClass) -> Self {
+        Self {
+            class,
+            exception: None,
+            message: None,
+        }
+    }
+
+    /// The helper's own report, bounded as untrusted input.
+    pub fn reported(
+        class: HelperFailureClass,
+        exception: Option<&str>,
+        message: Option<&str>,
+    ) -> Self {
+        Self {
+            class,
+            exception: exception.and_then(bounded_detail),
+            message: message.and_then(bounded_detail),
+        }
+    }
+
+    pub fn class(&self) -> HelperFailureClass {
+        self.class
+    }
+
+    /// The exception type the helper named, when it named one.
+    pub fn exception(&self) -> Option<&str> {
+        self.exception.as_deref()
+    }
+
+    /// The helper's sanitized diagnostic, when it reported one.
+    pub fn message(&self) -> Option<&str> {
+        self.message.as_deref()
+    }
+
+    /// The one-line reason an operator reads: ModelKeep's description of the
+    /// class, plus whatever the helper was able to say about this failure.
+    pub fn safe_reason(&self) -> String {
+        let class = self.class.safe_reason();
+        match (self.message.as_deref(), self.exception.as_deref()) {
+            (Some(message), _) => format!("{class}: {message}"),
+            (None, Some(exception)) => format!("{class}: {exception}"),
+            (None, None) => class.to_string(),
+        }
+    }
+}
+
+/// One reported string reduced to a bounded, single-line, printable form.
+///
+/// This is deliberately not a search for credentials. Recognizing a secret
+/// requires the context the helper has and the parent does not, so the helper
+/// sanitizes; the parent only refuses to store something unbounded or something
+/// that could forge a log record.
+fn bounded_detail(value: &str) -> Option<String> {
+    let printable: String = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let collapsed = printable
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(REPORTED_DETAIL_LIMIT)
+        .collect::<String>();
+    if collapsed.is_empty() {
+        None
+    } else {
+        Some(collapsed)
+    }
+}
+
 #[derive(Debug)]
 pub enum UpstreamError {
     Io(std::io::Error),
@@ -377,9 +544,32 @@ pub enum UpstreamError {
     InvalidOutput(InvalidOutputReason),
     Storage,
     Failed,
+    /// The helper reported why it failed (Issue 0084).
+    ///
+    /// This carries the class the helper established and the diagnostic it
+    /// sanitized. It is what replaced the bucket that used to turn every
+    /// unclassified helper exit into [`Self::Failed`]; the bare variants above
+    /// remain the vocabulary of fetchers that are not the official helper, and
+    /// of the exit codes the helper contract defined before this event existed.
+    HelperFailure(HelperFailure),
     /// The acquisition was stopped on request (Issue 0076). This is an
     /// interruption, not an upstream failure and never a miss.
     Cancelled,
+}
+
+impl UpstreamError {
+    /// The credential-safe one-line reason for a structured event.
+    ///
+    /// An I/O failure is reported by kind rather than by message: the kind is
+    /// what an operator acts on, and the message would carry local paths that
+    /// no event needs.
+    pub fn safe_reason(&self) -> String {
+        match self {
+            Self::Io(error) => format!("upstream I/O error: {:?}", error.kind()),
+            Self::HelperFailure(failure) => failure.safe_reason(),
+            other => other.to_string(),
+        }
+    }
 }
 
 /// A credential-safe description of a rejected fetch-helper contract.
@@ -402,10 +592,21 @@ pub enum InvalidOutputReason {
     MalformedResultCommit,
     ResumeCommitMismatch,
     EmptySnapshot,
+    /// The helper failed without reporting a failure event (Issue 0084).
+    ///
+    /// A helper that fails owes the parent a reason on its protocol channel.
+    /// Reporting the missing reason as the helper's own contract failure is what
+    /// keeps it from being mistaken for an upstream failure whose class nobody
+    /// established.
+    MissingFailureEvent,
+    /// The helper reported a failure event this parent cannot read, including
+    /// one naming a class it does not implement or announcing a version it does
+    /// not understand.
+    MalformedFailure,
 }
 
 impl InvalidOutputReason {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 15] = [
         Self::StdoutUnavailable,
         Self::NonJsonLine,
         Self::MalformedProgress,
@@ -419,6 +620,8 @@ impl InvalidOutputReason {
         Self::MalformedResultCommit,
         Self::ResumeCommitMismatch,
         Self::EmptySnapshot,
+        Self::MissingFailureEvent,
+        Self::MalformedFailure,
     ];
 
     pub const fn safe_reason(self) -> &'static str {
@@ -436,6 +639,8 @@ impl InvalidOutputReason {
             Self::MalformedResultCommit => "helper returned a malformed commit identity",
             Self::ResumeCommitMismatch => "helper result did not match the resumed commit",
             Self::EmptySnapshot => "helper returned an empty snapshot",
+            Self::MissingFailureEvent => "helper failed without reporting a failure event",
+            Self::MalformedFailure => "helper emitted a malformed failure event",
         }
     }
 }
@@ -461,6 +666,7 @@ impl std::fmt::Display for UpstreamError {
             }
             Self::Storage => write!(formatter, "fetch staging storage failure"),
             Self::Failed => write!(formatter, "upstream acquisition failed"),
+            Self::HelperFailure(failure) => formatter.write_str(&failure.safe_reason()),
             Self::Cancelled => write!(formatter, "upstream acquisition cancelled"),
         }
     }
@@ -626,11 +832,23 @@ impl OfficialHfFetcher {
         }
         let parsed = (|| {
             let mut result = None;
+            let mut failure = None;
             for line in BufReader::new(stdout).lines() {
                 let line = line.map_err(UpstreamError::Io)?;
                 let value: serde_json::Value = serde_json::from_str(&line)
                     .map_err(|_| UpstreamError::InvalidOutput(InvalidOutputReason::NonJsonLine))?;
                 match value.get("type").and_then(|value| value.as_str()) {
+                    // The helper's own reason for failing (Issue 0084). Reading
+                    // it does not end the loop: the pipe is drained to end of
+                    // file as always, because a helper that is still writing
+                    // must never be left blocked on it.
+                    Some("failure") => {
+                        let reported = parse_failure_event(value)?;
+                        // The first reported failure wins, so a later one cannot
+                        // overwrite the reason the acquisition actually failed
+                        // for.
+                        failure = failure.or(Some(reported));
+                    }
                     Some("progress") => {
                         let event: FetchProgress = serde_json::from_value(value).map_err(|_| {
                             UpstreamError::InvalidOutput(InvalidOutputReason::MalformedProgress)
@@ -685,7 +903,7 @@ impl OfficialHfFetcher {
                     }
                 }
             }
-            Ok(result)
+            Ok((result, failure))
         })();
         // The helper's output ended. Either a cancellation already reaped it, or
         // this thread owns it again and is responsible for reaping it.
@@ -696,21 +914,23 @@ impl OfficialHfFetcher {
             terminate_and_reap(&mut child);
             return Err(UpstreamError::Cancelled);
         }
-        let result = match parsed {
-            Ok(result) => result,
+        let (result, failure) = match parsed {
+            Ok(parsed) => parsed,
             Err(error) => {
                 terminate_and_reap(&mut child);
                 return Err(error);
             }
         };
         let status = child.wait().map_err(UpstreamError::Io)?;
+        // A failure the helper reported for itself is authoritative and fails
+        // closed: a helper that said it failed did not succeed, whatever it then
+        // exited with, and its own reason is better than any the exit code
+        // carries.
+        if let Some(failure) = failure {
+            return Err(UpstreamError::HelperFailure(failure));
+        }
         if !status.success() {
-            return Err(match status.code() {
-                Some(10) => UpstreamError::Unavailable,
-                Some(11) => UpstreamError::NotFound,
-                Some(12) => UpstreamError::Unauthorized,
-                _ => UpstreamError::Failed,
-            });
+            return Err(helper_exit_failure(status.code()));
         }
         let response: HelperOutput = result.ok_or(UpstreamError::InvalidOutput(
             InvalidOutputReason::MissingResult,
@@ -785,6 +1005,7 @@ impl OfficialHfFetcher {
         };
         let parsed = (|| {
             let mut result = None;
+            let mut failure = None;
             for line in BufReader::new(stdout).lines() {
                 let line = line.map_err(UpstreamError::Io)?;
                 let value: serde_json::Value = serde_json::from_str(&line)
@@ -794,6 +1015,12 @@ impl OfficialHfFetcher {
                     // to record from a resolved event and nothing to report
                     // from a progress event; the result event is authoritative.
                     Some("progress" | "resolved") => continue,
+                    // A resolve-only invocation fails for the same reasons an
+                    // acquisition does, so it reports them the same way.
+                    Some("failure") => {
+                        let reported = parse_failure_event(value)?;
+                        failure = failure.or(Some(reported));
+                    }
                     Some("result") => {
                         result =
                             Some(serde_json::from_value::<HelperOutput>(value).map_err(|_| {
@@ -808,23 +1035,21 @@ impl OfficialHfFetcher {
                     }
                 }
             }
-            Ok(result)
+            Ok((result, failure))
         })();
-        let result = match parsed {
-            Ok(result) => result,
+        let (result, failure) = match parsed {
+            Ok(parsed) => parsed,
             Err(error) => {
                 terminate_and_reap(&mut child);
                 return Err(error);
             }
         };
         let status = child.wait().map_err(UpstreamError::Io)?;
+        if let Some(failure) = failure {
+            return Err(UpstreamError::HelperFailure(failure));
+        }
         if !status.success() {
-            return Err(match status.code() {
-                Some(10) => UpstreamError::Unavailable,
-                Some(11) => UpstreamError::NotFound,
-                Some(12) => UpstreamError::Unauthorized,
-                _ => UpstreamError::Failed,
-            });
+            return Err(helper_exit_failure(status.code()));
         }
         let response: HelperOutput = result.ok_or(UpstreamError::InvalidOutput(
             InvalidOutputReason::MissingResult,
@@ -841,6 +1066,55 @@ impl OfficialHfFetcher {
 fn terminate_and_reap(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// The failure event as the helper writes it (Issue 0084).
+#[derive(Debug, Deserialize)]
+struct HelperFailureEvent {
+    #[serde(default)]
+    version: u32,
+    class: String,
+    #[serde(default)]
+    exception: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+/// Reads one reported failure, or rejects the helper's contract.
+///
+/// An unreadable event, an unimplemented class and an unsupported version are
+/// all the same operational answer — the helper must be fixed — so they share
+/// one reason rather than multiplying classes nothing branches on.
+fn parse_failure_event(value: serde_json::Value) -> Result<HelperFailure, UpstreamError> {
+    let malformed = || UpstreamError::InvalidOutput(InvalidOutputReason::MalformedFailure);
+    let event: HelperFailureEvent = serde_json::from_value(value).map_err(|_| malformed())?;
+    if event.version > FAILURE_EVENT_VERSION {
+        return Err(malformed());
+    }
+    let class = HelperFailureClass::parse(&event.class).ok_or_else(malformed)?;
+    Ok(HelperFailure::reported(
+        class,
+        event.exception.as_deref(),
+        event.message.as_deref(),
+    ))
+}
+
+/// What a non-zero helper exit means when no failure event explained it.
+///
+/// The three codes the helper contract defined before the failure event existed
+/// still name their class. Anything else is a helper that failed without saying
+/// why — including one killed outright — and that is reported as the helper's
+/// own contract failure rather than as an upstream failure nobody classified.
+fn helper_exit_failure(code: Option<i32>) -> UpstreamError {
+    match code {
+        Some(10) => UpstreamError::Unavailable,
+        Some(11) => UpstreamError::NotFound,
+        Some(12) => UpstreamError::Unauthorized,
+        Some(13) => {
+            UpstreamError::HelperFailure(HelperFailure::from_class(HelperFailureClass::RateLimited))
+        }
+        _ => UpstreamError::InvalidOutput(InvalidOutputReason::MissingFailureEvent),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1180,7 +1454,7 @@ mod tests {
 
     #[test]
     fn every_invalid_output_reason_is_fixed_and_credential_safe() {
-        assert_eq!(InvalidOutputReason::ALL.len(), 13);
+        assert_eq!(InvalidOutputReason::ALL.len(), 15);
         for reason in InvalidOutputReason::ALL {
             let safe = reason.safe_reason();
             assert!(!safe.is_empty());
@@ -1249,6 +1523,29 @@ mod tests {
                 format!("echo '{{\"type\":\"result\",\"commit\":\"{commit_a}\",\"files\":[]}}'"),
                 None,
                 InvalidOutputReason::EmptySnapshot,
+            ),
+            // Issue 0084: a helper that fails without reporting why, which is
+            // what every unclassified exit used to be reported as.
+            ("exit 1".into(), None, InvalidOutputReason::MissingFailureEvent),
+            (
+                "kill -9 $$".into(),
+                None,
+                InvalidOutputReason::MissingFailureEvent,
+            ),
+            (
+                "echo '{\"type\":\"failure\",\"class\":\"invented\"}'".into(),
+                None,
+                InvalidOutputReason::MalformedFailure,
+            ),
+            (
+                "echo '{\"type\":\"failure\",\"message\":\"no class\"}'".into(),
+                None,
+                InvalidOutputReason::MalformedFailure,
+            ),
+            (
+                "echo '{\"type\":\"failure\",\"version\":2,\"class\":\"unavailable\"}'".into(),
+                None,
+                InvalidOutputReason::MalformedFailure,
             ),
         ];
         for (script, resume_commit, expected) in cases {
@@ -1357,6 +1654,162 @@ mod tests {
             !std::path::Path::new("/proc").join(pid.trim()).exists(),
             "helper process {pid:?} was not reaped"
         );
+    }
+
+    /// Issue 0084. Every class the helper can report survives the process
+    /// boundary with the reason the helper sanitized, including the
+    /// `client_failure` that a permission failure inside the transfer is — the
+    /// shape of the Issue 0086 incident, which the parent used to reduce to
+    /// `UpstreamError::Failed`.
+    #[test]
+    fn helper_reported_failure_classes_are_kept_with_their_reason() {
+        for (class, exit_code) in [
+            (HelperFailureClass::Unavailable, 10),
+            (HelperFailureClass::NotFound, 11),
+            (HelperFailureClass::Unauthorized, 12),
+            (HelperFailureClass::RateLimited, 13),
+            (HelperFailureClass::ClientFailure, 14),
+        ] {
+            let script = format!(
+                "echo '{{\"type\":\"failure\",\"version\":1,\"class\":\"{}\",\"exception\":\"PermissionError\",\"message\":\"PermissionError: [Errno 13] Permission denied\"}}'\nexit {exit_code}",
+                class.as_str()
+            );
+            let error = run_helper(&script, None, |_| {});
+            let UpstreamError::HelperFailure(failure) = &error else {
+                panic!("expected a reported failure for {class:?}, got {error:?}");
+            };
+            assert_eq!(failure.class(), class);
+            assert_eq!(failure.exception(), Some("PermissionError"));
+            assert_eq!(
+                failure.message(),
+                Some("PermissionError: [Errno 13] Permission denied")
+            );
+            assert!(
+                error.to_string().contains("Permission denied"),
+                "reason was lost: {error}"
+            );
+            assert_eq!(error.safe_reason(), error.to_string());
+        }
+    }
+
+    #[test]
+    fn reported_failure_is_authoritative_over_a_successful_result() {
+        let commit = "a".repeat(40);
+        let script = format!(
+            "echo '{{\"type\":\"result\",\"commit\":\"{commit}\",\"files\":[\"config.json\"]}}'\necho '{{\"type\":\"failure\",\"version\":1,\"class\":\"client_failure\",\"exception\":\"RuntimeError\",\"message\":\"RuntimeError: transfer failed\"}}'\nexit 0"
+        );
+        let error = run_helper(&script, None, |_| {});
+        let UpstreamError::HelperFailure(failure) = &error else {
+            panic!("a reported failure must fail closed, got {error:?}");
+        };
+        assert_eq!(failure.class(), HelperFailureClass::ClientFailure);
+    }
+
+    #[test]
+    fn the_first_reported_failure_is_the_one_kept() {
+        let script = "echo '{\"type\":\"failure\",\"class\":\"unauthorized\",\"message\":\"first\"}'\necho '{\"type\":\"failure\",\"class\":\"client_failure\",\"message\":\"second\"}'\nexit 12";
+        let error = run_helper(script, None, |_| {});
+        let UpstreamError::HelperFailure(failure) = &error else {
+            panic!("expected a reported failure, got {error:?}");
+        };
+        assert_eq!(failure.class(), HelperFailureClass::Unauthorized);
+        assert_eq!(failure.message(), Some("first"));
+    }
+
+    #[test]
+    fn rate_limiting_reported_only_by_exit_code_keeps_its_class() {
+        let error = run_helper("exit 13", None, |_| {});
+        let UpstreamError::HelperFailure(failure) = &error else {
+            panic!("expected a reported failure, got {error:?}");
+        };
+        assert_eq!(failure.class(), HelperFailureClass::RateLimited);
+        assert_eq!(failure.message(), None);
+        assert_eq!(error.safe_reason(), "upstream rate limited the acquisition");
+    }
+
+    #[test]
+    fn resolve_only_failure_is_reported_with_its_class() {
+        let directory = tempfile::tempdir().unwrap();
+        let helper = directory.path().join("helper.sh");
+        fs::write(
+            &helper,
+            "#!/bin/sh\necho '{\"type\":\"failure\",\"version\":1,\"class\":\"rate_limited\",\"exception\":\"HfHubHTTPError\",\"message\":\"HfHubHTTPError: 429 Too Many Requests\"}'\nexit 13\n",
+        )
+        .unwrap();
+        let error = OfficialHfFetcher {
+            python: "sh".into(),
+            helper,
+        }
+        .inventory(&InventoryRequest {
+            repo_type: RepositoryType::Model,
+            repo_id: "public/model".into(),
+            revision: "main".into(),
+            files: Vec::new(),
+            exclude: Vec::new(),
+        })
+        .unwrap_err();
+        let UpstreamError::HelperFailure(failure) = &error else {
+            panic!("expected a reported failure, got {error:?}");
+        };
+        assert_eq!(failure.class(), HelperFailureClass::RateLimited);
+        assert!(error.to_string().contains("429"));
+    }
+
+    /// The helper sanitizes credentials, because only it knows the exception and
+    /// its context. What the parent guarantees is that a report cannot be
+    /// unbounded and cannot forge a log record.
+    #[test]
+    fn reported_failure_detail_is_bounded_as_untrusted_input() {
+        let failure = HelperFailure::reported(
+            HelperFailureClass::ClientFailure,
+            Some("Runtime\tError"),
+            Some(&format!(
+                "first line\n{{\"event\":\"archive_published\"}} {}",
+                "x".repeat(4096)
+            )),
+        );
+        assert_eq!(failure.exception(), Some("Runtime Error"));
+        let message = failure.message().unwrap();
+        assert_eq!(message.chars().count(), REPORTED_DETAIL_LIMIT);
+        assert!(!message.contains('\n'));
+        assert!(message.starts_with("first line {\"event\":\"archive_published\"} x"));
+        assert_eq!(
+            HelperFailure::reported(HelperFailureClass::ClientFailure, Some("  "), Some("\n\t"))
+                .message(),
+            None
+        );
+        assert_eq!(
+            HelperFailure::reported(HelperFailureClass::ClientFailure, None, None).safe_reason(),
+            "upstream client failure"
+        );
+    }
+
+    #[test]
+    fn helper_failure_classes_are_stable_and_credential_safe() {
+        assert_eq!(HelperFailureClass::ALL.len(), 5);
+        let mut names = std::collections::BTreeSet::new();
+        for class in HelperFailureClass::ALL {
+            assert!(names.insert(class.as_str()), "duplicate class {class:?}");
+            assert_eq!(HelperFailureClass::parse(class.as_str()), Some(class));
+            let reason = HelperFailure::from_class(class).safe_reason();
+            assert_eq!(reason, class.safe_reason());
+            assert!(!reason.is_empty());
+            assert!(!reason.contains("://"));
+            assert!(!reason.contains('\n'));
+        }
+        // The bucket this replaced is deliberately not a reportable class.
+        assert_eq!(HelperFailureClass::parse("failed"), None);
+        assert_eq!(HelperFailureClass::parse(""), None);
+    }
+
+    #[test]
+    fn io_failures_are_reported_by_kind_without_their_path() {
+        let error = UpstreamError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "/archive/.modelkeep-fetch/private-path",
+        ));
+        assert_eq!(error.safe_reason(), "upstream I/O error: PermissionDenied");
+        assert!(!error.safe_reason().contains("private-path"));
     }
 
     #[test]
