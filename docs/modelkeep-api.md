@@ -83,7 +83,7 @@ Two consequences follow, and both matter operationally:
 - **a download with no filter asks for every file**, so the whole repository is still
   acquired one file at a time. The filter is the only thing that bounds the cost, and a
   forgotten one is stopped by cancelling the running acquisition through the
-  [Admin API](admin-api.md) ([`Issue 0076`](issues/0076-cancel-a-running-acquisition.md)).
+  [Admin API](admin-api.md).
 
 A filtered `prefetch` through the [Admin API](admin-api.md) remains the way to archive
 a subset ahead of time, and is still preferable for a large repository, because it is

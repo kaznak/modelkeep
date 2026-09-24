@@ -895,6 +895,16 @@ MVP 後の候補:
 - OCI/model registry backend — [Issue 0034](issues/0034-add-oci-model-registry-backend.md)
 - ModelArk等とのarchive export/import interoperability — [Issue 0035](issues/0035-add-archive-interoperability.md)
 - upstream sourcesのHugging Face以外への拡張 — [Issue 0036](issues/0036-add-non-hugging-face-upstreams.md)
+- ~~部分取得（prefetchの`include`/`exclude`、公開済みrevisionへの単調拡張、差分だけの再取得） — [Issue 0070](https://github.com/kaznak/modelkeep/commit/380273e)、[ADR-0020](adr/0020-selection-scoped-revision-acquisition.md)~~。実機で48.41 GB（全体は469.92 GB）を実測
+- ~~cold-miss応答の有界化（resolveは`503`+`Retry-After`、metadataは既定で待機） — [Issue 0069](https://github.com/kaznak/modelkeep/commit/df52014)、[metadata方針](https://github.com/kaznak/modelkeep/commit/96b9527)~~。元の障害報告の再現が`status=000`から`200`/2.1秒へ
+- ~~ジョブ結果のno-op判別（`already_archived`/`published`/`extended`） — [Issue 0071](https://github.com/kaznak/modelkeep/commit/380273e)~~
+- ~~実行中取得の取り消し（管理APIとWeb UI、staging は再開可能なまま保持） — [Issue 0076](https://github.com/kaznak/modelkeep/commit/e3fdc70)~~
+- ~~取得の直列化（同一repositoryは1本、全体は既定2本） — [Issue 0077](https://github.com/kaznak/modelkeep/commit/e3fdc70)、[ADR-0021](adr/0021-one-transferring-acquisition-per-repository.md)~~
+- ~~内容由来のfile validator（`{commit}-{size}`衝突によるsilent corruptionの修正） — [Issue 0078](https://github.com/kaznak/modelkeep/commit/54c257e)~~
+- ~~取得せずにrepository metadataを応答し、上流のper-file metadataを記録 — [Issue 0074](https://github.com/kaznak/modelkeep/commit/aa86a70)、[ADR-0022](adr/0022-record-upstream-file-metadata.md)~~
+- ~~Hubのfieldをそのmeaningで報告し、ModelKeepのdigestは独自propertyへ — [Issue 0079](https://github.com/kaznak/modelkeep/commit/3e95df9)~~
+- ~~起動時のarchive自己検査（上流非依存・自動修復なし） — [Issue 0073](https://github.com/kaznak/modelkeep/commit/c6f5120)~~。運用手段は[Issue 0081](issues/0081-give-the-operator-actions-for-what-the-self-check-reports.md)
+- ~~構造化eventリファレンスの完成とずれを防ぐcheck — [Issue 0075](https://github.com/kaznak/modelkeep/commit/628a079)~~
 
 ModelKeep という名称は Hugging Face 専用に限定しないため、将来的に model artifact 全般の persistent pull-through mirror へ拡張できる。
 
