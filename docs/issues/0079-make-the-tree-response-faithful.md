@@ -57,8 +57,13 @@ verifiability: a Hub-semantics tool reads the Hub fields, and a client verifying
 copy reads one ModelKeep field that is always there and always equals the `ETag` it was
 served.
 
-**An unknown property must be shown not to disturb the supported clients** — measured
-against both pinned versions, not assumed from how their parsers appear to be written.
+**An unknown property must be shown not to disturb the supported clients.** Partly
+established already, on 2026-09-24 against `huggingface_hub` 1.27.0: `ModelInfo.__init__`
+pops the keys it knows and ends with `self.__dict__.update(**kwargs)`, so an unknown
+top-level key is kept rather than rejected, and constructing a sibling carrying an unknown
+key yielded `RepoSibling(rfilename=..., size=10, blob_id=None, lfs=None)` without error, so
+an unknown per-file key is ignored. **0.36.0 is not yet checked** — it is not in the
+development shell — and must be before this is treated as settled.
 
 ## Dependency
 
@@ -100,6 +105,6 @@ responses for a repository of each shape, LFS and non-LFS, and keep that observa
 
 The digest moves out of `oid`. The only thing known to read it there is a verification
 recipe written on 2026-09-24, so the cost is documenting the new location — which the
-acceptance criteria require anyway. The remaining assumption is that an unknown property is
-tolerated by the supported clients; if it is not, the fallback is to keep the Hub fields
-faithful and publish the digest on a separate route rather than to overload `oid` again.
+acceptance criteria require anyway. Tolerance of an unknown property is established for 1.27.0 and
+still open for 0.36.0; if 0.36.0 rejects it, the fallback is to keep the Hub fields faithful
+and publish the digest on a separate route rather than to overload `oid` again.
