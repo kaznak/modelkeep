@@ -1,5 +1,5 @@
 ---
-status: open
+status: in-progress
 priority: P1
 related_adrs:
   - ADR-0015
@@ -10,7 +10,7 @@ updated: 2026-09-24
 ---
 # Issue 0076: Cancel a running acquisition
 
-- Status: Open
+- Status: In Progress
 - Priority: P1
 - Related ADR: ADR-0015, ADR-0017, ADR-0009
 
@@ -87,3 +87,45 @@ for complete work; the existing publication boundary and staging identity are wh
 prevent that, and the tests must exercise them rather than assume them. Cancellation is
 an interruption, not a deletion: nothing removes archived data, and staging cleanup stays
 with the existing lease expiry path.
+
+## Implementation status
+
+Implemented on 2026-09-24 together with Issue 0077, in that order. Verified on
+x86_64-linux with `cargo fmt --check`, `cargo clippy --all-targets --all-features --
+-D warnings`, `cargo test --all-features`, and `nix flake check`, each with its exit
+status taken directly rather than through a pipe. No assertion anywhere in the diff was
+removed or altered.
+
+Cancellation reaches the transfer through a token that owns the helper's child process, so
+the canceller kills and reaps it rather than waiting for a thread that is itself blocked
+reading the helper's pipe. A running job of any kind is cancellable, and in-flight
+acquisitions — including those a client request started — are listable and cancellable
+through `/api/admin/v1/acquisitions` and the admin UI. There is one decision point:
+whichever of commit and cancel arrives first wins, so a revision is either published or
+recorded cancelled, never both and never neither.
+
+A cancelled acquisition publishes nothing and leaves staging resumable. Measured: a
+cancelled transfer resumed at 2000 bytes where a fresh one moved 3000, and a narrower
+retry moved none.
+
+Waiting clients receive `502`. A `503` would be retried automatically by both pinned
+clients, restarting the transfer that was just stopped. That a re-request legitimately
+starts new work is documented as correct rather than prevented.
+
+Attribution of requests was deliberately left out: the download plane carries no
+identity today, and a partial hint is not something an operator can act on. Identity
+belongs to Issue 0021.
+
+Two defects in the job store were fixed because cancellation depends on them: a shared
+temporary path made persistence fail with `ENOENT`, and a progress update written after
+releasing the lock could overwrite a terminal cancelled state.
+
+Sensitivity was checked by breaking each behaviour in a copy. Removing the child kill,
+letting commit always win, disabling the gate, moving metadata calls inside it, skipping
+staging preservation, and restricting cancel to queued jobs each broke the expected tests.
+Ignoring `commit` — a cancelled acquisition publishing anyway — broke nothing at first,
+which is the most dangerous case; the test that catches it was added rather than assumed.
+
+**Remaining before this issue can close**: the `502` returned to a waiting client after a
+cancellation is pinned only against a stub. The cold-miss contract was measured against
+both pinned clients; this one was not. Measure it before treating the status as a contract.

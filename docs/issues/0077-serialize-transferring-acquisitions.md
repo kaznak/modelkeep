@@ -1,5 +1,5 @@
 ---
-status: open
+status: done
 priority: P1
 related_adrs:
   - ADR-0021
@@ -10,7 +10,7 @@ updated: 2026-09-24
 ---
 # Issue 0077: Serialize transferring acquisitions
 
-- Status: Open
+- Status: Done
 - Priority: P1
 - Related ADR: ADR-0021, ADR-0005, ADR-0020
 
@@ -95,3 +95,37 @@ repository and holds one of a small number of global slots. That is only accepta
 alongside Issue 0076, and this issue should not land before it. A deadlock between the
 gate and an acquisition's own metadata calls is the sharpest implementation risk, and the
 test for it must exist before the gate is trusted.
+
+## Implementation status
+
+Implemented on 2026-09-24 after Issue 0076, as ADR-0021 requires. Verified on x86_64-linux
+with `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
+`cargo test --all-features`, and `nix flake check`, each with its exit status taken
+directly. No assertion in the diff was removed or altered.
+
+One transferring acquisition per repository, and at most
+`MODELKEEP_MAX_TRANSFERRING_ACQUISITIONS` — default two — overall, with the effective value
+reported at startup. The permit is taken only around the transfer, and reconciliation runs
+before it, so an acquisition cannot wait on a gate it holds. Single-flight is unchanged and
+sits below the gate. What holds each slot and what is waiting is visible through
+`/api/admin/v1/acquisitions` and the admin UI.
+
+A test found a real defect during implementation: an acquisition admitted after waiting
+used the difference it had computed *before* waiting, so two overlapping selections each
+transferred the shared file. Reconciling again after admission fixed it. Measured, the
+second of two overlapping acquisitions moves 200 bytes where a fresh one moves 600, and the
+shared file transfers once.
+
+Two existing concurrency tests rendezvoused inside the fake fetcher on a barrier, which
+assumed the concurrent same-repository transfers ADR-0021 now forbids. Their
+synchronisation moved to waiting for registration instead; their assertions, including the
+`calls` counts, are unchanged, and both were run fifteen times without flaking.
+
+Cancelling a `verify` or `audit` job terminates its record immediately, but the scan itself
+runs to completion in-process and its result is discarded, because the archive walk is not
+interruptible. This is documented in `docs/admin-api.md`; making the walk interruptible
+would require changes in `src/lib.rs`.
+
+Waiters on the gate poll their cancellation token every 50 ms; admission itself is
+immediate via a condvar, so the poll affects only how quickly a waiting acquisition notices
+it was cancelled.

@@ -1,5 +1,5 @@
 ---
-status: open
+status: done
 priority: P0
 related_adrs:
   - ADR-0001
@@ -9,7 +9,7 @@ updated: 2026-09-24
 ---
 # Issue 0078: Serve content-derived ETags
 
-- Status: Open
+- Status: Done
 - Priority: P0
 - Related ADR: ADR-0001, ADR-0008
 
@@ -154,3 +154,41 @@ re-download files they believe they already have. That is the correct outcome he
 what they hold may be wrong, but it should be stated in the release notes. The header
 shape is a compatibility surface; if the fix adds or changes headers beyond correcting the
 ETag value, record the decision in an ADR rather than only in this issue.
+
+## Implementation status
+
+Implemented on 2026-09-24. Verified on x86_64-linux with `cargo fmt --check`,
+`cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`,
+and `nix flake check`, each with its exit status taken directly. No assertion in the diff
+was removed or altered.
+
+The validator is the sha256 the manifest already records, carried to the serving route on
+`ResolvedFile`. `If-None-Match` compares the same value. A revision whose manifest lacks a
+digest cannot be read at all, so no response can fall back to a synthesised validator.
+
+The defect was reproduced before fixing it: against the pre-fix implementation, both pinned
+clients stored three of four shards holding another shard's bytes, and the integration test
+failed naming the differing shards. That is the field report, reproduced in CI.
+
+The header shape was measured rather than inferred, with a header-rewriting proxy in front
+of ModelKeep and a cold cache. The digest in `ETag` alone is sufficient; `x-linked-etag` is
+not needed, and both clients accept a sha256 for small non-LFS-shaped files as well, so
+recording the upstream validator turned out to be unnecessary and the helper is unchanged.
+Eight files collapse to seven blobs, the one sharing being the two files that are genuinely
+identical, with every byte matching the archive. Recorded in
+[`hugging-face-content-validator-2026-09-24.md`](../observations/hugging-face-content-validator-2026-09-24.md),
+which distinguishes what is pinned by a check from what was measured by hand.
+
+A test states that byte-identical files sharing one validator is correct, so a later change
+cannot remove deduplication in the course of fixing collisions.
+
+**Correction to this issue's operational note**: it said clients would re-download files
+whose validator changed. Measurement showed otherwise. A client that already holds a
+complete snapshot for a commit revalidates nothing — no `HEAD`, no `GET` — so a cache that
+is already wrong stays wrong after this fix and has to be deleted. Re-acquisition happens
+only where no snapshot pointer exists, and there the correct bytes are fetched rather than a
+stale blob reused.
+
+**Remaining**: exposing a per-file digest in the job record, so a corrupt acquisition is
+detectable through the Admin API rather than by inspecting a client's cache, needs
+`src/admin.rs` and was out of this change's scope.
