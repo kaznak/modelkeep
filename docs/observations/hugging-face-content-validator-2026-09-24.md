@@ -112,3 +112,48 @@ Be precise about what is pinned and what was measured by hand:
 Treat every unpinned row as an observation that can go stale, and re-measure before
 relying on it. The supported-client checks are run with the exit status taken directly,
 not through a pipe.
+
+## Checked against the Hub on the reported repository
+
+The field report that prompted Issue 0078 named `Qwen/Qwen3.8-27B` at
+`1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`, and quoted two shards of identical length that
+ModelKeep had given identical ETags. That revision is archived on the deployment, so the fix
+was checked against the exact object.
+
+Both shards are still `3979553696` bytes, and the validators are now different. Then every
+archived `.safetensors` file of that revision was compared with the Hub's own per-file digest,
+read from `repo_info(files_metadata=True)`:
+
+```text
+18 archived safetensors files checked, 0 digest mismatches
+```
+
+Two things follow, and the second was not expected.
+
+The archive holds byte-correct data for all eighteen shards. The corruption in the report was
+confined to the client's cache, as the report itself judged, and nothing needs re-fetching.
+
+**ModelKeep's validator equals the Hub's `lfs.sha256` for every one of these files.** Issue
+0078 chose to serve the digest ModelKeep records rather than to record and relay upstream's
+validator, on the grounds that a content fingerprint is what the clients need. For
+LFS-managed files the two turn out to be the same value, so the served validator is also
+faithful to what the Hub would return, without ModelKeep recording anything extra. That is a
+property of LFS objects being addressed by their sha256, not a coincidence to rely on for
+non-LFS files, where the Hub's validator is a git blob hash and ModelKeep's is not.
+
+### A correction to the report
+
+The report quoted upstream `x-linked-etag` values for the two shards:
+
+```text
+model-00006-of-00018.safetensors  0bc5214fac607f0e6cc92eec3789d4b8559410ef9fce66621ba8158e8410dae0
+model-00008-of-00018.safetensors  80b0c49033e9a0d5762562aa12f4acdb7f54da586f3d0110f28c48d91cf07892
+```
+
+The first matches both the Hub and ModelKeep. The second matches neither: the Hub reports a
+different digest for `model-00008-of-00018.safetensors`, and ModelKeep serves that same
+different digest. The `80b0c490…` value belongs to some other file or request. The report was
+assembled from two hand-issued `curl` calls, so a pairing slip is the likely explanation.
+
+This is recorded because the alternative reading — that the archive holds wrong bytes for that
+shard — would have been serious, and it was ruled out by measurement rather than by argument.
