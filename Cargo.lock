@@ -360,7 +360,7 @@ dependencies = [
 
 [[package]]
 name = "modelkeep"
-version = "0.4.9"
+version = "0.4.10"
 dependencies = [
  "axum",
  "rustix",
