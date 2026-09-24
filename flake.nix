@@ -54,7 +54,7 @@
       cargoValidation = pkgs: name: command:
         pkgs.rustPlatform.buildRustPackage {
           pname = "modelkeep-${name}";
-          version = "0.4.10";
+          version = "0.4.11";
           src = nixpkgs.lib.cleanSource ./.;
           cargoLock.lockFile = ./Cargo.lock;
           nativeBuildInputs = rustToolsFor pkgs;
@@ -81,7 +81,7 @@
         in {
         modelkeep = pkgs.rustPlatform.buildRustPackage {
           pname = "modelkeep";
-          version = "0.4.10";
+          version = "0.4.11";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
           meta.mainProgram = "modelkeep";
@@ -89,7 +89,7 @@
 
         modelkeep-image = pkgs.dockerTools.buildLayeredImage {
           name = "modelkeep";
-          tag = "0.4.10";
+          tag = "0.4.11";
           contents = [ self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep hfFetcher python pkgs.cacert pkgs.coreutils ];
           config = {
             Entrypoint = [ "${self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep}/bin/modelkeep" "serve" ];
@@ -309,7 +309,7 @@
             test "$(yq -r '.services.modelkeep.environment.MODELKEEP_TRUST_TAILSCALE_HEADERS' ${./compose.yaml})" = "true"
             image="$(yq -r '.services.modelkeep.image' ${./compose.yaml})"
             init_image="$(yq -r '.services."modelkeep-init".image' ${./compose.init.yaml})"
-            test "$image" = "ghcr.io/kaznak/modelkeep:v0.4.10"
+            test "$image" = "ghcr.io/kaznak/modelkeep:v0.4.11"
             test "$init_image" = "$image"
             test "$(yq -r '.services | keys | join(" ")' ${./compose.yaml})" = "modelkeep"
             test "$(yq -r '.services | keys | join(" ")' ${./compose.init.yaml})" = "modelkeep-init"
