@@ -34,6 +34,7 @@ headers, bearer tokens, signed URLs, or upstream error payloads.
 | `admin_archive_error` | WARN | `error` |
 | `incomplete_fetch_preserved` | WARN | `repo_id`, `requested_revision` |
 | `incomplete_fetch_recovered` | INFO | `repo_id`, `requested_revision`, `recovery_action`; resumable staging also has immutable `commit` |
+| `fetch_staging_conflict` | WARN | `repo_type`, `repo_id`, `requested_revision`, `staging` (directory name only), `lease_expires_in_seconds`, `error_class=staging_conflict` |
 | `acquisition_progress` | INFO | `request_kind`, `repo_id`, `requested_revision`, `path`, `phase`, `acquired_bytes`, `total_bytes` |
 | `acquisition_deadline_exceeded` | WARN | `request_kind`, `repo_id`, `requested_revision`, `path`, `deadline_seconds`, `acquired_bytes` |
 | `acquisition_abandoned` | ERROR | `repo_id`, `requested_revision` |
@@ -208,6 +209,41 @@ job stopped while queued behind the gate is distinguishable from one stopped whi
 transferring. A cancellation request that found the job already terminal, or its
 acquisition already past the publication point, emits nothing, because nothing
 changed.
+
+## Fetch staging collisions and recovery
+
+`fetch_staging_conflict` (WARN) is emitted when an acquisition is refused because
+fetch staging for the same repository, revision and selection is held by a lease
+that has not expired: another acquisition is running, and ADR-0017 does not let a
+second one resume its bytes from underneath it. `lease_expires_in_seconds` is how
+long that refusal can still last, which is bounded by the 120-second lease.
+
+It is deliberately not a publication conflict. Nothing is being published when it
+happens, and the revision may exist nowhere, so `error_class=staging_conflict`
+names the acquisition that holds the work rather than the archive (Issue 0083).
+The `error_class` of a management job record stays at the coarser granularity the
+management API defines (`conflict`), as it does for an upstream failure whose finer
+class lives in `upstream_fetch_failed.error_class`; the job's message names staging
+and never claims a publication.
+
+Staging left behind by a process that was killed emits nothing at the time — the
+process is gone. It is reclaimed by whichever comes first:
+
+- startup recovery, which renames an expired active marker holding a recorded
+  commit to the adoptable `fetch-abandoned-*` form and reports
+  `incomplete_fetch_recovered` with `recovery_action=preserved_for_resume`, or
+  discards one with no recorded commit and reports `recovery_action=discarded`;
+- the next acquisition of the same identity, which adopts the marker once its
+  lease has expired and reports `upstream_fetch_started` with `resumed=true`.
+  A restart that happens within the lease window leaves the marker for this path,
+  which is why an acquisition never depends on recovery having run.
+
+Neither path deletes retained data that records a commit: it is preserved by being
+renamed. A marker whose lease is absent or unreadable is left alone by both, for
+conservative manual inspection (ADR-0009), and `modelkeep self-check` counts it
+under `orphaned_staging` in the meantime. Because those directory names begin with
+a dot, `ls` and `du tmp/*` do not list them; `self-check` and
+`archive_self_check_finding` are what report them.
 
 ## Archive self-check
 

@@ -58,7 +58,7 @@ def start_server(binary, archive, helper=None):
     raise AssertionError("ModelKeep did not become ready")
 
 
-def start_admin_server(binary, archive, helper):
+def start_admin_server(binary, archive, helper, extra_environment=None, log=None):
     download_port = free_port()
     admin_port = free_port()
     download_endpoint = f"http://127.0.0.1:{download_port}"
@@ -69,16 +69,22 @@ def start_admin_server(binary, archive, helper):
     environment["MODELKEEP_ADMIN_ADDRESS"] = f"127.0.0.1:{admin_port}"
     environment["MODELKEEP_ADMIN_TOKEN"] = "fixture-token"
     environment.pop("MODELKEEP_TRUST_TAILSCALE_HEADERS", None)
+    environment.update(extra_environment or {})
     process = subprocess.Popen(
         [str(binary), "serve", str(archive), f"127.0.0.1:{download_port}"],
         env=environment,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
+        stderr=log if log is not None else subprocess.PIPE,
         start_new_session=True,
     )
     for _ in range(200):
         if process.poll() is not None:
-            raise AssertionError(process.stderr.read().decode(errors="replace"))
+            detail = (
+                process.stderr.read().decode(errors="replace")
+                if process.stderr is not None
+                else "see the server log"
+            )
+            raise AssertionError(detail)
         request = urllib.request.Request(
             f"{admin_endpoint}/api/admin/v1/status",
             headers={"Authorization": "Bearer fixture-token"},
@@ -299,6 +305,319 @@ def active_prefetch_shutdown_check(current, crash_helper, root):
     assert process.returncode == 0
 
 
+KILLED_REPO = "org/killed"
+KILLED_COMMIT = "d" * 40
+# Big enough that "half of it" is an unambiguous measurement, small enough that
+# the check stays cheap.
+KILLED_PAYLOAD = b"m" * 65536
+KILLED_RETAINED = len(KILLED_PAYLOAD) // 2
+
+# Generated into the harness's temporary directory rather than shipped under
+# tests/fixtures/, because the Nix check passes fixture paths to this script as
+# fixed positional arguments.
+KILLED_HELPER_SOURCE = '''#!/usr/bin/env python3
+"""Fixture that stalls mid-transfer once, then continues from retained bytes.
+
+Every invocation appends what it actually transferred to FIXTURE_TRANSFER_LOG, so
+a resumed acquisition's cost is measured rather than assumed.
+"""
+
+import argparse
+import json
+import os
+import time
+from pathlib import Path
+
+COMMIT = "{commit}"
+PAYLOAD = b"m" * {size}
+RETAINED = len(PAYLOAD) // 2
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--repo-id", required=True)
+parser.add_argument("--repo-type", choices=("model", "dataset"), default="model")
+parser.add_argument("--revision", required=True)
+parser.add_argument("--output")
+parser.add_argument("--file", action="append")
+parser.add_argument("--exclude", action="append")
+parser.add_argument("--resolve-only", action="store_true", dest="resolve_only")
+args = parser.parse_args()
+
+result = {{"type": "result", "commit": COMMIT, "files": ["model.bin"]}}
+
+if args.resolve_only:
+    print(json.dumps(result, separators=(",", ":")), flush=True)
+    raise SystemExit(0)
+
+if not args.output:
+    parser.error("--output is required unless --resolve-only is given")
+
+output = Path(args.output)
+output.mkdir(parents=True, exist_ok=True)
+target = output / "model.bin"
+retained = target.read_bytes() if target.is_file() else b""
+if retained and not PAYLOAD.startswith(retained):
+    raise SystemExit("staging held bytes this fixture never wrote")
+
+
+def record(transferred):
+    with open(os.environ["FIXTURE_TRANSFER_LOG"], "a") as log:
+        log.write(
+            json.dumps(
+                {{
+                    "repo_id": args.repo_id,
+                    "revision": args.revision,
+                    "retained": len(retained),
+                    "transferred": transferred,
+                }},
+                separators=(",", ":"),
+            )
+            + "\\n"
+        )
+
+
+print(json.dumps({{"type": "resolved", "version": 1, "commit": COMMIT}}), flush=True)
+
+if os.environ.get("FIXTURE_STALL") == "1":
+    # Transfer part of the payload and then stall, so the harness can force-stop
+    # the process while the acquisition is genuinely in flight.
+    target.write_bytes(PAYLOAD[:RETAINED])
+    record(RETAINED - len(retained))
+    print(
+        json.dumps(
+            {{
+                "type": "progress",
+                "phase": "downloading",
+                "unit": "bytes",
+                "completed": RETAINED,
+                "total": len(PAYLOAD),
+            }}
+        ),
+        flush=True,
+    )
+    time.sleep(300)
+
+target.write_bytes(PAYLOAD)
+record(len(PAYLOAD) - len(retained))
+print(json.dumps(result, separators=(",", ":")), flush=True)
+'''
+
+
+def write_killed_helper(path):
+    path.write_text(
+        KILLED_HELPER_SOURCE.format(commit=KILLED_COMMIT, size=len(KILLED_PAYLOAD))
+    )
+    return path
+
+
+def transfer_records(log):
+    if not log.exists():
+        return []
+    return [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
+
+
+def admin_request(admin_endpoint, path, data=None, method="GET", idempotency=None):
+    headers = {"Authorization": "Bearer fixture-token"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+        headers["X-ModelKeep-CSRF"] = "1"
+    if idempotency is not None:
+        headers["Idempotency-Key"] = idempotency
+    request = urllib.request.Request(
+        f"{admin_endpoint}/api/admin/v1/{path}",
+        data=json.dumps(data).encode() if data is not None else None,
+        headers=headers,
+        method=method,
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return response.status, json.loads(response.read())
+
+
+def submit_prefetch(admin_endpoint, idempotency, repo_id=KILLED_REPO):
+    status, job = admin_request(
+        admin_endpoint,
+        "jobs",
+        data={
+            "kind": "prefetch",
+            "repo_type": "model",
+            "repo_id": repo_id,
+            "revision": "main",
+        },
+        method="POST",
+        idempotency=idempotency,
+    )
+    assert status == 202, (status, job)
+    return job["id"]
+
+
+def await_terminal_job(admin_endpoint, job_id, timeout=120):
+    deadline = time.monotonic() + timeout
+    job = None
+    while time.monotonic() < deadline:
+        _, job = admin_request(admin_endpoint, f"jobs/{job_id}")
+        if job["state"] in ("completed", "failed", "cancelled"):
+            return job
+        time.sleep(0.05)
+    raise AssertionError(f"job never reached a terminal state: {job}")
+
+
+def server_events(log_path):
+    return [
+        json.loads(line)["fields"]
+        for line in log_path.read_text(errors="replace").splitlines()
+        if line.startswith("{")
+    ]
+
+
+def killed_staging_checkpoint(archive):
+    """The active marker a killed acquisition would leave, once it is resumable."""
+    states = []
+    for staging in sorted((archive / "tmp").glob(".fetch-active-*")):
+        payload = staging / "model.bin"
+        size = payload.stat().st_size if payload.is_file() else None
+        try:
+            metadata = json.loads((staging / ".modelkeep-fetch.json").read_text())
+        except (OSError, json.JSONDecodeError) as error:
+            states.append(f"{staging.name}: bytes={size}, metadata={error!r}")
+            continue
+        states.append(
+            f"{staging.name}: bytes={size}, resolved_commit={metadata.get('resolved_commit')!r}"
+        )
+        if size == KILLED_RETAINED and metadata.get("resolved_commit") == KILLED_COMMIT:
+            return staging, states
+    return None, states
+
+
+def await_killed_staging(process, archive):
+    for _ in range(400):
+        staging, states = killed_staging_checkpoint(archive)
+        if staging is not None:
+            return staging
+        time.sleep(0.025)
+    stop_server(process, force=True)
+    raise AssertionError(
+        "the acquisition never reached a resumable checkpoint: "
+        + ("; ".join(states) or "no active fetch staging")
+    )
+
+
+def expire_lease(staging):
+    """Model the lease expiring, which is the passage of time and nothing else.
+
+    The directory keeps its `.fetch-active-` name: renaming it by hand is exactly
+    the manual step Issue 0083 exists to remove.
+    """
+    lease = staging / ".modelkeep-staging-lease"
+    lines = lease.read_text().splitlines()
+    assert any(line.startswith("expires_at=") for line in lines), lines
+    lease.write_text(
+        "\n".join(
+            "expires_at=0" if line.startswith("expires_at=") else line for line in lines
+        )
+        + "\n"
+    )
+
+
+def killed_acquisition_resume_check(current, root):
+    """Issue 0083: force-stop, then resubmit the same identity, twice over.
+
+    `crash_recovery_check` above recreates the container *and* expires every
+    staging lease by hand before restarting, so it never exercised what a bare
+    force-stop leaves: an active marker whose lease is still live, then expired,
+    with nothing renaming it in between.
+    """
+    archive = root / "killed-archive"
+    helper = write_killed_helper(root / "killed-helper.py")
+    transfers = root / "killed-transfers.jsonl"
+    environment = {"FIXTURE_TRANSFER_LOG": str(transfers)}
+
+    # 1. An acquisition is force-stopped while it is transferring.
+    process, _, admin = start_admin_server(
+        current, archive, helper, {**environment, "FIXTURE_STALL": "1"}
+    )
+    submit_prefetch(admin, "killed-first")
+    killed = await_killed_staging(process, archive)
+    stop_server(process, force=True)
+
+    first = transfer_records(transfers)
+    assert [record["transferred"] for record in first] == [KILLED_RETAINED], first
+    assert (killed / "model.bin").stat().st_size == KILLED_RETAINED
+    assert killed.name.startswith(".fetch-active-"), killed.name
+
+    # 2. The container comes back while the dead process's lease is still live,
+    #    the same identity is resubmitted, and then the lease expires *while the
+    #    server keeps running*. That is the deployment's sequence, and it is the
+    #    one no restart can paper over: startup recovery already ran, with the
+    #    lease live, so nothing but the acquisition itself can release the marker.
+    #    The whole sequence is therefore one server session, and the absence of
+    #    `incomplete_fetch_recovered` from its log is part of the assertion.
+    session_log = root / "killed-session.log"
+    with session_log.open("wb") as log:
+        process, download, admin = start_admin_server(
+            current, archive, helper, environment, log
+        )
+        try:
+            assert killed.is_dir(), "recovery reclaimed staging whose lease was live"
+            refused = await_terminal_job(admin, submit_prefetch(admin, "killed-live"))
+            assert refused["state"] == "failed", refused
+            assert "publication" not in (refused["message"] or ""), refused
+            assert killed.is_dir(), "a refused acquisition removed the staging"
+            assert (
+                transfer_records(transfers) == first
+            ), "a refused acquisition transferred bytes"
+
+            # 3. The lease expires. Nothing is renamed, and nothing restarts.
+            expire_lease(killed)
+
+            # 4. The next acquisition of the same identity adopts the bytes.
+            resumed = await_terminal_job(
+                admin, submit_prefetch(admin, "killed-resumed")
+            )
+            with urllib.request.urlopen(
+                f"{download}/{KILLED_REPO}/resolve/{KILLED_COMMIT}/model.bin", timeout=30
+            ) as response:
+                assert response.read() == KILLED_PAYLOAD
+        finally:
+            stop_server(process)
+
+    events = server_events(session_log)
+    names = [event.get("event") for event in events]
+    assert "incomplete_fetch_recovered" not in names, names
+    conflicts = [event for event in events if event.get("event") == "fetch_staging_conflict"]
+    assert conflicts, names
+    assert conflicts[0]["error_class"] == "staging_conflict", conflicts
+    assert 0 < conflicts[0]["lease_expires_in_seconds"] <= 120, conflicts
+    assert conflicts[0]["repo_id"] == KILLED_REPO, conflicts
+
+    assert resumed["state"] == "completed", resumed
+    assert resumed["resumed"] is True, resumed
+    assert resumed["resolved_commit"] == KILLED_COMMIT, resumed
+    resumed_transfer = transfer_records(transfers)[-1]
+    assert resumed_transfer["retained"] == KILLED_RETAINED, resumed_transfer
+
+    # 5. Measure the same work from nothing, in an archive holding no staging.
+    fresh_archive = root / "fresh-archive"
+    process, _, admin = start_admin_server(current, fresh_archive, helper, environment)
+    try:
+        fresh = await_terminal_job(admin, submit_prefetch(admin, "killed-fresh"))
+    finally:
+        stop_server(process)
+
+    assert fresh["state"] == "completed", fresh
+    assert fresh["resumed"] is False, fresh
+    fresh_transfer = transfer_records(transfers)[-1]
+    assert fresh_transfer["retained"] == 0, fresh_transfer
+    assert resumed_transfer["transferred"] < fresh_transfer["transferred"], (
+        resumed_transfer,
+        fresh_transfer,
+    )
+    print(
+        "killed acquisition: resume moved "
+        f"{resumed_transfer['transferred']} bytes against "
+        f"{fresh_transfer['transferred']} from a fresh start, after reusing "
+        f"{resumed_transfer['retained']} retained bytes with no manual rename"
+    )
+
+
 def upgrade_check(old, current, root):
     archive = root / "upgrade-archive"
     payload = b"archive-created-by-v0.2.1"
@@ -385,6 +704,7 @@ def main():
         root = Path(temporary)
         active_prefetch_shutdown_check(current, crash_helper, root)
         crash_recovery_check(current, crash_helper, resume_helper, root)
+        killed_acquisition_resume_check(current, root)
         upgrade_check(old, current, root)
 
 

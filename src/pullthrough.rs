@@ -10,7 +10,10 @@ use crate::upstream::{
     InvalidOutputReason, InventoryRequest, SanitizedReason, UpstreamError, UpstreamFetcher,
     UpstreamRepositoryFiles,
 };
-use crate::{is_hf_commit, Archive, ArchiveError, RepositoryType, SourceFile, UpstreamFile};
+use crate::{
+    is_hf_commit, Archive, ArchiveError, FetchStagingError, RepositoryType, SourceFile,
+    UpstreamFile,
+};
 
 /// Identity of one in-flight acquisition.
 ///
@@ -548,6 +551,12 @@ pub enum PullThroughError {
     UnsafePath,
     Integrity,
     Storage,
+    /// Another operation already holds the work this acquisition needed: a
+    /// published revision it would have published over, or fetch staging held by
+    /// a running acquisition (Issue 0083).
+    ///
+    /// The two are different subsystems, so neither the message nor the
+    /// `fetch_staging_conflict` event calls a staging collision a publication.
     Conflict,
     /// The acquisition was stopped on request (Issue 0076).
     ///
@@ -572,7 +581,9 @@ impl std::fmt::Display for PullThroughError {
             Self::UnsafePath => "unsafe archive path",
             Self::Integrity => "archive integrity failure",
             Self::Storage => "archive storage failure",
-            Self::Conflict => "archive publication conflict",
+            Self::Conflict => {
+                "archive conflict: another operation holds this revision or its fetch staging"
+            }
             Self::Cancelled => "acquisition cancelled",
         };
         formatter.write_str(message)
@@ -1409,7 +1420,7 @@ impl PullThrough {
         let staging = self
             .archive
             .acquire_fetch_staging_for_type(repo_type, repo_id, reference, &[])
-            .map_err(|error| log_archive_failure(repo_type, repo_id, reference, "stage", error))?;
+            .map_err(|error| fetch_staging_failure(repo_type, repo_id, reference, error))?;
         progress(FetchProgress::phase(if staging.resumed {
             "resuming_snapshot"
         } else {
@@ -1679,7 +1690,7 @@ impl PullThrough {
                 &selection.identity(),
             )
             .map_err(|error| {
-                log_archive_failure(repo_type, repo_id, requested_revision, "stage", error)
+                fetch_staging_failure(repo_type, repo_id, requested_revision, error)
             })?;
         progress(FetchProgress::phase(if staging.resumed {
             "resuming_snapshot"
@@ -1989,6 +2000,27 @@ fn log_archive_failure(
         _ => {}
     }
     error.into()
+}
+
+/// Answers a failed staging acquisition (Issue 0083).
+///
+/// A staging collision is already reported where it is detected, with the
+/// `staging_conflict` class the archive gives it; nothing is logged twice here.
+/// The request-facing answer stays at the coarser granularity the management API
+/// defines for a job record, as it does for an upstream failure whose finer
+/// class lives in `upstream_fetch_failed.error_class`.
+fn fetch_staging_failure(
+    repo_type: RepositoryType,
+    repo_id: &str,
+    requested_revision: &str,
+    error: FetchStagingError,
+) -> PullThroughError {
+    match error {
+        FetchStagingError::InFlight(_) => PullThroughError::Conflict,
+        FetchStagingError::Archive(error) => {
+            log_archive_failure(repo_type, repo_id, requested_revision, "stage", error)
+        }
+    }
 }
 
 impl From<UpstreamError> for PullThroughError {
@@ -2645,6 +2677,41 @@ mod tests {
         assert!(output.contains("org/model"));
         assert!(output.contains("main"));
         assert!(!output.contains("partial.bin"));
+    }
+
+    /// A fetcher that fails the test if an acquisition ever reaches upstream.
+    struct UnreachedFetcher;
+
+    impl UpstreamFetcher for UnreachedFetcher {
+        fn fetch(&self, _request: &FetchRequest) -> Result<FetchedRevision, UpstreamError> {
+            panic!("a refused acquisition must not reach upstream");
+        }
+    }
+
+    /// Issue 0083: a running acquisition is still refused, and the refusal says
+    /// staging rather than publication all the way out to the caller.
+    #[test]
+    fn a_live_staging_lease_is_refused_as_a_staging_collision() {
+        let (writer, _guard) = capture_logs();
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        // The identity is held by an acquisition whose lease has not expired.
+        let running = archive
+            .acquire_fetch_staging("org/model", "main", &[])
+            .unwrap();
+        let pull = PullThrough::new(archive, Arc::new(UnreachedFetcher));
+
+        let error = pull.ensure("org/model", "main", &[]).unwrap_err();
+
+        assert_eq!(error, PullThroughError::Conflict);
+        // Nothing was published and no revision of this repository exists.
+        assert!(!error.to_string().contains("publi"), "{error}");
+        let output = writer.output();
+        assert!(output.contains("fetch_staging_conflict"));
+        assert!(output.contains("staging_conflict"));
+        assert!(!output.contains("archive_published"));
+        // The refused request left the running acquisition's staging alone.
+        assert!(running.path.is_dir());
     }
 
     #[test]

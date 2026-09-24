@@ -116,6 +116,49 @@ impl From<io::Error> for ArchiveError {
 
 pub type ArchiveResult<T> = Result<T, ArchiveError>;
 
+/// Why fetch staging could not be acquired (Issue 0083).
+///
+/// A staging collision is its own failure, not a publication conflict: nothing
+/// is being published when it happens, and the revision it names may exist
+/// nowhere. Reporting it as `AlreadyPublished` pointed an operator at the
+/// archive when what held the work was another acquisition.
+#[derive(Debug)]
+pub(crate) enum FetchStagingError {
+    /// Staging for this identity is held by a lease that has not expired, so an
+    /// acquisition is still running and must not be resumed from underneath
+    /// (ADR-0009, ADR-0017).
+    InFlight(PathBuf),
+    /// Any other archive failure met while acquiring staging.
+    Archive(ArchiveError),
+}
+
+impl fmt::Display for FetchStagingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InFlight(path) => write!(
+                f,
+                "fetch staging is held by a running acquisition: {}",
+                path.display()
+            ),
+            Self::Archive(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for FetchStagingError {}
+
+impl From<ArchiveError> for FetchStagingError {
+    fn from(error: ArchiveError) -> Self {
+        Self::Archive(error)
+    }
+}
+
+impl From<io::Error> for FetchStagingError {
+    fn from(error: io::Error) -> Self {
+        Self::Archive(ArchiveError::Io(error))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedFile {
     pub path: PathBuf,
@@ -1597,7 +1640,7 @@ impl Archive {
         repo_id: &str,
         requested_revision: &str,
         files: &[String],
-    ) -> ArchiveResult<FetchStaging> {
+    ) -> Result<FetchStaging, FetchStagingError> {
         self.acquire_fetch_staging_for_type(
             RepositoryType::Model,
             repo_id,
@@ -1612,7 +1655,7 @@ impl Archive {
         repo_id: &str,
         requested_revision: &str,
         files: &[String],
-    ) -> ArchiveResult<FetchStaging> {
+    ) -> Result<FetchStaging, FetchStagingError> {
         validate_repo_id(repo_id)?;
         validate_component(requested_revision)?;
         for file in files {
@@ -1646,45 +1689,29 @@ impl Archive {
                 Err(ArchiveError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
                     continue;
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.into()),
             };
             if expires_at > now {
-                return Err(ArchiveError::AlreadyPublished(old));
+                return Err(fetch_staging_in_flight(
+                    repo_type,
+                    repo_id,
+                    requested_revision,
+                    &old,
+                    expires_at - now,
+                ));
             }
-            let operation = operation_id();
-            let claimed = self
-                .root
-                .join("tmp")
-                .join(format!(".fetch-active-{operation}"));
-            match fs::rename(&old, &claimed) {
-                Ok(()) => {
-                    write_staging_lease(&claimed, &operation)?;
-                    let resolved_commit = metadata.resolved_commit.clone();
-                    if metadata.files != files {
-                        // An unrestricted staging adopted by a narrower request
-                        // is driven by that request from here on, so the
-                        // identity the acquisition records its resolved commit
-                        // under is the requesting one.
-                        write_fetch_staging_metadata(
-                            &claimed,
-                            &FetchStagingMetadata {
-                                files: files.to_vec(),
-                                ..metadata
-                            },
-                        )?;
-                    }
-                    sync_directory(&self.root.join("tmp"))?;
-                    spawn_lease_heartbeat(claimed.clone());
-                    return Ok(FetchStaging {
-                        path: claimed,
-                        resumed: true,
-                        resolved_commit,
-                    });
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
+            if let Some(claimed) = self.claim_fetch_staging(&old, metadata, files)? {
+                return Ok(claimed);
             }
         }
+        // An active marker names a *live* acquisition only while its lease says
+        // so. Before Issue 0083 this loop refused on identity alone, so a marker
+        // left behind by a process that was killed refused every later
+        // acquisition of that identity forever: nothing renames an active marker
+        // once its owner is gone, and startup recovery only reclaims one whose
+        // lease has already expired by the time it runs. The abandoned branch
+        // above has always reasoned from the lease; this one now does the same
+        // (ADR-0009, ADR-0017).
         for entry in fs::read_dir(self.root.join("tmp"))? {
             let entry = entry?;
             if !entry.file_type()?.is_dir()
@@ -1696,13 +1723,55 @@ impl Archive {
                 continue;
             }
             let path = entry.path();
-            if read_fetch_staging_metadata(&path).is_ok_and(|metadata| {
-                metadata.repo_type == repo_type
-                    && metadata.repo_id == repo_id
-                    && metadata.requested_revision == requested_revision
-                    && metadata.files == files
-            }) {
-                return Err(ArchiveError::AlreadyPublished(path));
+            let Ok(metadata) = read_fetch_staging_metadata(&path) else {
+                // Staging whose identity cannot be read is neither adopted nor
+                // refused on: recovery owns malformed staging (ADR-0017).
+                continue;
+            };
+            if metadata.repo_type != repo_type
+                || metadata.repo_id != repo_id
+                || metadata.requested_revision != requested_revision
+            {
+                continue;
+            }
+            let expires_at = match read_lease_expiry(&path) {
+                Ok(expires_at) => expires_at,
+                // A marker with no lease at all is not evidence that its owner
+                // is gone. ADR-0009 preserves unrecognizable lease state for
+                // manual inspection, and the abandoned branch skips it for the
+                // same reason, so it is neither adopted nor refused on.
+                Err(ArchiveError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if expires_at > now {
+                // A live lease is a running acquisition, and a running
+                // acquisition holds exactly the selection it was started with,
+                // which is the identity that was refused before this change and
+                // still is.
+                if metadata.files == files {
+                    return Err(fetch_staging_in_flight(
+                        repo_type,
+                        repo_id,
+                        requested_revision,
+                        &path,
+                        expires_at - now,
+                    ));
+                }
+                continue;
+            }
+            if !staging_selection_is_adoptable(&metadata.files, files)
+                || metadata.resolved_commit.is_none()
+            {
+                // The lease is expired but there is nothing a resume could be
+                // pinned to, or the bytes belong to a different selection.
+                // Leave it to recovery, which discards expired staging that
+                // records no commit, and start fresh rather than refuse.
+                continue;
+            }
+            if let Some(claimed) = self.claim_fetch_staging(&path, metadata, files)? {
+                return Ok(claimed);
             }
         }
         let path = self.create_staging(".fetch-active")?;
@@ -1722,6 +1791,68 @@ impl Archive {
             resumed: false,
             resolved_commit: None,
         })
+    }
+
+    /// Claims staging left behind by an acquisition that is no longer running.
+    ///
+    /// The rename *is* the claim: ADR-0017 makes adoption exclusive by atomically
+    /// renaming the directory into this process's own active marker, so two
+    /// retries cannot resume the same bytes. `Ok(None)` means another retry
+    /// renamed it first, which leaves the caller to keep looking. Nothing is
+    /// deleted here: retained data is preserved by being renamed, which is the
+    /// whole point of ADR-0017.
+    ///
+    /// The lease is renewed *before* the rename so that an active marker is never
+    /// observable with an expired lease. Renewing it afterwards leaves a window
+    /// in which a second retry reads the claimed marker's old expired lease,
+    /// concludes its owner is gone, and adopts the bytes a running acquisition
+    /// has just taken. A concurrent retry that reads the renewed lease under the
+    /// old name is refused instead, which is correct: a claim in progress is an
+    /// acquisition about to run.
+    fn claim_fetch_staging(
+        &self,
+        old: &Path,
+        metadata: FetchStagingMetadata,
+        files: &[String],
+    ) -> ArchiveResult<Option<FetchStaging>> {
+        let operation = operation_id();
+        let claimed = self
+            .root
+            .join("tmp")
+            .join(format!(".fetch-active-{operation}"));
+        match write_staging_lease(old, &operation) {
+            Ok(()) => {}
+            Err(ArchiveError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(None)
+            }
+            Err(error) => return Err(error),
+        }
+        match fs::rename(old, &claimed) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+        write_staging_lease(&claimed, &operation)?;
+        let resolved_commit = metadata.resolved_commit.clone();
+        if metadata.files != files {
+            // An unrestricted staging adopted by a narrower request is driven by
+            // that request from here on, so the identity the acquisition records
+            // its resolved commit under is the requesting one.
+            write_fetch_staging_metadata(
+                &claimed,
+                &FetchStagingMetadata {
+                    files: files.to_vec(),
+                    ..metadata
+                },
+            )?;
+        }
+        sync_directory(&self.root.join("tmp"))?;
+        spawn_lease_heartbeat(claimed.clone());
+        Ok(Some(FetchStaging {
+            path: claimed,
+            resumed: true,
+            resolved_commit,
+        }))
     }
 
     pub(crate) fn preserve_fetch_staging(&self, staging: &Path) -> ArchiveResult<bool> {
@@ -2590,6 +2721,36 @@ fn staging_selection_is_adoptable(recorded: &[String], requested: &[String]) -> 
     recorded.is_empty() || recorded == requested
 }
 
+/// Reports a staging collision and names it as one (Issue 0083).
+///
+/// The finer class belongs here rather than in the message a caller renders:
+/// an operator reading the log needs to tell "another acquisition already holds
+/// this work" from "the archive refused a publication", and those were the same
+/// sentence before this event existed. Only the staging directory's name is
+/// logged, never the archive path it sits under.
+fn fetch_staging_in_flight(
+    repo_type: RepositoryType,
+    repo_id: &str,
+    requested_revision: &str,
+    staging: &Path,
+    expires_in: u64,
+) -> FetchStagingError {
+    tracing::warn!(
+        event = "fetch_staging_conflict",
+        repo_type = %repo_type,
+        repo_id,
+        requested_revision,
+        error_class = "staging_conflict",
+        staging = %staging
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy(),
+        lease_expires_in_seconds = expires_in,
+        "fetch staging is held by a running acquisition"
+    );
+    FetchStagingError::InFlight(staging.to_path_buf())
+}
+
 fn read_fetch_staging_metadata(staging: &Path) -> ArchiveResult<FetchStagingMetadata> {
     let metadata: FetchStagingMetadata =
         serde_json::from_slice(&fs::read(staging.join(FETCH_STAGING_FILE))?)
@@ -2646,7 +2807,12 @@ fn write_staging_lease_with_expiry(
     nonce: &str,
     expires_at: u64,
 ) -> ArchiveResult<()> {
-    let temporary = staging.join(".modelkeep-staging-lease.part");
+    // The temporary name is per-write, as the fetch metadata writer's is: two
+    // retries claiming the same abandoned staging both write a lease into it
+    // before one of them wins the rename (Issue 0083), and a shared temporary
+    // name would let one truncate the other's half-written file and publish it
+    // as the lease.
+    let temporary = staging.join(format!(".modelkeep-staging-lease-{}.part", operation_id()));
     let mut lease = File::create(&temporary)?;
     writeln!(lease, "nonce={nonce}")?;
     writeln!(lease, "pid={}", process::id())?;
@@ -2806,7 +2972,7 @@ fn refresh_staging_lease(staging: &Path) -> ArchiveResult<()> {
         .lines()
         .find_map(|line| line.strip_prefix("nonce="))
         .ok_or_else(|| ArchiveError::IntegrityMismatch("staging lease has no nonce".into()))?;
-    let temporary = staging.join(".modelkeep-staging-lease.part");
+    let temporary = staging.join(format!(".modelkeep-staging-lease-{}.part", operation_id()));
     let mut lease = File::create(&temporary)?;
     writeln!(lease, "nonce={nonce}")?;
     writeln!(lease, "pid={}", process::id())?;
@@ -3646,9 +3812,11 @@ mod tests {
             b"partial"
         );
         assert!(!original.path.exists());
+        // The claim renewed the lease, so the resumed acquisition is live and a
+        // second one is refused as the staging collision it is.
         assert!(matches!(
             archive.acquire_fetch_staging("org/model", "main", &[]),
-            Err(ArchiveError::AlreadyPublished(_))
+            Err(FetchStagingError::InFlight(_))
         ));
         let output = writer.output();
         assert!(output.contains("incomplete_fetch_recovered"));
@@ -3656,6 +3824,158 @@ mod tests {
         assert!(output.contains("org/model"));
         assert!(output.contains("main"));
         assert!(output.contains(&"a".repeat(40)));
+    }
+
+    /// Issue 0083: the process that owned the marker is gone, and no recovery
+    /// run and no rename stands between its bytes and the next acquisition.
+    #[test]
+    fn adopts_expired_active_fetch_staging_without_recovery_or_a_rename() {
+        let (archive, _directory) = archive();
+        let commit = "a".repeat(40);
+        let killed = archive
+            .acquire_fetch_staging("org/model", "main", &[])
+            .unwrap();
+        fs::write(killed.path.join("partial.bin"), b"partial").unwrap();
+        record_fetch_resolved_commit(&killed.path, "org/model", "main", &[], &commit).unwrap();
+        // A killed process leaves its active marker exactly as it was, with a
+        // lease that then expires where it lies.
+        fs::write(
+            killed.path.join(STAGING_LEASE_FILE),
+            "nonce=killed\npid=1\nexpires_at=0\n",
+        )
+        .unwrap();
+        assert!(killed
+            .path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(".fetch-active-"));
+
+        let resumed = archive
+            .acquire_fetch_staging("org/model", "main", &[])
+            .unwrap();
+
+        assert!(resumed.resumed);
+        assert_eq!(resumed.resolved_commit, Some(commit));
+        assert_eq!(
+            fs::read(resumed.path.join("partial.bin")).unwrap(),
+            b"partial"
+        );
+        assert!(!killed.path.exists());
+    }
+
+    /// Issue 0083: the lease expiry is the whole contract. A live lease is a
+    /// running acquisition and is still refused, without its bytes being touched.
+    #[test]
+    fn live_active_fetch_staging_is_still_refused() {
+        let (writer, _guard) = capture_logs();
+        let (archive, _directory) = archive();
+        let running = archive
+            .acquire_fetch_staging("org/model", "main", &[])
+            .unwrap();
+        fs::write(running.path.join("partial.bin"), b"partial").unwrap();
+
+        let error = archive
+            .acquire_fetch_staging("org/model", "main", &[])
+            .unwrap_err();
+
+        assert!(matches!(error, FetchStagingError::InFlight(_)));
+        // Nothing was published and no revision of this repository exists, so
+        // the refusal must not name publication.
+        let message = error.to_string();
+        assert!(!message.contains("publi"), "{message}");
+        assert_eq!(
+            fs::read(running.path.join("partial.bin")).unwrap(),
+            b"partial"
+        );
+        let output = writer.output();
+        assert!(output.contains("fetch_staging_conflict"));
+        assert!(output.contains("staging_conflict"));
+        assert!(output.contains("lease_expires_in_seconds"));
+        assert!(!output.contains("publication"));
+    }
+
+    /// Issue 0083: unblocking must not widen what a resume may adopt.
+    #[test]
+    fn expired_active_fetch_staging_for_another_identity_is_not_adopted() {
+        let (archive, _directory) = archive();
+        let commit = "a".repeat(40);
+        let mut killed = Vec::new();
+        for (repo_type, repo_id, revision, files) in [
+            (RepositoryType::Model, "org/other", "main", Vec::new()),
+            (RepositoryType::Model, "org/model", "dev", Vec::new()),
+            (RepositoryType::Dataset, "org/model", "main", Vec::new()),
+            (
+                RepositoryType::Model,
+                "org/model",
+                "main",
+                vec!["other.bin".to_string()],
+            ),
+        ] {
+            let staging = archive
+                .acquire_fetch_staging_for_type(repo_type, repo_id, revision, &files)
+                .unwrap();
+            fs::write(staging.path.join("partial.bin"), b"other-identity").unwrap();
+            record_fetch_resolved_commit_for_type(
+                &staging.path,
+                repo_type,
+                repo_id,
+                revision,
+                &files,
+                &commit,
+            )
+            .unwrap();
+            fs::write(
+                staging.path.join(STAGING_LEASE_FILE),
+                "nonce=killed\npid=1\nexpires_at=0\n",
+            )
+            .unwrap();
+            killed.push(staging.path);
+        }
+
+        let fresh = archive
+            .acquire_fetch_staging("org/model", "main", &["partial.bin".to_string()])
+            .unwrap();
+
+        assert!(!fresh.resumed);
+        assert_eq!(fresh.resolved_commit, None);
+        assert!(!fresh.path.join("partial.bin").exists());
+        for path in killed {
+            assert_eq!(
+                fs::read(path.join("partial.bin")).unwrap(),
+                b"other-identity",
+                "{}",
+                path.display()
+            );
+        }
+    }
+
+    /// Issue 0083: without a recorded commit there is nothing to pin a resume
+    /// to, so the marker is neither adopted nor allowed to refuse. Recovery, not
+    /// the acquisition, decides what happens to it.
+    #[test]
+    fn expired_active_fetch_staging_without_a_resolved_commit_is_left_to_recovery() {
+        let (archive, _directory) = archive();
+        let killed = archive
+            .acquire_fetch_staging("org/model", "main", &[])
+            .unwrap();
+        fs::write(killed.path.join("partial.bin"), b"partial").unwrap();
+        fs::write(
+            killed.path.join(STAGING_LEASE_FILE),
+            "nonce=killed\npid=1\nexpires_at=0\n",
+        )
+        .unwrap();
+
+        let fresh = archive
+            .acquire_fetch_staging("org/model", "main", &[])
+            .unwrap();
+
+        assert!(!fresh.resumed);
+        assert_ne!(fresh.path, killed.path);
+        assert!(killed.path.is_dir());
+        assert_eq!(archive.recover_incomplete().unwrap(), 1);
+        assert!(!killed.path.exists());
+        assert!(fresh.path.is_dir());
     }
 
     /// ADR-0017: an interrupted unrestricted acquisition already covered every
@@ -3840,7 +4160,7 @@ mod tests {
         assert_eq!(
             results
                 .iter()
-                .filter(|result| matches!(result, Err(ArchiveError::AlreadyPublished(_))))
+                .filter(|result| matches!(result, Err(FetchStagingError::InFlight(_))))
                 .count(),
             1
         );

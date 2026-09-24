@@ -191,6 +191,36 @@ def damage_orphaned_staging(archive):
     )
 
 
+RETAINED_PARTIAL = b"retained-partial-bytes"
+
+
+def leave_killed_active_staging(archive, name, repo_id, expires_at):
+    """Staging a force-stopped acquisition leaves behind, exactly as it lies.
+
+    The name is dot-prefixed, as the deployment's was: `ls` and `du -hs tmp/*` do
+    not list it, which is why the self-check's count was the only hint it existed.
+    """
+    staging = archive / "tmp" / name
+    staging.mkdir(parents=True)
+    (staging / "partial.bin").write_bytes(RETAINED_PARTIAL)
+    (staging / ".modelkeep-fetch.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "repo_type": "model",
+                "repo_id": repo_id,
+                "requested_revision": "main",
+                "files": [],
+                "resolved_commit": HEALTHY_COMMIT,
+            }
+        )
+    )
+    (staging / ".modelkeep-staging-lease").write_text(
+        f"nonce=killed\npid=1\nexpires_at={expires_at}\n"
+    )
+    return staging
+
+
 DAMAGE_CLASSES = (
     ("missing_file", damage_missing_file, {"missing_file": 1}),
     ("size_mismatch", damage_size_mismatch, {"size_mismatch": 1}),
@@ -439,6 +469,56 @@ def check_startup_reports_findings_without_delaying_serving(binary, archive, log
     )
 
 
+def check_startup_reclaims_expired_active_staging(binary, root, log_path):
+    """Issue 0083: startup recovery reclaims a dead marker and says which it did.
+
+    Two markers are left behind: one whose lease expired, which recovery must
+    rename into the adoptable form with its bytes intact, and one whose lease is
+    still live, which recovery must not touch at all.
+    """
+    archive = build_archive(binary, root / "reclaim")
+    expired = leave_killed_active_staging(
+        archive,
+        # The deployment's name, which `du -hs tmp/*` did not list.
+        ".fetch-active-4bb1baf7182d415883bc6d0576a909d3",
+        "org/model",
+        0,
+    )
+    live = leave_killed_active_staging(
+        archive, ".fetch-active-live", "org/data", int(time.time()) + 3600
+    )
+
+    with log_path.open("wb") as log:
+        with server(binary, archive, log) as (endpoint, _admin):
+            with urllib.request.urlopen(f"{endpoint}/readyz", timeout=5) as response:
+                assert response.status == 200
+
+    events = [
+        json.loads(line)["fields"]
+        for line in log_path.read_text(errors="replace").splitlines()
+        if line.startswith("{")
+    ]
+    recovered = [
+        event for event in events if event.get("event") == "incomplete_fetch_recovered"
+    ]
+    assert len(recovered) == 1, recovered
+    assert recovered[0]["recovery_action"] == "preserved_for_resume", recovered
+    assert recovered[0]["repo_id"] == "org/model", recovered
+    assert recovered[0]["requested_revision"] == "main", recovered
+    assert recovered[0]["commit"] == HEALTHY_COMMIT, recovered
+
+    # Renamed into the adoptable form with its retained bytes intact: unblocking
+    # an acquisition never deletes what a resume would reuse (ADR-0017).
+    assert not expired.exists(), "the expired marker was left in place"
+    adoptable = sorted((archive / "tmp").glob("fetch-abandoned-*"))
+    assert len(adoptable) == 1, adoptable
+    assert (adoptable[0] / "partial.bin").read_bytes() == RETAINED_PARTIAL
+    # A live lease is a running acquisition, whatever else recovery finds.
+    assert live.is_dir(), "recovery reclaimed staging whose lease was still live"
+    assert (live / "partial.bin").read_bytes() == RETAINED_PARTIAL
+    print("startup recovery: expired marker renamed for resume, live lease untouched")
+
+
 def main():
     binary = Path(sys.argv[1])
     with tempfile.TemporaryDirectory() as temporary:
@@ -448,6 +528,9 @@ def main():
         check_internal_paths_are_counted_rather_than_reported(binary, root)
         check_published_revisions_are_untouched(binary, root)
         check_runs_with_upstream_unreachable(binary, root)
+        check_startup_reclaims_expired_active_staging(
+            binary, root, root / "reclaim.log"
+        )
         archive, _ = check_duration_is_measured_against_revision_count(binary, root)
         check_startup_reports_findings_without_delaying_serving(
             binary, archive, root / "serve.log"
