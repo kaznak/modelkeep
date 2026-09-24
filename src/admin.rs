@@ -4276,11 +4276,18 @@ mod tests {
         // The helper records its own pid, reports a resolved commit so the
         // staging stays resumable, then blocks. `exec` keeps the pid, so the pid
         // recorded here is the process a cancellation must stop.
+        //
+        // The pid is written through a temporary name so that the file existing
+        // means its contents are complete. `echo $$ > file` creates the file
+        // before it writes, and reading it in that window yields an empty
+        // string - which `/proc` joins to `/proc` itself, so both assertions
+        // below would pass vacuously and the test would fail ten seconds later
+        // with no pid in its message (Issue 0080).
         fs::write(
             &helper,
             format!(
-                "#!/bin/sh\necho $$ > '{}'\necho '{{\"type\":\"resolved\",\"commit\":\"{commit}\"}}'\nexec sleep 300\n",
-                pid_file.display()
+                "#!/bin/sh\necho $$ > '{pid}.part'\nmv '{pid}.part' '{pid}'\necho '{{\"type\":\"resolved\",\"commit\":\"{commit}\"}}'\nexec sleep 300\n",
+                pid = pid_file.display()
             ),
         )
         .unwrap();
@@ -4299,17 +4306,25 @@ mod tests {
             None,
             "cancel-helper",
         );
+        // Wait for a pid, not for a file. Parsing it as a number is what keeps
+        // an unfinished read from becoming a path that happens to exist.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !pid_file.exists() {
+        let pid = loop {
+            if let Some(pid) = fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok())
+            {
+                break pid;
+            }
             assert!(
                 std::time::Instant::now() < deadline,
-                "the helper never started"
+                "the helper never reported a pid"
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        let pid = fs::read_to_string(&pid_file).unwrap().trim().to_string();
+        };
+        let helper_process = std::path::Path::new("/proc").join(pid.to_string());
         assert!(
-            std::path::Path::new("/proc").join(&pid).exists(),
+            helper_process.exists(),
             "helper {pid} was not running before the cancellation"
         );
 
@@ -4317,7 +4332,7 @@ mod tests {
         assert_eq!(report, CancelReport::Cancelled);
         // No orphan and no zombie: whoever cancels kills and reaps the helper.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while std::path::Path::new("/proc").join(&pid).exists() {
+        while helper_process.exists() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "helper {pid} survived the cancellation"
