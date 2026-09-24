@@ -9,7 +9,8 @@ use std::{
 };
 
 use modelkeep::{
-    admin, http, pullthrough::PullThrough, upstream::OfficialHfFetcher, Archive, RepositoryType,
+    admin, http, pullthrough, pullthrough::PullThrough, upstream::OfficialHfFetcher, Archive,
+    RepositoryType,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -377,6 +378,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 error
             })?;
             spawn_startup_self_check(archive.clone());
+            let transfer_limit =
+                pullthrough::max_transferring_acquisitions_from_env().map_err(|error| {
+                    tracing::error!(
+                        event = "configuration_failed",
+                        field = "max_transferring_acquisitions",
+                        error = %error,
+                        "invalid transferring-acquisition limit"
+                    );
+                    error
+                })?;
             let upstream = match (
                 env::var("MODELKEEP_HF_PYTHON"),
                 env::var("MODELKEEP_HF_HELPER"),
@@ -386,7 +397,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         python: python.into(),
                         helper: helper.into(),
                     });
-                    let pullthrough = Arc::new(PullThrough::new(archive.clone(), fetcher));
+                    let pullthrough = Arc::new(PullThrough::with_transfer_limit(
+                        archive.clone(),
+                        fetcher,
+                        transfer_limit,
+                    ));
                     Some(pullthrough)
                 }
                 _ => None,
@@ -410,6 +425,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 metadata_cold_miss_deadline_seconds = cold_miss
                     .metadata_deadline
                     .map_or(0, |deadline| deadline.as_secs()),
+                max_transferring_acquisitions = transfer_limit,
                 "startup configuration loaded"
             );
             match (upstream, admin_config) {

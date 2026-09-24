@@ -87,6 +87,11 @@ const INDEX: &str = r#"<!doctype html>
         <button id="more-jobs" class="secondary" hidden>Load older jobs</button>
       </div>
     </section>
+
+    <section aria-labelledby="acquisitions-title">
+      <div class="section-heading"><div><p class="eyebrow">Upstream transfers</p><h2 id="acquisitions-title">Acquisitions in flight</h2></div><span id="slots">—</span></div>
+      <div id="acquisitions" class="list" aria-live="polite"><p class="empty">No acquisitions loaded.</p></div>
+    </section>
   </main>
   <script src="/admin/app.js" defer></script>
 </body>
@@ -181,6 +186,39 @@ async function loadRepository(repoType, repoId) {
   } catch (error) { $('repository-detail').replaceChildren(node('p', 'error', error.message)); }
 }
 
+function cancelButton(label, run) {
+  const button = node('button', 'secondary cancel', label); button.type = 'button';
+  button.addEventListener('click', async () => {
+    button.disabled = true;
+    try { const answer = await run(); $('form-message').textContent = `Cancellation: ${answer.cancellation.replace(/_/g, ' ')}.`; await load(); }
+    catch (error) { $('form-message').textContent = error.message; }
+    finally { button.disabled = false; }
+  });
+  return button;
+}
+
+// A cancellation is a state-changing request with no body, so it carries the
+// CSRF header explicitly rather than relying on the body-implies-write default.
+const cancel = (path) => api(path, {method: 'DELETE', headers: {'X-ModelKeep-CSRF': '1'}});
+
+function renderAcquisitions(view) {
+  $('slots').textContent = `${view.transferring}/${view.transfer_limit} transferring · ${view.waiting} waiting`;
+  if (!view.items.length) { $('acquisitions').replaceChildren(node('p', 'empty', 'No upstream acquisition is in flight.')); return; }
+  $('acquisitions').replaceChildren(...view.items.map((item) => {
+    const row = node('article', 'job'); const top = node('div', 'job-top');
+    top.append(node('strong', '', `${item.repo_type}: ${item.repo_id}@${item.requested_revision}`), node('span', `badge ${item.state}`, item.state.replace(/_/g, ' ')));
+    row.append(top);
+    const selection = [...(item.include || []).map((pattern) => `+${pattern}`), ...(item.exclude || []).map((pattern) => `-${pattern}`)];
+    row.append(node('small', 'job-meta', selection.length ? `selection ${selection.join(' ')}` : 'whole repository'));
+    const parts = [`${item.operation.replace(/_/g, ' ')}`, item.phase];
+    parts.push(item.total_bytes == null ? `${bytes(item.transferred_bytes)} transferred` : `${bytes(item.transferred_bytes)} / ${bytes(item.total_bytes)}`);
+    if (item.cancelled) parts.push('cancelling');
+    row.append(node('small', 'job-meta', parts.join(' · ')));
+    top.append(cancelButton('Cancel acquisition', () => cancel(`/api/admin/v1/acquisitions/${encodeURIComponent(item.id)}`)));
+    return row;
+  }));
+}
+
 function renderJobs(page, append = false) {
   if (!page.items.length && !append) { $('jobs').replaceChildren(node('p', 'empty', 'No management jobs yet.')); }
   const rows = page.items.map((job) => {
@@ -213,7 +251,9 @@ function renderJobs(page, append = false) {
     row.append(node('small', 'job-meta', parts.join(' · ')));
     if (active && job.total_bytes > 0) { const bar = node('progress', 'job-progress'); bar.max = job.total_bytes; bar.value = Math.min(job.progress_bytes || 0, job.total_bytes); row.append(bar); }
     else if (active) { row.append(node('progress', 'job-progress')); }
-    if (job.message) row.append(node('p', 'error', `${job.error_class}: ${job.message}`)); return row;
+    if (job.message) row.append(node('p', 'error', `${job.error_class}: ${job.message}`));
+    if (active) top.append(cancelButton('Cancel job', () => cancel(`/api/admin/v1/jobs/${encodeURIComponent(job.id)}`)));
+    return row;
   });
   if (append) $('jobs').append(...rows); else if (rows.length) $('jobs').replaceChildren(...rows);
   jobsCursor = page.next_cursor || null; $('more-jobs').hidden = jobsCursor == null;
@@ -221,8 +261,8 @@ function renderJobs(page, append = false) {
 
 async function load() {
   try {
-    const [status, repositories, jobs] = await Promise.all([api('/api/admin/v1/status'), api('/api/admin/v1/repositories?limit=50'), api('/api/admin/v1/jobs?limit=50')]);
-    renderOverview(status); renderRepositories(repositories); if (!jobsExpanded) renderJobs(jobs);
+    const [status, repositories, jobs, acquisitions] = await Promise.all([api('/api/admin/v1/status'), api('/api/admin/v1/repositories?limit=50'), api('/api/admin/v1/jobs?limit=50'), api('/api/admin/v1/acquisitions')]);
+    renderOverview(status); renderRepositories(repositories); if (!jobsExpanded) renderJobs(jobs); renderAcquisitions(acquisitions);
     const identity = status.principal.name || status.principal.login || status.principal.auth_method;
     $('connection').textContent = `Connected as ${identity} · v${status.version}`;
   } catch (error) { if (!error.message.includes('authorization required') && error.message !== 'Authentication required') $('connection').textContent = error.message; }
@@ -250,7 +290,7 @@ $('job-form').addEventListener('submit', async (event) => {
 load(); timer = setInterval(load, 3000); window.addEventListener('pagehide', () => clearInterval(timer));
 "#;
 
-const STYLE: &str = r#":root{color-scheme:dark;--bg:#0b1014;--panel:#121a20;--line:#26343d;--text:#edf5f2;--muted:#91a29f;--accent:#71e0b1;--warn:#ffd166;--error:#ff8e8e;font:16px/1.5 system-ui,sans-serif}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top left,#15352c 0,transparent 30rem),var(--bg);color:var(--text)}header,main{width:min(1180px,calc(100% - 2rem));margin:auto}header{display:flex;justify-content:space-between;align-items:end;padding:3rem 0 2rem;border-bottom:1px solid var(--line)}h1,h2,h3,p{margin-top:0}h1{font-size:clamp(2.5rem,8vw,5rem);line-height:.9;margin-bottom:0}h2{font-size:1.35rem;margin-bottom:1rem}.eyebrow{text-transform:uppercase;letter-spacing:.14em;color:var(--accent);font-size:.72rem;font-weight:700;margin-bottom:.5rem}main{display:grid;gap:2rem;padding:2rem 0 5rem}.panel,.metric{background:color-mix(in srgb,var(--panel) 92%,transparent);border:1px solid var(--line);border-radius:14px;padding:1.25rem}.auth{display:flex;justify-content:space-between;gap:2rem;align-items:end}.grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem}.operations{grid-template-columns:minmax(16rem,.7fr) minmax(20rem,1.3fr)}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:1rem}.metric span,.metric strong{display:block}.metric span,small,.empty,#connection{color:var(--muted)}.metric strong{font-size:1.3rem;margin-top:.4rem}.section-heading,.job-top,.inline{display:flex;align-items:center;justify-content:space-between;gap:1rem}.section-heading h2{margin-bottom:0}.list{display:grid;gap:.55rem}.list-row,.job{width:100%;text-align:left;background:#0d1519;border:1px solid var(--line);border-radius:10px;padding:.85rem;color:inherit}.list-row{display:flex;align-items:center;justify-content:space-between;cursor:pointer}.list-row:hover,.list-row:focus-visible{border-color:var(--accent)}.list-row span:first-child,.list-row small,.job-meta{display:block}.arrow{color:var(--accent)}button,input,select,textarea{font:inherit;border-radius:8px;border:1px solid var(--line);padding:.68rem .8rem}button{background:var(--accent);color:#082018;border:0;font-weight:750;cursor:pointer}button.secondary{background:transparent;color:var(--text);border:1px solid var(--line)}button:disabled{opacity:.55}input,select,textarea{width:100%;background:#0b1115;color:var(--text);margin:.3rem 0 1rem}label{display:block;font-weight:650}.auth form{min-width:min(26rem,100%)}.inline input{margin:0}.badge{padding:.15rem .55rem;border-radius:99px;background:#26343d;font-size:.75rem}.badge.dataset{color:#9fc5ff}.badge.completed{color:var(--accent)}.badge.failed{color:var(--error)}.badge.running{color:var(--warn)}.job p{margin:.35rem 0}.error{color:var(--error);overflow-wrap:anywhere}.compact{padding-left:1.2rem}.compact li{margin:.45rem 0;overflow-wrap:anywhere}code{font-size:.82rem}.detail{display:grid;gap:1rem}@media(max-width:760px){header{align-items:start;gap:1rem}.grid,.operations,.metrics{grid-template-columns:1fr}.auth{display:block}.section-heading{align-items:end}.jobs-panel{min-width:0}}"#;
+const STYLE: &str = r#":root{color-scheme:dark;--bg:#0b1014;--panel:#121a20;--line:#26343d;--text:#edf5f2;--muted:#91a29f;--accent:#71e0b1;--warn:#ffd166;--error:#ff8e8e;font:16px/1.5 system-ui,sans-serif}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top left,#15352c 0,transparent 30rem),var(--bg);color:var(--text)}header,main{width:min(1180px,calc(100% - 2rem));margin:auto}header{display:flex;justify-content:space-between;align-items:end;padding:3rem 0 2rem;border-bottom:1px solid var(--line)}h1,h2,h3,p{margin-top:0}h1{font-size:clamp(2.5rem,8vw,5rem);line-height:.9;margin-bottom:0}h2{font-size:1.35rem;margin-bottom:1rem}.eyebrow{text-transform:uppercase;letter-spacing:.14em;color:var(--accent);font-size:.72rem;font-weight:700;margin-bottom:.5rem}main{display:grid;gap:2rem;padding:2rem 0 5rem}.panel,.metric{background:color-mix(in srgb,var(--panel) 92%,transparent);border:1px solid var(--line);border-radius:14px;padding:1.25rem}.auth{display:flex;justify-content:space-between;gap:2rem;align-items:end}.grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem}.operations{grid-template-columns:minmax(16rem,.7fr) minmax(20rem,1.3fr)}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:1rem}.metric span,.metric strong{display:block}.metric span,small,.empty,#connection{color:var(--muted)}.metric strong{font-size:1.3rem;margin-top:.4rem}.section-heading,.job-top,.inline{display:flex;align-items:center;justify-content:space-between;gap:1rem}.section-heading h2{margin-bottom:0}.list{display:grid;gap:.55rem}.list-row,.job{width:100%;text-align:left;background:#0d1519;border:1px solid var(--line);border-radius:10px;padding:.85rem;color:inherit}.list-row{display:flex;align-items:center;justify-content:space-between;cursor:pointer}.list-row:hover,.list-row:focus-visible{border-color:var(--accent)}.list-row span:first-child,.list-row small,.job-meta{display:block}.arrow{color:var(--accent)}button,input,select,textarea{font:inherit;border-radius:8px;border:1px solid var(--line);padding:.68rem .8rem}button{background:var(--accent);color:#082018;border:0;font-weight:750;cursor:pointer}button.secondary{background:transparent;color:var(--text);border:1px solid var(--line)}button:disabled{opacity:.55}input,select,textarea{width:100%;background:#0b1115;color:var(--text);margin:.3rem 0 1rem}label{display:block;font-weight:650}.auth form{min-width:min(26rem,100%)}.inline input{margin:0}.badge{padding:.15rem .55rem;border-radius:99px;background:#26343d;font-size:.75rem}.badge.dataset{color:#9fc5ff}.badge.completed{color:var(--accent)}.badge.failed{color:var(--error)}.badge.running,.badge.waiting_for_transfer_slot{color:var(--warn)}.badge.cancelled{color:var(--muted)}.badge.transferring{color:var(--accent)}button.cancel{padding:.35rem .7rem;font-weight:650}.job p{margin:.35rem 0}.error{color:var(--error);overflow-wrap:anywhere}.compact{padding-left:1.2rem}.compact li{margin:.45rem 0;overflow-wrap:anywhere}code{font-size:.82rem}.detail{display:grid;gap:1rem}@media(max-width:760px){header{align-items:start;gap:1rem}.grid,.operations,.metrics{grid-template-columns:1fr}.auth{display:block}.section-heading{align-items:end}.jobs-panel{min-width:0}}"#;
 
 #[cfg(test)]
 mod tests {
@@ -305,5 +345,19 @@ mod tests {
         assert!(SCRIPT.contains("queued.`; $('include').value = ''; $('exclude').value = ''"));
         assert!(SCRIPT.contains("`outcome ${job.outcome.replace(/_/g, ' ')}`"));
         assert!(STYLE.contains("input,select,textarea{width:100%"));
+        // Issue 0076: a running job and an in-flight acquisition are both
+        // cancellable from the UI, and cancellation carries CSRF explicitly
+        // because it sends no body.
+        assert!(INDEX.contains("id=\"acquisitions\""));
+        assert!(INDEX.contains("id=\"slots\""));
+        assert!(SCRIPT.contains("method: 'DELETE', headers: {'X-ModelKeep-CSRF': '1'}"));
+        assert!(SCRIPT.contains("cancelButton('Cancel job'"));
+        assert!(SCRIPT.contains("cancelButton('Cancel acquisition'"));
+        assert!(SCRIPT.contains("/api/admin/v1/jobs/${encodeURIComponent(job.id)}"));
+        assert!(SCRIPT.contains("/api/admin/v1/acquisitions/${encodeURIComponent(item.id)}"));
+        assert!(SCRIPT.contains("api('/api/admin/v1/acquisitions')"));
+        assert!(SCRIPT.contains("transferring · ${view.waiting} waiting"));
+        assert!(SCRIPT.contains("if (item.cancelled) parts.push('cancelling')"));
+        assert!(STYLE.contains(".badge.waiting_for_transfer_slot"));
     }
 }

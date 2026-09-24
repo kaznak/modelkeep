@@ -808,13 +808,23 @@ fn status_for_archive_error(error: ArchiveError) -> StatusCode {
     }
 }
 
+/// The client-facing status for a pull-through failure class.
+///
+/// A cancelled acquisition (Issue 0076) is answered `502`, the existing
+/// "acquisition failed" class, rather than any new status or state of its own.
+/// It is deliberately not `503`: `503` means "acquiring, retry", and both
+/// supported clients retry it by themselves, which would immediately restart the
+/// transfer an operator just stopped. `502` is honest — the acquisition this
+/// request was waiting for did not complete — and it is never `404`, because
+/// nothing was learned about whether upstream holds the file, and never a
+/// success, because nothing was published.
 fn status_for_pullthrough_error(error: PullThroughError) -> StatusCode {
     match error {
         PullThroughError::UpstreamNotFound => StatusCode::NOT_FOUND,
         PullThroughError::UpstreamUnauthorized => StatusCode::UNAUTHORIZED,
-        PullThroughError::UpstreamUnavailable | PullThroughError::UpstreamFailed => {
-            StatusCode::BAD_GATEWAY
-        }
+        PullThroughError::UpstreamUnavailable
+        | PullThroughError::UpstreamFailed
+        | PullThroughError::Cancelled => StatusCode::BAD_GATEWAY,
         PullThroughError::Storage => StatusCode::INSUFFICIENT_STORAGE,
         PullThroughError::UnsafePath => StatusCode::BAD_REQUEST,
         PullThroughError::UpstreamInvalidOutput(_)
@@ -1697,6 +1707,23 @@ mod tests {
             *self.open.lock().unwrap() = true;
             self.changed.notify_all();
         }
+
+        /// Waits, but gives up when the acquisition is cancelled. `false` means
+        /// the transfer was stopped rather than released.
+        fn wait_cancellable(&self, cancel: &crate::upstream::Cancellation) -> bool {
+            let mut open = self.open.lock().unwrap();
+            while !*open {
+                if cancel.is_cancelled() {
+                    return false;
+                }
+                let (next, _timeout) = self
+                    .changed
+                    .wait_timeout(open, Duration::from_millis(10))
+                    .unwrap();
+                open = next;
+            }
+            true
+        }
     }
 
     /// An upstream that reports byte movement and then blocks until released,
@@ -1719,6 +1746,26 @@ mod tests {
             request: &crate::upstream::FetchRequest,
             progress: &(dyn Fn(FetchProgress) + Send + Sync),
         ) -> Result<crate::upstream::FetchedRevision, crate::upstream::UpstreamError> {
+            self.run(request, progress, None)
+        }
+
+        fn fetch_cancellable(
+            &self,
+            request: &crate::upstream::FetchRequest,
+            progress: &(dyn Fn(FetchProgress) + Send + Sync),
+            cancel: &crate::upstream::Cancellation,
+        ) -> Result<crate::upstream::FetchedRevision, crate::upstream::UpstreamError> {
+            self.run(request, progress, Some(cancel))
+        }
+    }
+
+    impl GatedFetcher {
+        fn run(
+            &self,
+            request: &crate::upstream::FetchRequest,
+            progress: &(dyn Fn(FetchProgress) + Send + Sync),
+            cancel: Option<&crate::upstream::Cancellation>,
+        ) -> Result<crate::upstream::FetchedRevision, crate::upstream::UpstreamError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let bytes = |completed: u64| FetchProgress {
                 version: 1,
@@ -1731,7 +1778,13 @@ mod tests {
             progress(bytes(4));
             // A counter that does not move is liveness, never progress.
             progress(bytes(4));
-            self.gate.wait();
+            match cancel {
+                Some(cancel) if !self.gate.wait_cancellable(cancel) => {
+                    return Err(crate::upstream::UpstreamError::Cancelled)
+                }
+                Some(_) => {}
+                None => self.gate.wait(),
+            }
             std::fs::write(request.staging.join("config.json"), b"cold-http").unwrap();
             Ok(crate::upstream::FetchedRevision {
                 commit: COLD_MISS_COMMIT.into(),
@@ -1914,6 +1967,54 @@ mod tests {
         );
         // The retry joined the flight rather than starting a second download.
         assert_eq!(fixture.acquisitions(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_acquisition_answers_a_waiting_client_with_an_upstream_failure() {
+        // Issue 0076: a client that is waiting when an operator stops the
+        // acquisition is answered from the existing failure vocabulary — `502`,
+        // "the acquisition did not complete" — rather than hanging, a false
+        // `404`, or a success that delivers nothing. It is deliberately not
+        // `503`: both supported clients retry `503` on their own, which would
+        // restart the transfer that was just stopped.
+        let fixture = ColdMissFixture::new();
+        let app = fixture.router_with(ColdMissPolicy {
+            deadline: None,
+            metadata_deadline: None,
+        });
+        let pullthrough = Arc::clone(&fixture.pullthrough);
+        let cancelling = tokio::task::spawn_blocking(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let view = pullthrough.in_flight_acquisitions();
+                if let Some(item) = view.items.iter().find(|item| item.state == "transferring") {
+                    return pullthrough.cancel_acquisition(&item.id);
+                }
+                assert!(Instant::now() < deadline, "no acquisition started");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/org/model/resolve/main/config.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            cancelling.await.unwrap(),
+            Some(crate::upstream::CancelOutcome::Cancelled)
+        );
+        // Nothing partial was published or served.
+        assert!(fixture
+            .archive
+            .list_revisions("org/model")
+            .unwrap()
+            .is_empty());
+        fixture.gate.release();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

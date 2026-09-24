@@ -21,6 +21,7 @@ headers, bearer tokens, signed URLs, or upstream error payloads.
 | `archive_selection_satisfied` | INFO | `repo_id`, `requested_revision`, immutable `commit`, `covered` |
 | `archive_storage_failed` | ERROR | `repo_id`, `requested_revision`, `operation`, `error_class=storage`, `io_kind` |
 | `admin_job_failed` | WARN | `job_id`, `job_kind`, job target (`repo_id`, `revision`), `error_class`, credential-safe `safe_reason` |
+| `admin_job_cancelled` | INFO | `job_id`, `job_kind`, job target (`repo_id`, `revision`), `previous_state` |
 | `admin_server_ready` | INFO | `listen_address` |
 | `admin_server_bind_failed` | ERROR | `listen_address`, `error` |
 | `admin_active_job_skipped` | WARN | `job_id`; an unreadable marker also has `error` |
@@ -34,6 +35,9 @@ headers, bearer tokens, signed URLs, or upstream error payloads.
 | `acquisition_progress` | INFO | `request_kind`, `repo_id`, `requested_revision`, `path`, `phase`, `acquired_bytes`, `total_bytes` |
 | `acquisition_deadline_exceeded` | WARN | `request_kind`, `repo_id`, `requested_revision`, `path`, `deadline_seconds`, `acquired_bytes` |
 | `acquisition_abandoned` | ERROR | `repo_id`, `requested_revision` |
+| `acquisition_cancelled` | WARN | `repo_id`, `requested_revision`, `operation`, `acquisition_id`, `acquired_bytes` |
+| `transfer_slot_waiting` | INFO | `repo_id`, `requested_revision`, `operation`, `transferring`, `waiting`, `transfer_limit` |
+| `transfer_slot_admitted` | INFO | `repo_id`, `requested_revision`, `operation`, `waited_ms`, `transfer_limit` |
 | `server_ready` | INFO | `listen_address` |
 | `server_bind_failed` | ERROR | `listen_address`, `error` |
 | `process_failed` | ERROR | `error` |
@@ -49,7 +53,7 @@ headers, bearer tokens, signed URLs, or upstream error payloads.
 | `archive_recovery_failed` | ERROR | `error` |
 | `archive_recovery_completed` | INFO | `recovered_staging_directories` |
 | `archive_readiness_failed` | ERROR | `error` |
-| `startup_configuration` | INFO | `pullthrough_enabled`, `management_enabled`, `cold_miss_deadline_seconds`, `metadata_cold_miss_deadline_seconds` |
+| `startup_configuration` | INFO | `pullthrough_enabled`, `management_enabled`, `cold_miss_deadline_seconds`, `metadata_cold_miss_deadline_seconds`, `max_transferring_acquisitions` |
 | `shutdown_started` | INFO | none |
 | `shutdown_completed` | INFO | none |
 | `health_probe_succeeded` | DEBUG | `endpoint` |
@@ -76,7 +80,8 @@ to.
 `unauthorized`, `invalid_output`, `storage`, `failed`, or `io`. The upstream diagnostic itself
 is intentionally excluded because helper output can contain credentials or signed
 URLs. Detailed helper diagnostics are available only through their separately
-redacted diagnostic path.
+redacted diagnostic path. An acquisition stopped on request is not an upstream
+failure and never appears here; it is reported by `acquisition_cancelled`.
 
 For an invalid fetch-helper contract, `admin_job_failed.error_class` is `upstream`
 and `safe_reason` contains only ModelKeep's fixed description of the rejected
@@ -116,6 +121,33 @@ not restarted by a retry, so this event is not a failure of the acquisition.
 
 `acquisition_abandoned` is an internal failure: the acquisition ended without a
 result. It is never a cache miss and never a partial result.
+
+## Cancellation and transfer slots
+
+`acquisition_cancelled` (WARN) is emitted once per acquisition that an operator
+stopped, by the acquisition itself as it stops, so the event records what happened
+rather than what was asked for. A repeated cancellation request emits nothing more.
+`acquired_bytes` is what had moved by then, and those bytes are kept: the same
+acquisition also emits `incomplete_fetch_preserved` when its staging is retained for
+a later retry (ADR-0017). Nothing is published, so no `archive_published` or
+`archive_extended` follows. Because single-flight collapses identical work, one
+`acquisition_cancelled` can be the answer to several waiting requests and to a
+management job at the same time.
+
+`transfer_slot_waiting` and `transfer_slot_admitted` (both INFO) bracket the
+per-repository transfer gate (ADR-0021). Every transferring acquisition emits both,
+including one admitted immediately, whose `transfer_slot_admitted.waited_ms` is `0`.
+`transferring` and `waiting` are the counts at the moment the acquisition joined the
+queue, and `transfer_limit` is the effective global limit, the same value
+`startup_configuration.max_transferring_acquisitions` reports. A resolve-only or
+metadata invocation emits neither event, because it is not gated.
+
+`admin_job_cancelled` (INFO) is emitted when a management job's record reaches the
+terminal `cancelled` state; `previous_state` is the state it was cancelled from, so a
+job stopped while queued behind the gate is distinguishable from one stopped while
+transferring. A cancellation request that found the job already terminal, or its
+acquisition already past the publication point, emits nothing, because nothing
+changed.
 
 ## Archive self-check
 
@@ -184,12 +216,16 @@ succeeded (or, for the initial parse, is emitted instead of it):
    management configuration aborts startup but is **not** reported through
    `configuration_failed` or any other event documented here — only the top-level
    `process_failed` below is emitted for it.
-7. The cold-miss deadline configuration is read; failure emits
+7. The transferring-acquisition limit is read; an invalid value emits
+   `configuration_failed` with `field=max_transferring_acquisitions` and aborts.
+   Then the cold-miss deadline configuration is read; failure emits
    `configuration_failed` with `field=cold_miss_deadline` and aborts.
 8. `startup_configuration` — guaranteed once every prior step has succeeded;
    `pullthrough_enabled` and `management_enabled` report which optional
-   subsystems are active for this process, and the two `*_deadline_seconds`
-   fields are `0` when the corresponding deadline is unconfigured.
+   subsystems are active for this process, the two `*_deadline_seconds`
+   fields are `0` when the corresponding deadline is unconfigured, and
+   `max_transferring_acquisitions` is the effective transfer limit (ADR-0021),
+   reported whether or not it was configured explicitly.
 9. The HTTP listener(s) then emit `server_ready`/`server_bind_failed` (and, when
    the management API is enabled, `admin_server_ready`/`admin_server_bind_failed`
    from a separate listener) as documented in the event table.

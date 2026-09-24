@@ -1,11 +1,13 @@
-use std::collections::BTreeSet;
-use std::sync::Arc;
-use std::time::Instant;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde::Serialize;
 
 use crate::singleflight::{Joined, SingleFlight};
 use crate::upstream::{
-    FetchProgress, FetchRequest, FileSelection, InvalidOutputReason, InventoryRequest,
-    UpstreamError, UpstreamFetcher,
+    CancelOutcome, Cancellation, FetchProgress, FetchRequest, FileSelection, InvalidOutputReason,
+    InventoryRequest, UpstreamError, UpstreamFetcher,
 };
 use crate::{is_hf_commit, Archive, ArchiveError, RepositoryType, SourceFile};
 
@@ -22,12 +24,464 @@ type AcquisitionFlights =
 type RefreshFlights =
     SingleFlight<(String, String, bool), RefreshResult, PullThroughError, FetchProgress>;
 
+/// What one acquisition reports while it resolves, before it can transfer.
+pub const RESOLVE_PHASE: &str = "resolving_revision";
+
+/// What one acquisition reports while it waits for a transfer slot (ADR-0021).
+///
+/// A management job in this phase is still `queued`: it holds no slot, has moved
+/// no bytes, and is cancellable.
+pub const TRANSFER_WAIT_PHASE: &str = "waiting_for_transfer_slot";
+
+/// How many transferring acquisitions may run at once across all repositories.
+///
+/// ADR-0021 decision 5 sets two rather than one: a limit of one would queue a
+/// single small file behind a multi-day transfer of an unrelated repository.
+pub const DEFAULT_MAX_TRANSFERRING_ACQUISITIONS: usize = 2;
+
+const MAX_TRANSFERRING_ACQUISITIONS_VARIABLE: &str = "MODELKEEP_MAX_TRANSFERRING_ACQUISITIONS";
+
+/// How often a waiter at the gate rechecks its cancellation token.
+///
+/// The gate and the cancellation token have separate locks, so a waiter polls
+/// rather than being woken by the token. The interval only bounds how long a
+/// cancelled waiter stays parked; it never delays admission, which is signalled
+/// by the gate's own condition variable.
+const GATE_CANCEL_POLL: Duration = Duration::from_millis(50);
+
+/// Reads the effective transferring-acquisition limit.
+pub fn max_transferring_acquisitions_from_env() -> Result<usize, String> {
+    max_transferring_acquisitions_from_value(std::env::var(MAX_TRANSFERRING_ACQUISITIONS_VARIABLE))
+}
+
+fn max_transferring_acquisitions_from_value(
+    value: Result<String, std::env::VarError>,
+) -> Result<usize, String> {
+    match value {
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_MAX_TRANSFERRING_ACQUISITIONS),
+        Err(error) => Err(format!(
+            "invalid {MAX_TRANSFERRING_ACQUISITIONS_VARIABLE}: {error}"
+        )),
+        Ok(value) => match value.trim().parse::<usize>() {
+            Ok(limit) if limit >= 1 => Ok(limit),
+            // Zero is rejected rather than read as "unlimited": the point of
+            // the setting is to bound concurrent transfers (ADR-0021).
+            _ => Err(format!(
+                "invalid {MAX_TRANSFERRING_ACQUISITIONS_VARIABLE}: expected a whole number of at least 1"
+            )),
+        },
+    }
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+type RepositoryKey = (RepositoryType, String);
+
+/// Serializes transferring acquisitions (ADR-0021).
+///
+/// At most one transfer runs per repository, keyed by repository type and
+/// repository ID, and at most `limit` run across all repositories. Waiting is
+/// FIFO among the tickets that could run: a ticket whose repository is busy is
+/// skipped rather than blocking a free slot for an unrelated repository, which
+/// is what keeps different repositories concurrent up to the limit.
+///
+/// The gate covers transferring invocations only. Metadata and resolve-only
+/// invocations are never gated, so an acquisition cannot block on a metadata
+/// call it makes itself (ADR-0021 decision 3).
+struct TransferGate {
+    limit: usize,
+    state: Mutex<GateState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct GateState {
+    /// The repositories that hold a slot. One repository holds at most one, so
+    /// this set's size is also the global transfer count.
+    transferring: BTreeSet<RepositoryKey>,
+    waiting: VecDeque<u64>,
+    granted: BTreeSet<u64>,
+    repository_of: BTreeMap<u64, RepositoryKey>,
+    next_ticket: u64,
+}
+
+/// One held transfer slot. Dropping it releases the slot and admits the next
+/// waiter, whether the acquisition succeeded, failed, or was cancelled.
+struct TransferPermit<'gate> {
+    gate: &'gate TransferGate,
+    repository: RepositoryKey,
+}
+
+impl Drop for TransferPermit<'_> {
+    fn drop(&mut self) {
+        let mut state = self.gate.state.lock().expect("transfer gate lock poisoned");
+        state.transferring.remove(&self.repository);
+        TransferGate::promote(&mut state, self.gate.limit);
+        drop(state);
+        self.gate.changed.notify_all();
+    }
+}
+
+impl TransferGate {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit: limit.max(1),
+            state: Mutex::new(GateState::default()),
+            changed: Condvar::new(),
+        }
+    }
+
+    /// Admits as many waiting tickets as the per-repository and global rules
+    /// allow, oldest first.
+    fn promote(state: &mut GateState, limit: usize) {
+        let mut index = 0;
+        while index < state.waiting.len() && state.transferring.len() < limit {
+            let ticket = state.waiting[index];
+            let Some(repository) = state.repository_of.get(&ticket).cloned() else {
+                state.waiting.remove(index);
+                continue;
+            };
+            if state.transferring.contains(&repository) {
+                index += 1;
+                continue;
+            }
+            state.transferring.insert(repository);
+            state.granted.insert(ticket);
+            state.waiting.remove(index);
+        }
+    }
+
+    /// Waits for a transfer slot for `repository`.
+    ///
+    /// Returns how long the caller waited, or `None` when it was admitted
+    /// immediately. A cancellation while waiting is reported as
+    /// [`PullThroughError::Cancelled`] and transfers nothing.
+    fn acquire(
+        &self,
+        repository: RepositoryKey,
+        cancel: &Cancellation,
+    ) -> Result<(TransferPermit<'_>, Option<Duration>), PullThroughError> {
+        let mut state = self.state.lock().expect("transfer gate lock poisoned");
+        let ticket = state.next_ticket;
+        state.next_ticket += 1;
+        state.repository_of.insert(ticket, repository.clone());
+        state.waiting.push_back(ticket);
+        Self::promote(&mut state, self.limit);
+        let started = Instant::now();
+        let mut waited = false;
+        loop {
+            if state.granted.remove(&ticket) {
+                state.repository_of.remove(&ticket);
+                drop(state);
+                return Ok((
+                    TransferPermit {
+                        gate: self,
+                        repository,
+                    },
+                    waited.then(|| started.elapsed()),
+                ));
+            }
+            if cancel.is_cancelled() {
+                state.waiting.retain(|waiting| *waiting != ticket);
+                state.repository_of.remove(&ticket);
+                Self::promote(&mut state, self.limit);
+                drop(state);
+                self.changed.notify_all();
+                return Err(PullThroughError::Cancelled);
+            }
+            waited = true;
+            let (next, _timeout) = self
+                .changed
+                .wait_timeout(state, GATE_CANCEL_POLL)
+                .expect("transfer gate lock poisoned");
+            state = next;
+        }
+    }
+}
+
+/// What one acquisition is doing right now, for the in-flight views.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcquisitionState {
+    Resolving,
+    Waiting,
+    Transferring,
+}
+
+impl AcquisitionState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Resolving => "resolving",
+            Self::Waiting => "waiting_for_transfer_slot",
+            Self::Transferring => "transferring",
+        }
+    }
+}
+
+/// One acquisition that is in flight right now.
+///
+/// There is deliberately no field naming who asked for it. The download data
+/// plane carries no principal (ADR-0015 keeps identity on the management plane
+/// only), so any attribution ModelKeep could report here would be a guess, and
+/// a partial hint is worse than none for an operational decision.
+#[derive(Debug, Clone, Serialize)]
+pub struct AcquisitionSnapshot {
+    pub id: String,
+    pub repo_type: RepositoryType,
+    pub repo_id: String,
+    pub requested_revision: String,
+    /// The normalized selection this acquisition runs under. Both empty means
+    /// the whole repository.
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    /// `pull_through` or `refresh`, the same vocabulary the event stream uses.
+    pub operation: &'static str,
+    pub state: &'static str,
+    pub phase: String,
+    pub transferred_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub started_at: u64,
+    pub cancelled: bool,
+}
+
+/// The in-flight view the Admin API and the admin UI report.
+#[derive(Debug, Clone, Serialize)]
+pub struct AcquisitionsView {
+    /// The effective global transfer limit (ADR-0021 decision 5).
+    pub transfer_limit: usize,
+    /// How many acquisitions hold a transfer slot.
+    pub transferring: usize,
+    /// How many are waiting for one.
+    pub waiting: usize,
+    pub items: Vec<AcquisitionSnapshot>,
+}
+
+#[derive(Debug)]
+struct LiveAcquisition {
+    state: AcquisitionState,
+    phase: String,
+    transferred_bytes: u64,
+    total_bytes: Option<u64>,
+}
+
+#[derive(Debug)]
+struct AcquisitionEntry {
+    id: String,
+    repo_type: RepositoryType,
+    repo_id: String,
+    requested_revision: String,
+    include: Vec<String>,
+    exclude: Vec<String>,
+    operation: &'static str,
+    started_at: u64,
+    cancel: Arc<Cancellation>,
+    live: Mutex<LiveAcquisition>,
+}
+
+impl AcquisitionEntry {
+    fn snapshot(&self) -> AcquisitionSnapshot {
+        let live = self.live.lock().expect("acquisition lock poisoned");
+        AcquisitionSnapshot {
+            id: self.id.clone(),
+            repo_type: self.repo_type,
+            repo_id: self.repo_id.clone(),
+            requested_revision: self.requested_revision.clone(),
+            include: self.include.clone(),
+            exclude: self.exclude.clone(),
+            operation: self.operation,
+            state: live.state.as_str(),
+            phase: live.phase.clone(),
+            transferred_bytes: live.transferred_bytes,
+            total_bytes: live.total_bytes,
+            started_at: self.started_at,
+            cancelled: self.cancel.is_cancelled(),
+        }
+    }
+}
+
+/// Every acquisition that is in flight, whether a management job or a client
+/// request started it (Issue 0076).
+#[derive(Default)]
+struct AcquisitionRegistry {
+    state: Mutex<RegistryState>,
+}
+
+#[derive(Default)]
+struct RegistryState {
+    next_id: u64,
+    entries: BTreeMap<String, Arc<AcquisitionEntry>>,
+}
+
+impl AcquisitionRegistry {
+    fn register(
+        self: &Arc<Self>,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        requested_revision: &str,
+        selection: &FileSelection,
+        operation: &'static str,
+    ) -> AcquisitionHandle {
+        let mut state = self.state.lock().expect("acquisition registry poisoned");
+        state.next_id += 1;
+        let id = format!("acq-{:012}", state.next_id);
+        let entry = Arc::new(AcquisitionEntry {
+            id: id.clone(),
+            repo_type,
+            repo_id: repo_id.to_string(),
+            requested_revision: requested_revision.to_string(),
+            include: selection.include().to_vec(),
+            exclude: selection.exclude().to_vec(),
+            operation,
+            started_at: unix_timestamp(),
+            cancel: Arc::new(Cancellation::new()),
+            live: Mutex::new(LiveAcquisition {
+                state: AcquisitionState::Resolving,
+                phase: RESOLVE_PHASE.to_string(),
+                transferred_bytes: 0,
+                total_bytes: None,
+            }),
+        });
+        state.entries.insert(id, Arc::clone(&entry));
+        drop(state);
+        AcquisitionHandle {
+            registry: Arc::clone(self),
+            entry,
+        }
+    }
+
+    fn view(&self, transfer_limit: usize) -> AcquisitionsView {
+        let state = self.state.lock().expect("acquisition registry poisoned");
+        let items = state
+            .entries
+            .values()
+            .map(|entry| entry.snapshot())
+            .collect::<Vec<_>>();
+        drop(state);
+        AcquisitionsView {
+            transfer_limit,
+            transferring: items
+                .iter()
+                .filter(|item| item.state == AcquisitionState::Transferring.as_str())
+                .count(),
+            waiting: items
+                .iter()
+                .filter(|item| item.state == AcquisitionState::Waiting.as_str())
+                .count(),
+            items,
+        }
+    }
+
+    fn entry(&self, id: &str) -> Option<Arc<AcquisitionEntry>> {
+        self.state
+            .lock()
+            .expect("acquisition registry poisoned")
+            .entries
+            .get(id)
+            .map(Arc::clone)
+    }
+
+    fn matching(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        requested_revision: &str,
+        include: &[String],
+        exclude: &[String],
+        operation: &str,
+    ) -> Option<Arc<AcquisitionEntry>> {
+        self.state
+            .lock()
+            .expect("acquisition registry poisoned")
+            .entries
+            .values()
+            .find(|entry| {
+                entry.repo_type == repo_type
+                    && entry.repo_id == repo_id
+                    && entry.requested_revision == requested_revision
+                    && entry.include == include
+                    && entry.exclude == exclude
+                    && entry.operation == operation
+            })
+            .map(Arc::clone)
+    }
+
+    fn remove(&self, id: &str) {
+        self.state
+            .lock()
+            .expect("acquisition registry poisoned")
+            .entries
+            .remove(id);
+    }
+}
+
+/// The registration one acquisition holds for as long as it runs.
+///
+/// Dropping it deregisters the acquisition, including when the acquisition
+/// thread panics, so the in-flight view cannot accumulate acquisitions that
+/// ended.
+struct AcquisitionHandle {
+    registry: Arc<AcquisitionRegistry>,
+    entry: Arc<AcquisitionEntry>,
+}
+
+impl Drop for AcquisitionHandle {
+    fn drop(&mut self) {
+        self.registry.remove(&self.entry.id);
+    }
+}
+
+impl AcquisitionHandle {
+    fn cancellation(&self) -> &Cancellation {
+        &self.entry.cancel
+    }
+
+    fn set_state(&self, state: AcquisitionState) {
+        let mut live = self.entry.live.lock().expect("acquisition lock poisoned");
+        live.state = state;
+        if state != AcquisitionState::Transferring {
+            live.phase = state_phase(state).to_string();
+        }
+    }
+
+    /// Records what a progress event says about this acquisition.
+    ///
+    /// Only a strictly higher byte count counts as transferred, for the same
+    /// reason the cold-miss liveness events do it: a repeated counter says the
+    /// transfer is alive, not that it advanced.
+    fn observe(&self, event: &FetchProgress) {
+        let mut live = self.entry.live.lock().expect("acquisition lock poisoned");
+        live.phase = event.phase.clone();
+        if event.unit.as_deref() == Some("bytes") {
+            if let Some(completed) = event.completed {
+                live.transferred_bytes = live.transferred_bytes.max(completed);
+            }
+            if live.total_bytes.is_none() {
+                live.total_bytes = event.total;
+            }
+        }
+    }
+}
+
+fn state_phase(state: AcquisitionState) -> &'static str {
+    match state {
+        AcquisitionState::Resolving => RESOLVE_PHASE,
+        AcquisitionState::Waiting => TRANSFER_WAIT_PHASE,
+        AcquisitionState::Transferring => "transferring",
+    }
+}
+
 #[derive(Clone)]
 pub struct PullThrough {
     archive: Archive,
     fetcher: Arc<dyn UpstreamFetcher>,
     flights: Arc<AcquisitionFlights>,
     refresh_flights: Arc<RefreshFlights>,
+    acquisitions: Arc<AcquisitionRegistry>,
+    gate: Arc<TransferGate>,
 }
 
 /// What one acquisition did to the archive.
@@ -66,6 +520,11 @@ pub enum PullThroughError {
     Integrity,
     Storage,
     Conflict,
+    /// The acquisition was stopped on request (Issue 0076).
+    ///
+    /// It is an interruption, not a miss and not a failure of upstream: nothing
+    /// was published, the archive is unchanged, and staging is left resumable.
+    Cancelled,
 }
 
 impl std::fmt::Display for PullThroughError {
@@ -82,12 +541,23 @@ impl std::fmt::Display for PullThroughError {
             Self::Integrity => "archive integrity failure",
             Self::Storage => "archive storage failure",
             Self::Conflict => "archive publication conflict",
+            Self::Cancelled => "acquisition cancelled",
         };
         formatter.write_str(message)
     }
 }
 
 impl std::error::Error for PullThroughError {}
+
+/// What reconciling a selection against upstream and the archive concluded.
+enum Reconciliation {
+    /// Nothing archived to reconcile against; acquire the selection as asked.
+    NotPublished,
+    /// The archive already holds every path the selection covers.
+    Satisfied(AcquisitionResult),
+    /// Only these paths are missing.
+    Missing(FileSelection),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefreshResult {
@@ -98,12 +568,72 @@ pub struct RefreshResult {
 
 impl PullThrough {
     pub fn new(archive: Archive, fetcher: Arc<dyn UpstreamFetcher>) -> Self {
+        Self::with_transfer_limit(archive, fetcher, DEFAULT_MAX_TRANSFERRING_ACQUISITIONS)
+    }
+
+    /// Builds a pull-through whose transfers are bounded by `transfer_limit`
+    /// across all repositories (ADR-0021 decision 5).
+    pub fn with_transfer_limit(
+        archive: Archive,
+        fetcher: Arc<dyn UpstreamFetcher>,
+        transfer_limit: usize,
+    ) -> Self {
         Self {
             archive,
             fetcher,
             flights: Arc::new(SingleFlight::new()),
             refresh_flights: Arc::new(SingleFlight::new()),
+            acquisitions: Arc::new(AcquisitionRegistry::default()),
+            gate: Arc::new(TransferGate::new(transfer_limit)),
         }
+    }
+
+    /// The effective global transfer limit.
+    pub fn transfer_limit(&self) -> usize {
+        self.gate.limit
+    }
+
+    /// Every acquisition in flight, with what holds each transfer slot and what
+    /// is waiting for one (Issue 0076, Issue 0077).
+    pub fn in_flight_acquisitions(&self) -> AcquisitionsView {
+        self.acquisitions.view(self.gate.limit)
+    }
+
+    /// Stops the in-flight acquisition with this identifier.
+    ///
+    /// `None` means no acquisition is in flight under that identifier, which is
+    /// different from one that had already finished.
+    pub fn cancel_acquisition(&self, id: &str) -> Option<CancelOutcome> {
+        // The acquisition itself emits `acquisition_cancelled` once it stops, so
+        // the event records what actually happened rather than what was asked.
+        Some(self.acquisitions.entry(id)?.cancel.cancel())
+    }
+
+    /// Stops the acquisition a management job is running, addressed by the
+    /// job's own target and normalized selection.
+    ///
+    /// Single-flight means one acquisition can serve a job and any number of
+    /// client requests for the same work, so cancelling here stops that shared
+    /// acquisition and therefore also the clients waiting on it. That is a
+    /// property of sharing the transfer, not a separate policy.
+    pub fn cancel_matching_acquisition(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        requested_revision: &str,
+        include: &[String],
+        exclude: &[String],
+        operation: &str,
+    ) -> Option<CancelOutcome> {
+        let entry = self.acquisitions.matching(
+            repo_type,
+            repo_id,
+            requested_revision,
+            include,
+            exclude,
+            operation,
+        )?;
+        Some(entry.cancel.cancel())
     }
 
     pub fn ensure(
@@ -289,6 +819,21 @@ impl PullThrough {
         let joined = self.flights.join(
             key,
             move |sink| {
+                // Registration happens inside the flight body, so exactly one
+                // record exists per acquisition however many callers share it,
+                // and it is visible and cancellable from the moment the work
+                // starts rather than once it reaches upstream.
+                let handle = this.acquisitions.register(
+                    repo_type,
+                    &owned_repo_id,
+                    &owned_revision,
+                    &selection,
+                    "pull_through",
+                );
+                let observed = |event: FetchProgress| {
+                    handle.observe(&event);
+                    sink(event);
+                };
                 tracing::dispatcher::with_default(&dispatch, || {
                     if reconcile {
                         this.acquire_reconciled(
@@ -296,7 +841,8 @@ impl PullThrough {
                             &owned_repo_id,
                             &owned_revision,
                             &selection,
-                            sink,
+                            &observed,
+                            &handle,
                         )
                     } else {
                         this.fetch_and_publish(
@@ -304,7 +850,8 @@ impl PullThrough {
                             &owned_repo_id,
                             &owned_revision,
                             &selection,
-                            sink,
+                            &observed,
+                            &handle,
                         )
                     }
                 })
@@ -341,22 +888,62 @@ impl PullThrough {
         requested_revision: &str,
         selection: &FileSelection,
         progress: &(dyn Fn(FetchProgress) + Send + Sync),
+        handle: &AcquisitionHandle,
     ) -> Result<AcquisitionResult, PullThroughError> {
+        // The reconciliation round trip is resolve-only and is made before any
+        // transfer slot is held (ADR-0021 decision 3), so a selection a published
+        // revision already covers is answered without ever queueing behind
+        // another repository's transfer. That is also what keeps an acquisition
+        // from waiting on a metadata call of its own.
+        let selection = match self.reconcile_selection(
+            repo_type,
+            repo_id,
+            requested_revision,
+            selection,
+            progress,
+            handle,
+        )? {
+            Reconciliation::Satisfied(result) => return Ok(result),
+            Reconciliation::Missing(narrowed) => narrowed,
+            Reconciliation::NotPublished => selection.clone(),
+        };
+        self.fetch_and_publish_selection(
+            repo_type,
+            repo_id,
+            requested_revision,
+            &selection,
+            true,
+            progress,
+            handle,
+        )
+    }
+
+    /// What upstream and the archive together say about a selection.
+    ///
+    /// `NotPublished` means there is nothing archived to reconcile against, so
+    /// the selection is acquired exactly as asked.
+    fn reconcile_selection(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        requested_revision: &str,
+        selection: &FileSelection,
+        progress: &(dyn Fn(FetchProgress) + Send + Sync),
+        handle: &AcquisitionHandle,
+    ) -> Result<Reconciliation, PullThroughError> {
         // A revision that is not published yet needs no reconciliation, and must
         // not pay for an extra upstream round trip.
         if self
             .published_commit(repo_type, repo_id, requested_revision)
             .is_none()
         {
-            return self.fetch_and_publish(
-                repo_type,
-                repo_id,
-                requested_revision,
-                selection,
-                progress,
-            );
+            return Ok(Reconciliation::NotPublished);
         }
-        progress(FetchProgress::phase("resolving_revision"));
+        if handle.cancellation().is_cancelled() {
+            return Err(PullThroughError::Cancelled);
+        }
+        handle.set_state(AcquisitionState::Resolving);
+        progress(FetchProgress::phase(RESOLVE_PHASE));
         let inventory = self
             .fetcher
             .inventory(&InventoryRequest {
@@ -375,13 +962,7 @@ impl PullThrough {
         let Some(inventory) = inventory
             .filter(|inventory| self.revision_is_published(repo_type, repo_id, &inventory.commit))
         else {
-            return self.fetch_and_publish(
-                repo_type,
-                repo_id,
-                requested_revision,
-                selection,
-                progress,
-            );
+            return Ok(Reconciliation::NotPublished);
         };
         let archived = self.archived_paths(repo_type, repo_id, &inventory.commit)?;
         let missing = inventory
@@ -392,16 +973,16 @@ impl PullThrough {
             .collect::<Vec<_>>();
         if missing.is_empty() {
             tracing::info!(event = "archive_selection_satisfied", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %requested_revision, commit = %inventory.commit, covered = inventory.files.len(), "selection is already archived");
-            return Ok(AcquisitionResult {
+            return Ok(Reconciliation::Satisfied(AcquisitionResult {
                 commit: inventory.commit,
                 outcome: AcquisitionOutcome::AlreadyArchived,
-            });
+            }));
         }
         // Narrowing to the absent paths is what keeps a repeated acquisition
         // from re-downloading what the revision already holds.
-        let narrowed =
-            FileSelection::from_paths(&missing).map_err(|_| PullThroughError::UnsafePath)?;
-        self.fetch_and_publish(repo_type, repo_id, requested_revision, &narrowed, progress)
+        Ok(Reconciliation::Missing(
+            FileSelection::from_paths(&missing).map_err(|_| PullThroughError::UnsafePath)?,
+        ))
     }
 
     /// The published, complete commit this request already resolves to, if any.
@@ -510,8 +1091,26 @@ impl PullThrough {
         let joined = self.refresh_flights.join(
             key,
             move |sink| {
+                let handle = this.acquisitions.register(
+                    repo_type,
+                    &owned_repo_id,
+                    &owned_reference,
+                    &FileSelection::all(),
+                    "refresh",
+                );
+                let observed = |event: FetchProgress| {
+                    handle.observe(&event);
+                    sink(event);
+                };
                 tracing::dispatcher::with_default(&dispatch, || {
-                    this.refresh_once(repo_type, &owned_repo_id, &owned_reference, dry_run, sink)
+                    this.refresh_once(
+                        repo_type,
+                        &owned_repo_id,
+                        &owned_reference,
+                        dry_run,
+                        &observed,
+                        &handle,
+                    )
                 })
             },
             None,
@@ -529,6 +1128,7 @@ impl PullThrough {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn refresh_once(
         &self,
         repo_type: RepositoryType,
@@ -536,11 +1136,21 @@ impl PullThrough {
         reference: &str,
         dry_run: bool,
         progress: &(dyn Fn(FetchProgress) + Send + Sync),
+        handle: &AcquisitionHandle,
     ) -> Result<RefreshResult, PullThroughError> {
         let previous = self
             .archive
             .resolve_ref_for_type(repo_type, repo_id, reference)
             .ok();
+        let cancel = handle.cancellation();
+        // A refresh transfers, so it holds a slot like any other transferring
+        // acquisition; a dry run transfers too, because it must fetch to see
+        // what the ref now resolves to.
+        let (_permit, _waited) =
+            self.enter_transfer_gate(repo_type, repo_id, reference, "refresh", progress, handle)?;
+        if cancel.is_cancelled() {
+            return Err(PullThroughError::Cancelled);
+        }
         let staging = self
             .archive
             .acquire_fetch_staging_for_type(repo_type, repo_id, reference, &[])
@@ -553,7 +1163,7 @@ impl PullThrough {
         tracing::info!(event = "upstream_fetch_started", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %reference, resumed = staging.resumed, operation = "refresh", "upstream fetch started");
         let fetched = self
             .fetcher
-            .fetch_with_progress(
+            .fetch_cancellable(
                 &FetchRequest {
                     repo_type,
                     repo_id: repo_id.into(),
@@ -564,13 +1174,25 @@ impl PullThrough {
                     resume_commit: staging.resolved_commit.clone(),
                 },
                 progress,
+                cancel,
             )
             .map_err(|error| {
                 self.handle_fetch_failure(&staging.path, repo_type, repo_id, reference, &error);
-                log_fetch_failure(repo_type, repo_id, reference, "refresh", &error);
+                self.report_fetch_failure(repo_type, repo_id, reference, "refresh", &error, handle);
                 PullThroughError::from(error)
             })?;
         tracing::info!(event = "upstream_fetch_finished", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %reference, commit = %fetched.commit, operation = "refresh", "upstream fetch finished");
+        if !cancel.commit() {
+            if self
+                .archive
+                .preserve_fetch_staging(&staging.path)
+                .is_ok_and(|preserved| preserved)
+            {
+                tracing::warn!(event = "incomplete_fetch_preserved", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %reference, "preserved interrupted upstream staging for retry");
+            }
+            log_acquisition_cancelled(&handle.entry);
+            return Err(PullThroughError::Cancelled);
+        }
         if dry_run {
             let _ = std::fs::remove_dir_all(&staging.path);
             return Ok(RefreshResult {
@@ -702,6 +1324,37 @@ impl PullThrough {
         requested_revision: &str,
         selection: &FileSelection,
         progress: &(dyn Fn(FetchProgress) + Send + Sync),
+        handle: &AcquisitionHandle,
+    ) -> Result<AcquisitionResult, PullThroughError> {
+        self.fetch_and_publish_selection(
+            repo_type,
+            repo_id,
+            requested_revision,
+            selection,
+            false,
+            progress,
+            handle,
+        )
+    }
+
+    /// Transfers a selection and publishes what it produced.
+    ///
+    /// `reconcile` says this acquisition came from the selection-driven path, so
+    /// if it had to wait for a transfer slot its selection is reconciled again
+    /// before anything is transferred. That second look is where ADR-0021's
+    /// saving actually happens: by the time a queued acquisition runs, the one
+    /// ahead of it may have archived the paths they share, and only the remainder
+    /// is worth the uplink.
+    #[allow(clippy::too_many_arguments)]
+    fn fetch_and_publish_selection(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        requested_revision: &str,
+        selection: &FileSelection,
+        reconcile: bool,
+        progress: &(dyn Fn(FetchProgress) + Send + Sync),
+        handle: &AcquisitionHandle,
     ) -> Result<AcquisitionResult, PullThroughError> {
         let required = selection.required_paths();
         if let Ok(commit) =
@@ -715,6 +1368,42 @@ impl PullThrough {
                 });
             }
         }
+        let cancel = handle.cancellation();
+        // This is the transferring invocation, so it is what the gate covers
+        // (ADR-0021 decision 3). The slot is taken before staging is created, so
+        // the number of partial snapshots on disk is bounded by the same limit.
+        let (_permit, waited) = self.enter_transfer_gate(
+            repo_type,
+            repo_id,
+            requested_revision,
+            "pull_through",
+            progress,
+            handle,
+        )?;
+        if cancel.is_cancelled() {
+            return Err(PullThroughError::Cancelled);
+        }
+        let narrowed;
+        let selection = if reconcile && waited.is_some() {
+            match self.reconcile_selection(
+                repo_type,
+                repo_id,
+                requested_revision,
+                selection,
+                progress,
+                handle,
+            )? {
+                Reconciliation::Satisfied(result) => return Ok(result),
+                Reconciliation::Missing(remaining) => {
+                    narrowed = remaining;
+                    &narrowed
+                }
+                Reconciliation::NotPublished => selection,
+            }
+        } else {
+            selection
+        };
+        handle.set_state(AcquisitionState::Transferring);
         // The normalized selection is part of the staging identity: staging
         // recorded under a different restricted selection is never adopted,
         // while staging left by an unrestricted acquisition is, because it
@@ -748,7 +1437,7 @@ impl PullThrough {
             staging: staging.path.clone(),
             resume_commit: staging.resolved_commit.clone(),
         };
-        let fetched = match self.fetcher.fetch_with_progress(&request, progress) {
+        let fetched = match self.fetcher.fetch_cancellable(&request, progress, cancel) {
             Ok(result) => result,
             Err(error) => {
                 self.handle_fetch_failure(
@@ -758,17 +1447,34 @@ impl PullThrough {
                     requested_revision,
                     &error,
                 );
-                log_fetch_failure(
+                self.report_fetch_failure(
                     repo_type,
                     repo_id,
                     requested_revision,
                     "pull_through",
                     &error,
+                    handle,
                 );
                 return Err(error.into());
             }
         };
         tracing::info!(event = "upstream_fetch_finished", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %requested_revision, commit = %fetched.commit, operation = "pull_through", "upstream fetch finished");
+        // The one place cancellation and completion are decided against each
+        // other: after this claim succeeds the acquisition publishes and a later
+        // cancel is answered "already finished", and if it fails a cancel won and
+        // nothing is published. Staging stays resumable either way, so the bytes
+        // already transferred are not thrown away (ADR-0017).
+        if !cancel.commit() {
+            if self
+                .archive
+                .preserve_fetch_staging(&staging.path)
+                .is_ok_and(|preserved| preserved)
+            {
+                tracing::warn!(event = "incomplete_fetch_preserved", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %requested_revision, "preserved interrupted upstream staging for retry");
+            }
+            log_acquisition_cancelled(&handle.entry);
+            return Err(PullThroughError::Cancelled);
+        }
         let source_files = fetched
             .files
             .iter()
@@ -858,6 +1564,10 @@ impl PullThrough {
                 | UpstreamError::Failed
                 | UpstreamError::Io(_)
                 | UpstreamError::Storage
+                // A cancellation is an interruption, not a deletion: the bytes it
+                // already moved stay resumable so a later acquisition with the
+                // same or a narrower selection adopts them (ADR-0017).
+                | UpstreamError::Cancelled
         ) && self
             .archive
             .preserve_fetch_staging(staging)
@@ -868,6 +1578,69 @@ impl PullThrough {
         }
         let _ = std::fs::remove_dir_all(staging);
     }
+
+    /// Waits for a transfer slot, reporting the wait so a management job stays
+    /// `queued` and the in-flight views show what is blocked (ADR-0021).
+    fn enter_transfer_gate(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        requested_revision: &str,
+        operation: &'static str,
+        progress: &(dyn Fn(FetchProgress) + Send + Sync),
+        handle: &AcquisitionHandle,
+    ) -> Result<(TransferPermit<'_>, Option<Duration>), PullThroughError> {
+        handle.set_state(AcquisitionState::Waiting);
+        progress(FetchProgress::phase(TRANSFER_WAIT_PHASE));
+        let view = self.in_flight_acquisitions();
+        tracing::info!(event = "transfer_slot_waiting", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %requested_revision, operation, transferring = view.transferring, waiting = view.waiting, transfer_limit = view.transfer_limit, "acquisition is waiting for a transfer slot");
+        let result = self
+            .gate
+            .acquire((repo_type, repo_id.to_string()), handle.cancellation());
+        match result {
+            Ok((permit, waited)) => {
+                handle.set_state(AcquisitionState::Transferring);
+                tracing::info!(event = "transfer_slot_admitted", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %requested_revision, operation, waited_ms = waited.map_or(0, |waited| waited.as_millis()), transfer_limit = self.gate.limit, "acquisition holds a transfer slot");
+                Ok((permit, waited))
+            }
+            Err(error) => {
+                log_acquisition_cancelled(&handle.entry);
+                Err(error)
+            }
+        }
+    }
+
+    /// Reports a failed fetch, distinguishing an interruption from an upstream
+    /// failure so a cancellation is never logged as one.
+    fn report_fetch_failure(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        requested_revision: &str,
+        operation: &str,
+        error: &UpstreamError,
+        handle: &AcquisitionHandle,
+    ) {
+        if matches!(error, UpstreamError::Cancelled) {
+            log_acquisition_cancelled(&handle.entry);
+            return;
+        }
+        log_fetch_failure(repo_type, repo_id, requested_revision, operation, error);
+    }
+}
+
+fn log_acquisition_cancelled(entry: &AcquisitionEntry) {
+    let snapshot = entry.snapshot();
+    tracing::warn!(
+        event = "acquisition_cancelled",
+        repo_type = %snapshot.repo_type,
+        repo_id = %snapshot.repo_id,
+        requested_revision = %snapshot.requested_revision,
+        operation = snapshot.operation,
+        acquisition_id = %snapshot.id,
+        acquired_bytes = snapshot.transferred_bytes,
+        "acquisition was cancelled on request"
+    );
 }
 
 fn upstream_error_class(error: &UpstreamError) -> &'static str {
@@ -879,6 +1652,9 @@ fn upstream_error_class(error: &UpstreamError) -> &'static str {
         UpstreamError::Storage => "storage",
         UpstreamError::Failed => "failed",
         UpstreamError::Io(_) => "io",
+        // A cancelled acquisition is reported by `acquisition_cancelled`, not as
+        // an upstream failure; this arm exists so the mapping stays total.
+        UpstreamError::Cancelled => "cancelled",
     }
 }
 
@@ -941,6 +1717,7 @@ impl From<UpstreamError> for PullThroughError {
             UpstreamError::InvalidOutput(reason) => Self::UpstreamInvalidOutput(reason),
             UpstreamError::Storage => Self::Storage,
             UpstreamError::Failed | UpstreamError::Io(_) => Self::UpstreamFailed,
+            UpstreamError::Cancelled => Self::Cancelled,
         }
     }
 }
@@ -962,7 +1739,7 @@ mod tests {
     use crate::upstream::{FetchedRevision, InvalidOutputReason};
     use std::fs;
     use std::io::Write;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::Barrier;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -1012,9 +1789,66 @@ mod tests {
         fail: bool,
     }
 
+    /// A fetcher whose callers all resolve to one commit.
+    ///
+    /// It used to rendezvous inside `fetch` on a barrier, which asserted that
+    /// several acquisitions for one repository were transferring at once.
+    /// ADR-0021 forbids exactly that, so the rendezvous moved outside the
+    /// transfer: it waits until `expect_in_flight` acquisitions are registered,
+    /// which they are before any of them can hold a transfer slot. Every
+    /// assertion the affected tests make is unchanged; only the synchronisation
+    /// that required simultaneous transfers is.
     struct AliasedFetcher {
         calls: Arc<AtomicUsize>,
-        barrier: Arc<Barrier>,
+        pull: Arc<std::sync::OnceLock<Arc<PullThrough>>>,
+        expect_in_flight: usize,
+        all_registered: std::sync::atomic::AtomicBool,
+    }
+
+    impl AliasedFetcher {
+        fn shared(expect_in_flight: usize) -> (Arc<Self>, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            (
+                Arc::new(Self {
+                    calls: calls.clone(),
+                    pull: Arc::new(std::sync::OnceLock::new()),
+                    expect_in_flight,
+                    all_registered: std::sync::atomic::AtomicBool::new(false),
+                }),
+                calls,
+            )
+        }
+
+        /// Blocks the first transfer until every expected acquisition is
+        /// registered in flight.
+        ///
+        /// Registration happens before an acquisition can be short-circuited by
+        /// another one publishing, so this latch is what keeps the aliases'
+        /// fetch count deterministic now that they transfer one at a time. It is
+        /// one-shot: later transfers proceed immediately, because the earlier
+        /// ones have already deregistered.
+        fn await_registrations(&self) {
+            if self.all_registered.load(Ordering::SeqCst) {
+                return;
+            }
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let in_flight = self
+                    .pull
+                    .get()
+                    .map_or(0, |pull| pull.in_flight_acquisitions().items.len());
+                if in_flight >= self.expect_in_flight {
+                    self.all_registered.store(true, Ordering::SeqCst);
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "only {in_flight} acquisition(s) registered; expected {}",
+                    self.expect_in_flight
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
     }
 
     struct SlowRefreshFetcher {
@@ -1057,9 +1891,9 @@ mod tests {
 
     impl UpstreamFetcher for AliasedFetcher {
         fn fetch(&self, request: &FetchRequest) -> Result<FetchedRevision, UpstreamError> {
+            self.await_registrations();
             self.calls.fetch_add(1, Ordering::SeqCst);
             fs::write(request.staging.join("config.json"), b"shared").unwrap();
-            self.barrier.wait();
             Ok(FetchedRevision {
                 commit: "dddddddddddddddddddddddddddddddddddddddd".into(),
                 files: vec!["config.json".into()],
@@ -1266,14 +2100,9 @@ mod tests {
     fn concurrent_different_ref_refreshes_are_independent_and_converge() {
         let root = tempfile::tempdir().unwrap();
         let archive = Archive::new(root.path()).unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let pull = Arc::new(PullThrough::new(
-            archive.clone(),
-            Arc::new(AliasedFetcher {
-                calls: calls.clone(),
-                barrier: Arc::new(Barrier::new(2)),
-            }),
-        ));
+        let (fetcher, calls) = AliasedFetcher::shared(2);
+        let pull = Arc::new(PullThrough::new(archive.clone(), fetcher.clone()));
+        assert!(fetcher.pull.set(pull.clone()).is_ok());
         let threads = ["main", "release"].map(|reference| {
             let pull = pull.clone();
             std::thread::spawn(move || pull.refresh("org/model", reference, false))
@@ -1359,14 +2188,9 @@ mod tests {
     fn cross_alias_publications_converge_on_complete_revision() {
         let root = tempfile::tempdir().unwrap();
         let archive = Archive::new(root.path()).unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let pull = Arc::new(PullThrough::new(
-            archive.clone(),
-            Arc::new(AliasedFetcher {
-                calls: calls.clone(),
-                barrier: Arc::new(Barrier::new(3)),
-            }),
-        ));
+        let (fetcher, calls) = AliasedFetcher::shared(3);
+        let pull = Arc::new(PullThrough::new(archive.clone(), fetcher.clone()));
+        assert!(fetcher.pull.set(pull.clone()).is_ok());
         let threads = [
             "main",
             "release",
@@ -2647,5 +3471,1016 @@ mod tests {
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    // ------------------------------------------------------------------
+    // Issue 0076 (cancel a running acquisition) and Issue 0077 / ADR-0021
+    // (serialize transferring acquisitions).
+    // ------------------------------------------------------------------
+
+    /// A rendezvous a fetcher waits on so a test can act mid-transfer.
+    #[derive(Default)]
+    struct Hold {
+        state: Mutex<HoldState>,
+        changed: Condvar,
+    }
+
+    #[derive(Default)]
+    struct HoldState {
+        released: bool,
+        arrived: usize,
+    }
+
+    impl Hold {
+        /// Waits to be released. `false` means the acquisition was cancelled
+        /// while it waited, which is how a fetcher that is mid-transfer notices.
+        fn wait(&self, cancel: &Cancellation) -> bool {
+            let mut state = self.state.lock().unwrap();
+            state.arrived += 1;
+            self.changed.notify_all();
+            while !state.released {
+                if cancel.is_cancelled() {
+                    return false;
+                }
+                let (next, _timeout) = self
+                    .changed
+                    .wait_timeout(state, Duration::from_millis(10))
+                    .unwrap();
+                state = next;
+            }
+            true
+        }
+
+        fn arrived(&self) -> usize {
+            self.state.lock().unwrap().arrived
+        }
+
+        fn await_arrival(&self, count: usize) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if self.arrived() >= count {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "only {} fetch(es) reached the hold; expected {count}",
+                    self.arrived()
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        fn release(&self) {
+            self.state.lock().unwrap().released = true;
+            self.changed.notify_all();
+        }
+    }
+
+    /// A fetcher that measures the bytes it moves and can be interrupted.
+    ///
+    /// It writes the selected files one at a time and skips any that staging
+    /// already holds, which is the supported client's `local_dir` resume
+    /// behaviour that ADR-0017 relies on. `transferred` therefore counts only
+    /// bytes that actually crossed the link, which is what the byte-level
+    /// acceptance criteria of Issues 0076 and 0077 are measured against.
+    struct MeasuredFetcher {
+        commit: String,
+        upstream: Vec<(String, Vec<u8>)>,
+        transferred: Arc<AtomicU64>,
+        transfers: Arc<Mutex<Vec<String>>>,
+        requests: Arc<Mutex<Vec<RecordedFetch>>>,
+        inventories: Arc<AtomicUsize>,
+        /// After this many files of one fetch have moved, wait on the hold.
+        hold_after: usize,
+        hold: Option<Arc<Hold>>,
+        /// Cancel the acquisition after the transfer is complete but before it
+        /// returns, which puts the cancellation exactly in the window between a
+        /// finished transfer and the publication claim.
+        cancel_at_the_end: bool,
+    }
+
+    impl MeasuredFetcher {
+        fn new(commit: &str, upstream: &[(&str, usize)]) -> Self {
+            Self {
+                commit: commit.into(),
+                upstream: upstream
+                    .iter()
+                    .map(|(path, size)| ((*path).to_string(), vec![b'x'; *size]))
+                    .collect(),
+                transferred: Arc::new(AtomicU64::new(0)),
+                transfers: Arc::new(Mutex::new(Vec::new())),
+                requests: Arc::new(Mutex::new(Vec::new())),
+                inventories: Arc::new(AtomicUsize::new(0)),
+                hold_after: 0,
+                hold: None,
+                cancel_at_the_end: false,
+            }
+        }
+
+        fn holding(mut self, hold: &Arc<Hold>, hold_after: usize) -> Self {
+            self.hold = Some(Arc::clone(hold));
+            self.hold_after = hold_after;
+            self
+        }
+
+        fn cancelling_at_the_end(mut self) -> Self {
+            self.cancel_at_the_end = true;
+            self
+        }
+
+        fn matches(path: &str, include: &[String], exclude: &[String]) -> bool {
+            let hit = |pattern: &String| match pattern.strip_suffix('*') {
+                Some(prefix) => path.starts_with(prefix),
+                None => path == pattern.as_str(),
+            };
+            (include.is_empty() || include.iter().any(hit)) && !exclude.iter().any(hit)
+        }
+
+        fn transferred(&self) -> u64 {
+            self.transferred.load(Ordering::SeqCst)
+        }
+
+        fn transfers_of(&self, path: &str) -> usize {
+            self.transfers
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|moved| moved.as_str() == path)
+                .count()
+        }
+    }
+
+    impl UpstreamFetcher for MeasuredFetcher {
+        fn fetch(&self, request: &FetchRequest) -> Result<FetchedRevision, UpstreamError> {
+            self.fetch_cancellable(request, &|_| {}, &Cancellation::new())
+        }
+
+        fn fetch_cancellable(
+            &self,
+            request: &FetchRequest,
+            progress: &(dyn Fn(FetchProgress) + Send + Sync),
+            cancel: &Cancellation,
+        ) -> Result<FetchedRevision, UpstreamError> {
+            self.requests.lock().unwrap().push(RecordedFetch {
+                files: request.files.clone(),
+                exclude: request.exclude.clone(),
+                resume_commit: request.resume_commit.clone(),
+            });
+            // The official helper records its resolved commit into staging; a
+            // fetcher that skips this leaves staging unresumable (ADR-0017).
+            crate::record_fetch_resolved_commit_for_type(
+                &request.staging,
+                request.repo_type,
+                &request.repo_id,
+                &request.revision,
+                &request.selection_identity(),
+                &self.commit,
+            )
+            .map_err(|_| UpstreamError::Storage)?;
+            let mut files = Vec::new();
+            let mut moved_files = 0usize;
+            let mut moved_bytes = 0u64;
+            for (path, bytes) in &self.upstream {
+                if !Self::matches(path, &request.files, &request.exclude) {
+                    continue;
+                }
+                files.push(path.clone());
+                let destination = request.staging.join(path);
+                if destination.exists() {
+                    // Already in staging: a resumed download does not re-fetch it.
+                    continue;
+                }
+                if cancel.is_cancelled() {
+                    return Err(UpstreamError::Cancelled);
+                }
+                if let Some(hold) = &self.hold {
+                    if moved_files == self.hold_after && !hold.wait(cancel) {
+                        return Err(UpstreamError::Cancelled);
+                    }
+                }
+                if cancel.is_cancelled() {
+                    return Err(UpstreamError::Cancelled);
+                }
+                if let Some(parent) = destination.parent() {
+                    fs::create_dir_all(parent).unwrap();
+                }
+                fs::write(destination, bytes).unwrap();
+                moved_files += 1;
+                moved_bytes += bytes.len() as u64;
+                self.transferred
+                    .fetch_add(bytes.len() as u64, Ordering::SeqCst);
+                self.transfers.lock().unwrap().push(path.clone());
+                progress(FetchProgress {
+                    version: 1,
+                    phase: "downloading".into(),
+                    unit: Some("bytes".into()),
+                    completed: Some(moved_bytes),
+                    total: None,
+                });
+            }
+            if files.is_empty() {
+                return Err(UpstreamError::InvalidOutput(
+                    InvalidOutputReason::EmptySnapshot,
+                ));
+            }
+            if self.cancel_at_the_end {
+                assert_eq!(cancel.cancel(), CancelOutcome::Cancelled);
+            }
+            Ok(FetchedRevision {
+                commit: self.commit.clone(),
+                files,
+                staging: request.staging.clone(),
+            })
+        }
+
+        fn inventory(
+            &self,
+            request: &InventoryRequest,
+        ) -> Result<Option<crate::upstream::RevisionInventory>, UpstreamError> {
+            self.inventories.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(crate::upstream::RevisionInventory {
+                commit: self.commit.clone(),
+                files: self
+                    .upstream
+                    .iter()
+                    .filter(|(path, _)| Self::matches(path, &request.files, &request.exclude))
+                    .map(|(path, _)| path.clone())
+                    .collect(),
+            }))
+        }
+    }
+
+    const MEASURED_COMMIT: &str = "cccccccccccccccccccccccccccccccccccccccc";
+
+    fn await_in_flight(pull: &PullThrough, state: &str, count: usize) -> AcquisitionsView {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let view = pull.in_flight_acquisitions();
+            if view.items.iter().filter(|item| item.state == state).count() >= count {
+                return view;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "expected {count} acquisition(s) in state {state}, saw {:?}",
+                view.items
+                    .iter()
+                    .map(|item| (item.repo_id.clone(), item.state))
+                    .collect::<Vec<_>>()
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn cancellation_and_completion_are_mutually_exclusive() {
+        // The one decision point: whichever of the two claims it first wins, and
+        // the other is told what happened rather than being hidden as an error.
+        let completed = Cancellation::new();
+        assert!(completed.commit());
+        assert_eq!(completed.cancel(), CancelOutcome::AlreadyFinished);
+        assert!(!completed.is_cancelled());
+
+        let cancelled = Cancellation::new();
+        assert_eq!(cancelled.cancel(), CancelOutcome::Cancelled);
+        assert_eq!(cancelled.cancel(), CancelOutcome::AlreadyCancelled);
+        assert!(!cancelled.commit());
+        assert!(cancelled.is_cancelled());
+    }
+
+    #[test]
+    fn a_client_driven_acquisition_is_listable_and_cancellable_with_waiters_attached() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let hold = Arc::new(Hold::default());
+        let fetcher = Arc::new(
+            MeasuredFetcher::new(MEASURED_COMMIT, &[("a.bin", 100), ("b.bin", 200)])
+                .holding(&hold, 1),
+        );
+        let pull = Arc::new(PullThrough::new(
+            archive.clone(),
+            Arc::clone(&fetcher) as Arc<_>,
+        ));
+
+        // Two client requests for the same work share one acquisition, so one of
+        // them is a waiter attached to the other's flight.
+        let waiters = (0..2)
+            .map(|_| {
+                let pull = Arc::clone(&pull);
+                std::thread::spawn(move || pull.ensure("org/model", "main", &[]))
+            })
+            .collect::<Vec<_>>();
+        hold.await_arrival(1);
+        let view = await_in_flight(&pull, "transferring", 1);
+        assert_eq!(view.items.len(), 1, "one shared acquisition: {view:?}");
+        let listed = view.items[0].clone();
+        assert_eq!(listed.repo_id, "org/model");
+        assert_eq!(listed.requested_revision, "main");
+        assert!(listed.include.is_empty() && listed.exclude.is_empty());
+        assert_eq!(listed.operation, "pull_through");
+        assert_eq!(listed.transferred_bytes, 100);
+
+        assert_eq!(
+            pull.cancel_acquisition(&listed.id),
+            Some(CancelOutcome::Cancelled)
+        );
+
+        // Every waiter is answered with the interruption rather than a hang, a
+        // miss, or a success that delivers nothing.
+        for waiter in waiters {
+            assert_eq!(waiter.join().unwrap(), Err(PullThroughError::Cancelled));
+        }
+        assert_eq!(fetcher.requests.lock().unwrap().len(), 1);
+        assert!(archive.list_revisions("org/model").unwrap().is_empty());
+        assert!(pull.in_flight_acquisitions().items.is_empty());
+        assert_eq!(pull.cancel_acquisition(&listed.id), None);
+
+        // A later request starts a new acquisition, which is the documented
+        // behaviour: cancellation is an interruption, not a cooldown.
+        hold.release();
+        assert_eq!(
+            pull.ensure("org/model", "main", &[]).unwrap(),
+            MEASURED_COMMIT
+        );
+    }
+
+    #[test]
+    fn a_cancelled_acquisition_publishes_nothing_and_leaves_resumable_staging() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let hold = Arc::new(Hold::default());
+        let fetcher = Arc::new(
+            MeasuredFetcher::new(MEASURED_COMMIT, &[("a.bin", 100), ("b.bin", 200)])
+                .holding(&hold, 1),
+        );
+        let pull = Arc::new(PullThrough::new(archive.clone(), fetcher));
+        let acquiring = {
+            let pull = Arc::clone(&pull);
+            std::thread::spawn(move || pull.ensure("org/model", "main", &[]))
+        };
+        hold.await_arrival(1);
+        let view = await_in_flight(&pull, "transferring", 1);
+        assert_eq!(
+            pull.cancel_acquisition(&view.items[0].id),
+            Some(CancelOutcome::Cancelled)
+        );
+        assert_eq!(acquiring.join().unwrap(), Err(PullThroughError::Cancelled));
+
+        // Nothing partial is observable: no revision, no ref, no manifest.
+        assert!(archive.list_revisions("org/model").unwrap().is_empty());
+        assert!(archive.resolve_ref("org/model", "main").is_err());
+        assert!(!archive
+            .revision_path("org/model", MEASURED_COMMIT)
+            .unwrap()
+            .exists());
+        // The bytes it did move are kept, as resumable staging rather than as
+        // archive content (ADR-0017): a cancel is an interruption, not a delete.
+        let staged = fs::read_dir(root.path().join("tmp"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("fetch-abandoned-"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            staged.len(),
+            1,
+            "expected preserved staging, saw {staged:?}"
+        );
+        assert!(root
+            .path()
+            .join("tmp")
+            .join(&staged[0])
+            .join("a.bin")
+            .exists());
+    }
+
+    #[test]
+    fn a_resumed_acquisition_after_a_cancellation_transfers_fewer_bytes_than_a_fresh_one() {
+        let upstream: &[(&str, usize)] = &[("a.bin", 1000), ("b.bin", 2000)];
+
+        // The number a fresh start costs, measured rather than assumed.
+        let fresh_root = tempfile::tempdir().unwrap();
+        let fresh_archive = Archive::new(fresh_root.path()).unwrap();
+        let fresh_fetcher = Arc::new(MeasuredFetcher::new(MEASURED_COMMIT, upstream));
+        let fresh = PullThrough::new(fresh_archive, Arc::clone(&fresh_fetcher) as Arc<_>);
+        assert_eq!(
+            fresh.ensure("org/model", "main", &[]).unwrap(),
+            MEASURED_COMMIT
+        );
+        let fresh_bytes = fresh_fetcher.transferred();
+        assert_eq!(fresh_bytes, 3000);
+
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let hold = Arc::new(Hold::default());
+        let fetcher = Arc::new(MeasuredFetcher::new(MEASURED_COMMIT, upstream).holding(&hold, 1));
+        let pull = Arc::new(PullThrough::new(
+            archive.clone(),
+            Arc::clone(&fetcher) as Arc<_>,
+        ));
+        let acquiring = {
+            let pull = Arc::clone(&pull);
+            std::thread::spawn(move || pull.ensure("org/model", "main", &[]))
+        };
+        hold.await_arrival(1);
+        let view = await_in_flight(&pull, "transferring", 1);
+        assert_eq!(
+            pull.cancel_acquisition(&view.items[0].id),
+            Some(CancelOutcome::Cancelled)
+        );
+        assert_eq!(acquiring.join().unwrap(), Err(PullThroughError::Cancelled));
+        let cancelled_bytes = fetcher.transferred();
+        assert_eq!(cancelled_bytes, 1000);
+
+        // The retry adopts that staging and pays only for what is missing.
+        hold.release();
+        assert_eq!(
+            pull.ensure("org/model", "main", &[]).unwrap(),
+            MEASURED_COMMIT
+        );
+        let resumed_bytes = fetcher.transferred() - cancelled_bytes;
+        assert_eq!(resumed_bytes, 2000);
+        assert!(
+            resumed_bytes < fresh_bytes,
+            "resumed transfer {resumed_bytes} was not cheaper than a fresh {fresh_bytes}"
+        );
+        assert_eq!(
+            fetcher.requests.lock().unwrap()[1].resume_commit.as_deref(),
+            Some(MEASURED_COMMIT),
+            "the retry did not resume the recorded commit"
+        );
+        assert_eq!(fetcher.transfers_of("a.bin"), 1);
+        assert!(archive
+            .is_complete_revision("org/model", MEASURED_COMMIT)
+            .unwrap());
+    }
+
+    #[test]
+    fn a_narrower_acquisition_after_a_cancellation_also_resumes_the_staging() {
+        let upstream: &[(&str, usize)] = &[("a.bin", 1000), ("b.bin", 2000)];
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let hold = Arc::new(Hold::default());
+        let fetcher = Arc::new(MeasuredFetcher::new(MEASURED_COMMIT, upstream).holding(&hold, 1));
+        let pull = Arc::new(PullThrough::new(
+            archive.clone(),
+            Arc::clone(&fetcher) as Arc<_>,
+        ));
+        let acquiring = {
+            let pull = Arc::clone(&pull);
+            std::thread::spawn(move || pull.ensure("org/model", "main", &[]))
+        };
+        hold.await_arrival(1);
+        let view = await_in_flight(&pull, "transferring", 1);
+        assert_eq!(
+            pull.cancel_acquisition(&view.items[0].id),
+            Some(CancelOutcome::Cancelled)
+        );
+        assert_eq!(acquiring.join().unwrap(), Err(PullThroughError::Cancelled));
+        assert_eq!(fetcher.transferred(), 1000);
+
+        // A narrower selection adopts the unrestricted staging and needs nothing
+        // more, because the one path it asks for is already there.
+        hold.release();
+        assert_eq!(
+            pull.ensure("org/model", "main", &["a.bin".to_string()])
+                .unwrap(),
+            MEASURED_COMMIT
+        );
+        assert_eq!(fetcher.transferred(), 1000, "a resumed path was re-fetched");
+    }
+
+    #[test]
+    fn a_cancellation_that_lands_after_the_transfer_still_publishes_nothing() {
+        // The hard half of the race, made deterministic: the cancellation lands
+        // in the window between a finished transfer and the publication claim.
+        // `commit` is the only thing that decides it, so the acquisition must
+        // publish nothing, report the interruption, and keep its bytes.
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let fetcher = Arc::new(
+            MeasuredFetcher::new(MEASURED_COMMIT, &[("a.bin", 100)]).cancelling_at_the_end(),
+        );
+        let pull = PullThrough::new(archive.clone(), Arc::clone(&fetcher) as Arc<_>);
+        assert_eq!(
+            pull.ensure("org/model", "main", &[]),
+            Err(PullThroughError::Cancelled)
+        );
+        assert_eq!(fetcher.transferred(), 100, "the transfer did not complete");
+        assert!(archive.list_revisions("org/model").unwrap().is_empty());
+        assert!(archive.resolve_ref("org/model", "main").is_err());
+        assert!(!archive
+            .revision_path("org/model", MEASURED_COMMIT)
+            .unwrap()
+            .exists());
+        // The completed transfer is kept as resumable staging, not discarded.
+        let staged = fs::read_dir(root.path().join("tmp"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("fetch-abandoned-"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            staged.len(),
+            1,
+            "expected preserved staging, saw {staged:?}"
+        );
+    }
+
+    #[test]
+    fn a_cancel_that_races_completion_leaves_consistent_state() {
+        // Every iteration ends in exactly one of two states: published and
+        // completed, or reported cancelled and nothing published. Never both,
+        // and never neither.
+        for iteration in 0..24u64 {
+            let root = tempfile::tempdir().unwrap();
+            let archive = Archive::new(root.path()).unwrap();
+            let fetcher = Arc::new(MeasuredFetcher::new(MEASURED_COMMIT, &[("a.bin", 64)]));
+            let pull = Arc::new(PullThrough::new(archive.clone(), fetcher));
+            let acquiring = {
+                let pull = Arc::clone(&pull);
+                std::thread::spawn(move || pull.ensure("org/model", "main", &[]))
+            };
+            // Sweep the cancel across the acquisition's whole lifetime so it
+            // lands before, during, and after the publication claim.
+            std::thread::sleep(Duration::from_micros(iteration * 120));
+            let cancelled = pull
+                .in_flight_acquisitions()
+                .items
+                .first()
+                .and_then(|item| pull.cancel_acquisition(&item.id));
+            let result = acquiring.join().unwrap();
+            let published = archive
+                .is_complete_revision("org/model", MEASURED_COMMIT)
+                .unwrap_or(false);
+            match result {
+                Ok(commit) => {
+                    assert_eq!(commit, MEASURED_COMMIT);
+                    assert!(
+                        published,
+                        "iteration {iteration} completed without publishing"
+                    );
+                    assert_ne!(
+                        cancelled,
+                        Some(CancelOutcome::Cancelled),
+                        "iteration {iteration} reported a cancellation and published"
+                    );
+                }
+                Err(PullThroughError::Cancelled) => {
+                    assert!(
+                        !published,
+                        "iteration {iteration} was cancelled and published anyway"
+                    );
+                }
+                Err(other) => panic!("iteration {iteration} failed unexpectedly: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn cancelling_one_acquisition_leaves_another_repositorys_acquisition_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let hold = Arc::new(Hold::default());
+        let fetcher =
+            Arc::new(MeasuredFetcher::new(MEASURED_COMMIT, &[("a.bin", 100)]).holding(&hold, 0));
+        let pull = Arc::new(PullThrough::new(archive.clone(), fetcher));
+        let threads = ["org/first", "org/second"].map(|repo_id| {
+            let pull = Arc::clone(&pull);
+            std::thread::spawn(move || (repo_id, pull.ensure(repo_id, "main", &[])))
+        });
+        hold.await_arrival(2);
+        let view = await_in_flight(&pull, "transferring", 2);
+        let doomed = view
+            .items
+            .iter()
+            .find(|item| item.repo_id == "org/first")
+            .expect("the first repository is in flight");
+        assert_eq!(
+            pull.cancel_acquisition(&doomed.id),
+            Some(CancelOutcome::Cancelled)
+        );
+        hold.release();
+        for thread in threads {
+            let (repo_id, result) = thread.join().unwrap();
+            if repo_id == "org/first" {
+                assert_eq!(result, Err(PullThroughError::Cancelled));
+            } else {
+                assert_eq!(result.unwrap(), MEASURED_COMMIT);
+            }
+        }
+        assert!(archive.list_revisions("org/first").unwrap().is_empty());
+        assert!(archive
+            .is_complete_revision("org/second", MEASURED_COMMIT)
+            .unwrap());
+    }
+
+    #[test]
+    fn a_second_acquisition_for_one_repository_waits_for_the_first_to_finish() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let hold = Arc::new(Hold::default());
+        let fetcher = Arc::new(
+            MeasuredFetcher::new(MEASURED_COMMIT, &[("a.bin", 100), ("b.bin", 200)])
+                .holding(&hold, 0),
+        );
+        let pull = Arc::new(PullThrough::new(
+            archive.clone(),
+            Arc::clone(&fetcher) as Arc<_>,
+        ));
+        let first = {
+            let pull = Arc::clone(&pull);
+            std::thread::spawn(move || {
+                pull.ensure_selected_for_type(
+                    RepositoryType::Model,
+                    "org/model",
+                    "main",
+                    &selection(&["a.bin"], &[]),
+                )
+            })
+        };
+        hold.await_arrival(1);
+        await_in_flight(&pull, "transferring", 1);
+        let second = {
+            let pull = Arc::clone(&pull);
+            std::thread::spawn(move || {
+                pull.ensure_selected_for_type(
+                    RepositoryType::Model,
+                    "org/model",
+                    "main",
+                    &selection(&["b.bin"], &[]),
+                )
+            })
+        };
+        // The second acquisition is registered and visible, but it has not
+        // started transferring: exactly one repository holds a slot.
+        let view = await_in_flight(&pull, "waiting_for_transfer_slot", 1);
+        assert_eq!(view.transferring, 1);
+        assert_eq!(view.waiting, 1);
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(
+            hold.arrived(),
+            1,
+            "a second transfer started for one repository"
+        );
+        assert_eq!(fetcher.requests.lock().unwrap().len(), 1);
+
+        hold.release();
+        assert!(first.join().unwrap().unwrap().transferred());
+        assert!(second.join().unwrap().unwrap().transferred());
+        assert_eq!(fetcher.requests.lock().unwrap().len(), 2);
+        assert_eq!(fetcher.transferred(), 300);
+    }
+
+    #[test]
+    fn two_overlapping_selections_transfer_each_shared_file_once() {
+        let upstream: &[(&str, usize)] = &[("a.bin", 100), ("shared.bin", 400), ("b.bin", 200)];
+
+        // What a fresh acquisition of the second selection costs on its own.
+        let fresh_root = tempfile::tempdir().unwrap();
+        let fresh_fetcher = Arc::new(MeasuredFetcher::new(MEASURED_COMMIT, upstream));
+        let fresh = PullThrough::new(
+            Archive::new(fresh_root.path()).unwrap(),
+            Arc::clone(&fresh_fetcher) as Arc<_>,
+        );
+        fresh
+            .ensure_selected_for_type(
+                RepositoryType::Model,
+                "org/model",
+                "main",
+                &selection(&["b.bin", "shared.bin"], &[]),
+            )
+            .unwrap();
+        let fresh_bytes = fresh_fetcher.transferred();
+        assert_eq!(fresh_bytes, 600);
+
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let hold = Arc::new(Hold::default());
+        let fetcher = Arc::new(MeasuredFetcher::new(MEASURED_COMMIT, upstream).holding(&hold, 0));
+        let pull = Arc::new(PullThrough::new(
+            archive.clone(),
+            Arc::clone(&fetcher) as Arc<_>,
+        ));
+        let first = {
+            let pull = Arc::clone(&pull);
+            std::thread::spawn(move || {
+                pull.ensure_selected_for_type(
+                    RepositoryType::Model,
+                    "org/model",
+                    "main",
+                    &selection(&["a.bin", "shared.bin"], &[]),
+                )
+            })
+        };
+        hold.await_arrival(1);
+        await_in_flight(&pull, "transferring", 1);
+        let second = {
+            let pull = Arc::clone(&pull);
+            std::thread::spawn(move || {
+                pull.ensure_selected_for_type(
+                    RepositoryType::Model,
+                    "org/model",
+                    "main",
+                    &selection(&["b.bin", "shared.bin"], &[]),
+                )
+            })
+        };
+        await_in_flight(&pull, "waiting_for_transfer_slot", 1);
+        hold.release();
+        assert_eq!(
+            first.join().unwrap().unwrap().outcome,
+            AcquisitionOutcome::Published
+        );
+        assert_eq!(
+            second.join().unwrap().unwrap().outcome,
+            AcquisitionOutcome::Extended
+        );
+
+        // Measured, not asserted: the shared file crossed the link once, and the
+        // second acquisition paid only for what the archive did not hold.
+        assert_eq!(fetcher.transfers_of("shared.bin"), 1);
+        assert_eq!(fetcher.transferred(), 700);
+        let second_bytes = fetcher.transferred() - 500;
+        assert_eq!(second_bytes, 200);
+        assert!(
+            second_bytes < fresh_bytes,
+            "the second selection cost {second_bytes}, not less than a fresh {fresh_bytes}"
+        );
+    }
+
+    #[test]
+    fn different_repositories_run_concurrently_up_to_the_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let hold = Arc::new(Hold::default());
+        let fetcher =
+            Arc::new(MeasuredFetcher::new(MEASURED_COMMIT, &[("a.bin", 10)]).holding(&hold, 0));
+        let pull = Arc::new(PullThrough::new(archive, fetcher));
+        assert_eq!(pull.transfer_limit(), DEFAULT_MAX_TRANSFERRING_ACQUISITIONS);
+        let threads = ["org/one", "org/two", "org/three"].map(|repo_id| {
+            let pull = Arc::clone(&pull);
+            std::thread::spawn(move || pull.ensure(repo_id, "main", &[]))
+        });
+        // Two transfer, the third waits: the default limit is two.
+        hold.await_arrival(2);
+        let view = await_in_flight(&pull, "waiting_for_transfer_slot", 1);
+        assert_eq!(view.transfer_limit, 2);
+        assert_eq!(view.transferring, 2);
+        assert_eq!(view.waiting, 1);
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(
+            hold.arrived(),
+            2,
+            "a third repository transferred past the limit"
+        );
+        hold.release();
+        for thread in threads {
+            assert_eq!(thread.join().unwrap().unwrap(), MEASURED_COMMIT);
+        }
+    }
+
+    #[test]
+    fn a_limit_of_one_makes_a_second_repository_wait() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let hold = Arc::new(Hold::default());
+        let fetcher =
+            Arc::new(MeasuredFetcher::new(MEASURED_COMMIT, &[("a.bin", 10)]).holding(&hold, 0));
+        let pull = Arc::new(PullThrough::with_transfer_limit(archive, fetcher, 1));
+        assert_eq!(pull.transfer_limit(), 1);
+        let threads = ["org/one", "org/two"].map(|repo_id| {
+            let pull = Arc::clone(&pull);
+            std::thread::spawn(move || pull.ensure(repo_id, "main", &[]))
+        });
+        hold.await_arrival(1);
+        let view = await_in_flight(&pull, "waiting_for_transfer_slot", 1);
+        assert_eq!(view.transferring, 1);
+        assert_eq!(view.waiting, 1);
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(
+            hold.arrived(),
+            1,
+            "a second repository transferred under a limit of one"
+        );
+        hold.release();
+        for thread in threads {
+            assert_eq!(thread.join().unwrap().unwrap(), MEASURED_COMMIT);
+        }
+    }
+
+    #[test]
+    fn a_resolve_only_reconciliation_is_not_blocked_by_a_running_transfer() {
+        // The sharpest risk in ADR-0021: if the gate covered metadata calls, the
+        // Issue 0070 reconciliation an acquisition makes about its own repository
+        // would wait for a slot that is already held, and deadlock. The limit is
+        // one so no slot is available at all while the transfer runs.
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let fetcher = Arc::new(MeasuredFetcher::new(
+            MEASURED_COMMIT,
+            &[("a.bin", 100), ("b.bin", 200)],
+        ));
+        let seeded =
+            PullThrough::with_transfer_limit(archive.clone(), Arc::clone(&fetcher) as Arc<_>, 1);
+        // Archive the revision first, so the reconciliation path is the one under
+        // test rather than a first publication.
+        seeded
+            .ensure_selected_for_type(
+                RepositoryType::Model,
+                "org/model",
+                "main",
+                &selection(&["a.bin"], &[]),
+            )
+            .unwrap();
+        assert!(archive
+            .is_complete_revision("org/model", MEASURED_COMMIT)
+            .unwrap());
+
+        // A transfer for the same repository now holds the only slot.
+        let blocking = Arc::new(Hold::default());
+        let holding_fetcher = Arc::new(
+            MeasuredFetcher::new(MEASURED_COMMIT, &[("a.bin", 100), ("b.bin", 200)])
+                .holding(&blocking, 0),
+        );
+        let gated = Arc::new(PullThrough::with_transfer_limit(
+            archive.clone(),
+            Arc::clone(&holding_fetcher) as Arc<_>,
+            1,
+        ));
+        let transferring = {
+            let gated = Arc::clone(&gated);
+            std::thread::spawn(move || {
+                gated.ensure_selected_for_type(
+                    RepositoryType::Model,
+                    "org/model",
+                    "main",
+                    &selection(&["b.bin"], &[]),
+                )
+            })
+        };
+        blocking.await_arrival(1);
+        await_in_flight(&gated, "transferring", 1);
+
+        // The reconciliation resolves against upstream and answers from the
+        // archive while that transfer still holds the slot.
+        let inventories_before = holding_fetcher.inventories.load(Ordering::SeqCst);
+        let started = Instant::now();
+        let reconciled = gated
+            .ensure_selected_for_type(
+                RepositoryType::Model,
+                "org/model",
+                "main",
+                &selection(&["a.bin"], &[]),
+            )
+            .unwrap();
+        assert_eq!(reconciled.outcome, AcquisitionOutcome::AlreadyArchived);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the reconciliation waited {:?} behind the gate",
+            started.elapsed()
+        );
+        assert!(
+            holding_fetcher.inventories.load(Ordering::SeqCst) > inventories_before,
+            "the reconciliation did not make its resolve-only call"
+        );
+        assert_eq!(
+            gated.in_flight_acquisitions().transferring,
+            1,
+            "the running transfer was disturbed"
+        );
+        blocking.release();
+        assert!(transferring.join().unwrap().unwrap().transferred());
+    }
+
+    #[test]
+    fn identical_requests_are_collapsed_by_single_flight_rather_than_serialized() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let hold = Arc::new(Hold::default());
+        let fetcher =
+            Arc::new(MeasuredFetcher::new(MEASURED_COMMIT, &[("a.bin", 100)]).holding(&hold, 0));
+        let pull = Arc::new(PullThrough::with_transfer_limit(
+            archive,
+            Arc::clone(&fetcher) as Arc<_>,
+            1,
+        ));
+        let callers = (0..4)
+            .map(|_| {
+                let pull = Arc::clone(&pull);
+                std::thread::spawn(move || {
+                    pull.ensure_selected_for_type(
+                        RepositoryType::Model,
+                        "org/model",
+                        "main",
+                        &selection(&["a.bin"], &[]),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        hold.await_arrival(1);
+        let view = await_in_flight(&pull, "transferring", 1);
+        // One acquisition, holding the one slot, with nothing queued behind it:
+        // identical work is still collapsed and never queues behind itself, even
+        // with a limit of one.
+        assert_eq!(view.items.len(), 1, "identical requests were not collapsed");
+        assert_eq!(view.waiting, 0);
+        hold.release();
+        for caller in callers {
+            assert_eq!(caller.join().unwrap().unwrap().commit, MEASURED_COMMIT);
+        }
+        assert_eq!(fetcher.requests.lock().unwrap().len(), 1);
+        assert_eq!(fetcher.transferred(), 100);
+    }
+
+    #[test]
+    fn a_cancelled_refresh_is_reported_and_publishes_nothing() {
+        let (_root, archive) = published_archive();
+        let hold = Arc::new(Hold::default());
+        let fetcher = Arc::new(
+            MeasuredFetcher::new(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                &[("a.bin", 100)],
+            )
+            .holding(&hold, 0),
+        );
+        let pull = Arc::new(PullThrough::new(archive.clone(), fetcher));
+        let refreshing = {
+            let pull = Arc::clone(&pull);
+            std::thread::spawn(move || pull.refresh("org/model", "main", false))
+        };
+        hold.await_arrival(1);
+        let view = await_in_flight(&pull, "transferring", 1);
+        assert_eq!(view.items[0].operation, "refresh");
+        assert_eq!(
+            pull.cancel_acquisition(&view.items[0].id),
+            Some(CancelOutcome::Cancelled)
+        );
+        assert_eq!(refreshing.join().unwrap(), Err(PullThroughError::Cancelled));
+        // The old revision and the ref are untouched.
+        assert_eq!(
+            archive.resolve_ref("org/model", "main").unwrap(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            archive.list_revisions("org/model").unwrap(),
+            vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+        );
+    }
+
+    #[test]
+    fn a_cancelled_acquisition_is_reported_as_an_interruption_not_an_upstream_failure() {
+        let (writer, _guard) = capture_logs();
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let hold = Arc::new(Hold::default());
+        let fetcher =
+            Arc::new(MeasuredFetcher::new(MEASURED_COMMIT, &[("a.bin", 100)]).holding(&hold, 0));
+        let pull = Arc::new(PullThrough::new(archive, fetcher));
+        // The acquisition inherits the starting caller's log destination, so this
+        // thread is the one that must start it for the captured subscriber to see
+        // the events; the cancellation comes from another thread, as it does in
+        // the deployment.
+        let cancelling = {
+            let pull = Arc::clone(&pull);
+            let hold = Arc::clone(&hold);
+            std::thread::spawn(move || {
+                hold.await_arrival(1);
+                let view = await_in_flight(&pull, "transferring", 1);
+                pull.cancel_acquisition(&view.items[0].id)
+            })
+        };
+        assert_eq!(
+            pull.ensure("org/model", "main", &[]),
+            Err(PullThroughError::Cancelled)
+        );
+        assert_eq!(cancelling.join().unwrap(), Some(CancelOutcome::Cancelled));
+        let output = writer.output();
+        assert!(
+            output.contains("\"event\":\"acquisition_cancelled\""),
+            "missing acquisition_cancelled: {output}"
+        );
+        assert!(
+            !output.contains("\"event\":\"upstream_fetch_failed\""),
+            "a cancellation was reported as an upstream failure: {output}"
+        );
+        assert!(output.contains("\"event\":\"incomplete_fetch_preserved\""));
+        assert!(output.contains("\"event\":\"transfer_slot_waiting\""));
+        assert!(output.contains("\"event\":\"transfer_slot_admitted\""));
+    }
+
+    #[test]
+    fn the_transfer_limit_setting_defaults_to_two_and_rejects_unusable_values() {
+        assert_eq!(
+            max_transferring_acquisitions_from_value(Err(std::env::VarError::NotPresent)).unwrap(),
+            2
+        );
+        assert_eq!(
+            max_transferring_acquisitions_from_value(Ok(" 5 ".into())).unwrap(),
+            5
+        );
+        for rejected in ["0", "-1", "two", ""] {
+            assert!(
+                max_transferring_acquisitions_from_value(Ok(rejected.into())).is_err(),
+                "{rejected:?} was accepted as a transfer limit"
+            );
+        }
     }
 }

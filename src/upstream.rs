@@ -1,10 +1,144 @@
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 
 use serde::Deserialize;
 
 use crate::{is_hf_commit, record_fetch_resolved_commit_for_type, RepositoryType};
+
+/// What a cancellation request found (Issue 0076).
+///
+/// Cancelling something that has already finished is reported as such rather
+/// than as an error, because "it was already done" and "there is no such
+/// acquisition" are different operational answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// This request stopped a running acquisition.
+    Cancelled,
+    /// The acquisition was already cancelled.
+    AlreadyCancelled,
+    /// The acquisition had already claimed its publication point, so it
+    /// finishes and publishes. Nothing was cancelled and nothing is partial.
+    AlreadyFinished,
+}
+
+impl CancelOutcome {
+    /// The stable name the Admin API and the admin UI report.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::AlreadyCancelled => "already_cancelled",
+            Self::AlreadyFinished => "already_finished",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum CancellationPhase {
+    #[default]
+    Running,
+    Cancelled,
+    Committing,
+}
+
+#[derive(Debug, Default)]
+struct CancellationState {
+    phase: CancellationPhase,
+    child: Option<Child>,
+}
+
+/// The token that stops one acquisition, and the owner of its helper process.
+///
+/// The token owns the running helper because stopping an acquisition means
+/// stopping that process: [`Child::kill`] needs `&mut Child`, so the handle
+/// lives behind this lock rather than only on the acquisition thread, which is
+/// normally blocked reading the helper's pipe. Whoever cancels kills **and
+/// reaps** the child under the lock, so no helper is left orphaned and no
+/// zombie is left behind when the acquisition thread is woken by the resulting
+/// end of file.
+///
+/// `commit` is the single point where cancellation and completion are decided
+/// against each other: exactly one of them wins, so an acquisition is either
+/// published or recorded cancelled, never both and never neither.
+#[derive(Debug, Default)]
+pub struct Cancellation {
+    state: Mutex<CancellationState>,
+}
+
+/// The helper handed back to the acquisition thread once its output ends.
+pub enum ReclaimedChild {
+    /// Still owned by this acquisition; it must be waited for as usual.
+    Running(Child),
+    /// A cancellation already stopped and reaped the helper.
+    Reaped,
+}
+
+impl Cancellation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, CancellationState> {
+        self.state.lock().expect("cancellation lock poisoned")
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.state().phase == CancellationPhase::Cancelled
+    }
+
+    /// Stops the acquisition, killing and reaping its helper if one is running.
+    pub fn cancel(&self) -> CancelOutcome {
+        let mut state = self.state();
+        match state.phase {
+            CancellationPhase::Committing => CancelOutcome::AlreadyFinished,
+            CancellationPhase::Cancelled => CancelOutcome::AlreadyCancelled,
+            CancellationPhase::Running => {
+                state.phase = CancellationPhase::Cancelled;
+                if let Some(mut child) = state.child.take() {
+                    terminate_and_reap(&mut child);
+                }
+                CancelOutcome::Cancelled
+            }
+        }
+    }
+
+    /// Claims the right to publish. `false` means a cancellation won the race,
+    /// so this acquisition must publish nothing.
+    pub fn commit(&self) -> bool {
+        let mut state = self.state();
+        if state.phase == CancellationPhase::Running {
+            state.phase = CancellationPhase::Committing;
+            return true;
+        }
+        false
+    }
+
+    /// Hands a freshly spawned helper to the token.
+    ///
+    /// `false` means the acquisition was cancelled before the helper started;
+    /// the child has already been stopped and reaped, so the caller must not
+    /// wait for it.
+    fn attach(&self, child: Child) -> bool {
+        let mut state = self.state();
+        if state.phase == CancellationPhase::Cancelled {
+            let mut child = child;
+            terminate_and_reap(&mut child);
+            return false;
+        }
+        state.child = Some(child);
+        true
+    }
+
+    /// Takes the helper back once its output has ended.
+    fn reclaim(&self) -> ReclaimedChild {
+        let mut state = self.state();
+        match state.child.take() {
+            Some(child) => ReclaimedChild::Running(child),
+            None => ReclaimedChild::Reaped,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchRequest {
@@ -231,6 +365,9 @@ pub enum UpstreamError {
     InvalidOutput(InvalidOutputReason),
     Storage,
     Failed,
+    /// The acquisition was stopped on request (Issue 0076). This is an
+    /// interruption, not an upstream failure and never a miss.
+    Cancelled,
 }
 
 /// A credential-safe description of a rejected fetch-helper contract.
@@ -312,6 +449,7 @@ impl std::fmt::Display for UpstreamError {
             }
             Self::Storage => write!(formatter, "fetch staging storage failure"),
             Self::Failed => write!(formatter, "upstream acquisition failed"),
+            Self::Cancelled => write!(formatter, "upstream acquisition cancelled"),
         }
     }
 }
@@ -327,6 +465,21 @@ pub trait UpstreamFetcher: Send + Sync {
         _progress: &(dyn Fn(FetchProgress) + Send + Sync),
     ) -> Result<FetchedRevision, UpstreamError> {
         self.fetch(request)
+    }
+
+    /// A transferring fetch that can be stopped while it runs (Issue 0076).
+    ///
+    /// The default implementation ignores the token, which keeps every existing
+    /// fetcher valid: a fetcher that cannot be interrupted still runs to its
+    /// own end, and the caller observes the cancellation at the next boundary
+    /// instead of mid-transfer.
+    fn fetch_cancellable(
+        &self,
+        request: &FetchRequest,
+        progress: &(dyn Fn(FetchProgress) + Send + Sync),
+        _cancel: &Cancellation,
+    ) -> Result<FetchedRevision, UpstreamError> {
+        self.fetch_with_progress(request, progress)
     }
 
     /// Resolves the commit and the upstream paths a selection covers, without
@@ -359,6 +512,36 @@ impl UpstreamFetcher for OfficialHfFetcher {
         request: &FetchRequest,
         progress: &(dyn Fn(FetchProgress) + Send + Sync),
     ) -> Result<FetchedRevision, UpstreamError> {
+        self.run_fetch(request, progress, &Cancellation::new())
+    }
+
+    fn fetch_cancellable(
+        &self,
+        request: &FetchRequest,
+        progress: &(dyn Fn(FetchProgress) + Send + Sync),
+        cancel: &Cancellation,
+    ) -> Result<FetchedRevision, UpstreamError> {
+        self.run_fetch(request, progress, cancel)
+    }
+
+    fn inventory(
+        &self,
+        request: &InventoryRequest,
+    ) -> Result<Option<RevisionInventory>, UpstreamError> {
+        self.run_inventory(request)
+    }
+}
+
+impl OfficialHfFetcher {
+    fn run_fetch(
+        &self,
+        request: &FetchRequest,
+        progress: &(dyn Fn(FetchProgress) + Send + Sync),
+        cancel: &Cancellation,
+    ) -> Result<FetchedRevision, UpstreamError> {
+        if cancel.is_cancelled() {
+            return Err(UpstreamError::Cancelled);
+        }
         let mut command = Command::new(&self.python);
         command
             .arg(&self.helper)
@@ -385,6 +568,12 @@ impl UpstreamFetcher for OfficialHfFetcher {
                 InvalidOutputReason::StdoutUnavailable,
             ));
         };
+        // From here the token owns the helper, so a cancellation arriving while
+        // this thread is blocked on the pipe stops and reaps it rather than
+        // leaving it transferring with nobody waiting.
+        if !cancel.attach(child) {
+            return Err(UpstreamError::Cancelled);
+        }
         let parsed = (|| {
             let mut result = None;
             for line in BufReader::new(stdout).lines() {
@@ -448,6 +637,15 @@ impl UpstreamFetcher for OfficialHfFetcher {
             }
             Ok(result)
         })();
+        // The helper's output ended. Either a cancellation already reaped it, or
+        // this thread owns it again and is responsible for reaping it.
+        let ReclaimedChild::Running(mut child) = cancel.reclaim() else {
+            return Err(UpstreamError::Cancelled);
+        };
+        if cancel.is_cancelled() {
+            terminate_and_reap(&mut child);
+            return Err(UpstreamError::Cancelled);
+        }
         let result = match parsed {
             Ok(result) => result,
             Err(error) => {
@@ -493,7 +691,10 @@ impl UpstreamFetcher for OfficialHfFetcher {
         })
     }
 
-    fn inventory(
+    /// A resolve-only invocation. It transfers nothing, is never gated
+    /// (ADR-0021 decision 3), and owns no staging, so it needs no cancellation
+    /// token: it is the call a running acquisition may make about itself.
+    fn run_inventory(
         &self,
         request: &InventoryRequest,
     ) -> Result<Option<RevisionInventory>, UpstreamError> {

@@ -181,6 +181,41 @@ counter that is not moving is never reported as progress.
 An already archived revision never enters this path: its metadata and files are
 answered from the archive and are unaffected by the deadline.
 
+### A cancelled acquisition answers `502`
+
+An operator can stop an acquisition that is already running, through the
+[Admin API](admin-api.md). A request that was waiting for it is answered
+`502 Bad Gateway` — the existing "acquisition failed" class — because the acquisition it
+was waiting for did not complete.
+
+It is deliberately **not** `503`. `503` means "acquiring, retry", and both supported
+clients retry it by themselves; answering `503` would restart the transfer the operator
+just stopped. It is also never `404`: nothing was learned about whether upstream holds
+the file, and a cancellation must not be reported as an absence. And it is never a
+success, because nothing was published — no partial file is ever served.
+
+**A new request after a cancellation starts a new acquisition. That is correct
+behaviour, not a defect.** Cancellation is an interruption of one transfer, not a
+cooldown, a block, or a policy about the repository; ModelKeep has no state that says
+"do not acquire this". The new acquisition also adopts the resumable staging the
+cancelled one left, so it starts from the bytes already transferred rather than from
+zero. An operator who wants a repository to stay unacquired must stop the requests, not
+the acquisition.
+
+Because identical work is collapsed into one acquisition, stopping it answers every
+request waiting on it, and a management job sharing it reaches its terminal `cancelled`
+state. That follows from sharing one transfer rather than paying for it repeatedly.
+
+### Transfers are serialized per repository
+
+At most one acquisition transfers per repository at a time, and at most a configured
+number across all repositories (two by default), under
+[`ADR-0021`](adr/0021-one-transferring-acquisition-per-repository.md). A cold request
+for a repository that is already being acquired under a different selection therefore
+waits for that transfer before its own begins, and the `resolve` deadline above still
+bounds how long it waits before answering `503`. Nothing about the archived path changes:
+an already archived file is served immediately regardless of what is transferring.
+
 ## Health and compatibility routes
 
 The download origin provides unauthenticated service probes:
@@ -230,7 +265,8 @@ Client-facing status codes distinguish common failure classes:
 - `401`: upstream authorization failed during a cold acquisition;
 - `404`: the requested upstream object or revision does not exist;
 - `416`: a requested byte range is unsatisfiable;
-- `502`: upstream is unavailable or acquisition failed;
+- `502`: upstream is unavailable, or the acquisition this request was waiting for did
+  not complete — including one an operator cancelled;
 - `503` on a `resolve` route, or on a repository metadata route where
   `MODELKEEP_METADATA_COLD_MISS_DEADLINE_SECONDS` is configured: the acquisition is
   still running and exceeded the cold-miss deadline; retry after `Retry-After`

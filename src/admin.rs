@@ -25,15 +25,26 @@ use serde::{Deserialize, Serialize};
 
 use sha2::{Digest, Sha256};
 
-use crate::upstream::{FetchProgress, FileSelection};
+use crate::upstream::{CancelOutcome, FetchProgress, FileSelection};
 use crate::{
-    pullthrough::{AcquisitionOutcome, PullThrough, PullThroughError},
+    pullthrough::{
+        AcquisitionOutcome, AcquisitionsView, PullThrough, PullThroughError, RESOLVE_PHASE,
+        TRANSFER_WAIT_PHASE,
+    },
     validate_repository_id, validate_revision_ref, Archive, ArchiveError, ArchiveResult,
     RepositorySummary, RepositoryType, SelfCheckState,
 };
 
 const ADMIN_CAPABILITY: &str = "io.modelkeep/cap/admin";
 static JOB_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// The phases an acquisition reports before it holds a transfer slot.
+///
+/// A job in one of these has resolved nothing into the archive and moved no
+/// bytes: it is either resolving or waiting behind the per-repository gate
+/// (ADR-0021 decision 2), so it stays `queued` — visible and cancellable —
+/// and becomes `running` when its transfer starts.
+const QUEUED_PHASES: [&str; 2] = [RESOLVE_PHASE, TRANSFER_WAIT_PHASE];
 
 #[derive(Clone)]
 pub struct Config {
@@ -485,6 +496,45 @@ struct JobPage {
     next_cursor: Option<String>,
 }
 
+/// What a cancellation request did, so "already finished" is never hidden
+/// behind an error (Issue 0076).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelReport {
+    /// The job is now terminal `cancelled`.
+    Cancelled,
+    /// It had already reached a terminal state before this request.
+    AlreadyTerminal,
+    /// Its acquisition had already passed its publication point, so it is
+    /// finishing and nothing was cancelled.
+    AlreadyFinishing,
+}
+
+impl CancelReport {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::AlreadyTerminal => "already_terminal",
+            Self::AlreadyFinishing => "already_finishing",
+        }
+    }
+}
+
+/// The cancellation response: the job record as the other job routes report it,
+/// plus what the request actually did.
+#[derive(Debug, Serialize)]
+struct JobCancelView {
+    cancellation: &'static str,
+    #[serde(flatten)]
+    job: JobView,
+}
+
+/// The cancellation response for an in-flight acquisition.
+#[derive(Debug, Serialize)]
+struct AcquisitionCancelView {
+    cancellation: &'static str,
+    id: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct JobRequest {
     kind: JobKind,
@@ -766,14 +816,25 @@ impl JobManager {
             if job.state == JobState::Cancelled {
                 return;
             }
-            job.state = JobState::Running;
             job.started_at = Some(unix_timestamp());
-            job.phase = match job.kind {
-                JobKind::Prefetch | JobKind::Refresh => "acquiring_snapshot",
-                JobKind::Verify => "verifying_revision",
-                JobKind::Audit => "auditing_archive",
+            match job.kind {
+                // An acquisition resolves and may then wait for a transfer slot
+                // before it moves a byte (ADR-0021). It stays queued until its
+                // own progress says it is transferring, so a job blocked by the
+                // gate is not reported as running with nothing happening.
+                JobKind::Prefetch | JobKind::Refresh => {
+                    job.state = JobState::Queued;
+                    job.phase = RESOLVE_PHASE.into();
+                }
+                JobKind::Verify => {
+                    job.state = JobState::Running;
+                    job.phase = "verifying_revision".into();
+                }
+                JobKind::Audit => {
+                    job.state = JobState::Running;
+                    job.phase = "auditing_archive".into();
+                }
             }
-            .into();
         }) else {
             return;
         };
@@ -876,35 +937,108 @@ impl JobManager {
         }
     }
 
-    fn cancel(&self, id: &str) -> Result<Job, &'static str> {
-        let mut jobs = self.inner.active_jobs.lock().unwrap();
-        let job = jobs.get_mut(id).ok_or("not_found")?;
-        if job.state != JobState::Queued {
-            return Err("not_cancellable");
+    /// Cancels a job, queued or running (Issue 0076).
+    ///
+    /// The acquisition is stopped **before** the record is marked, because that
+    /// is what keeps the two consistent: the acquisition's own publication claim
+    /// decides the race, so either it published and this reports
+    /// `already_finished`, or it was stopped and the record becomes terminal
+    /// `cancelled`. It is never both and never neither.
+    ///
+    /// A `verify` or `audit` job has no acquisition to stop. Its record becomes
+    /// terminal `cancelled` immediately; the in-process archive walk it started
+    /// finishes on its own and its result is discarded, because a terminal record
+    /// is never overwritten.
+    fn cancel(
+        &self,
+        id: &str,
+        pullthrough: Option<&PullThrough>,
+    ) -> Result<(Job, CancelReport), &'static str> {
+        validate_job_id(id).map_err(|_| "invalid_request")?;
+        let active = self.inner.active_jobs.lock().unwrap().get(id).cloned();
+        let Some(job) = active else {
+            // Not active: either it is already terminal on disk, which is an
+            // answer rather than an error, or there is no such job.
+            return match self.read_job(id) {
+                Ok(job) => Ok((job, CancelReport::AlreadyTerminal)),
+                Err(ArchiveError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Err("not_found")
+                }
+                Err(_) => Err("storage"),
+            };
+        };
+        if job.started_at.is_some() && matches!(job.kind, JobKind::Prefetch | JobKind::Refresh) {
+            let Some(pullthrough) = pullthrough else {
+                return Err("storage");
+            };
+            let operation = match job.kind {
+                JobKind::Refresh => "refresh",
+                _ => "pull_through",
+            };
+            match pullthrough.cancel_matching_acquisition(
+                job.repo_type,
+                job.repo_id.as_deref().unwrap_or_default(),
+                job.revision.as_deref().unwrap_or_default(),
+                &job.include,
+                &job.exclude,
+                operation,
+            ) {
+                Some(CancelOutcome::Cancelled) | Some(CancelOutcome::AlreadyCancelled) => {}
+                // The acquisition passed its publication point, or it is already
+                // gone and its terminal state is being recorded. Either way the
+                // work finished; marking the record cancelled now would claim
+                // something that did not happen.
+                Some(CancelOutcome::AlreadyFinished) | None => {
+                    return Ok((job, CancelReport::AlreadyFinishing));
+                }
+            }
         }
-        let previous = job.clone();
-        job.state = JobState::Cancelled;
-        job.phase = "cancelled".into();
+        let mut jobs = self.inner.active_jobs.lock().unwrap();
+        let Some(record) = jobs.get_mut(id) else {
+            drop(jobs);
+            return match self.read_job(id) {
+                Ok(job) => Ok((job, CancelReport::AlreadyTerminal)),
+                Err(_) => Err("storage"),
+            };
+        };
+        let previous = record.clone();
+        record.state = JobState::Cancelled;
+        record.phase = "cancelled".into();
         let now = unix_timestamp();
-        job.finished_at = Some(now);
-        job.updated_at = now;
-        let snapshot = job.clone();
-        drop(jobs);
+        record.finished_at = Some(now);
+        record.updated_at = now;
+        let snapshot = record.clone();
+        // Written under the in-memory lock, for the reason [`Self::update`]
+        // explains: the acquisition this cancellation just stopped is still
+        // reporting, and the terminal record must not be overtaken.
         if self.persist(&snapshot).is_err() {
-            self.inner
-                .active_jobs
-                .lock()
-                .unwrap()
-                .insert(id.into(), previous);
+            jobs.insert(id.into(), previous);
             return Err("storage");
         }
-        self.inner.active_jobs.lock().unwrap().remove(id);
-        Ok(snapshot)
+        jobs.remove(id);
+        drop(jobs);
+        tracing::info!(
+            event = "admin_job_cancelled",
+            job_id = %snapshot.id,
+            job_kind = ?snapshot.kind,
+            repo_type = %snapshot.repo_type,
+            repo_id = snapshot.repo_id.as_deref().unwrap_or(""),
+            revision = snapshot.revision.as_deref().unwrap_or(""),
+            previous_state = ?previous.state,
+            "management job cancelled"
+        );
+        Ok((snapshot, CancelReport::Cancelled))
     }
 
     fn record_progress(&self, id: &str, event: FetchProgress) {
         let snapshot = self.update(id, |job| {
             job.phase = event.phase.clone();
+            // A queued acquisition becomes running when its own progress says it
+            // is past the gate, so `queued` means exactly "holding no transfer
+            // slot" for the whole life of the job (ADR-0021 decision 2).
+            if job.state == JobState::Queued && !QUEUED_PHASES.contains(&event.phase.as_str()) {
+                job.state = JobState::Running;
+            }
             if event.phase == "resuming_snapshot" {
                 job.resumed = true;
             }
@@ -946,6 +1080,17 @@ impl JobManager {
         }
     }
 
+    /// Applies one transition and writes it, holding the in-memory lock across
+    /// the write.
+    ///
+    /// The lock spans the write because a running job can now be cancelled
+    /// (Issue 0076), so a progress update and a cancellation can reach the same
+    /// record at once. Deciding the transition under the lock and releasing it
+    /// only after the record is on disk is what keeps the durable record in the
+    /// same order as the in-memory one: a progress update can no longer overwrite
+    /// the terminal cancellation that overtook it. Job records are small and this
+    /// is management metadata, so serializing their writes costs nothing that
+    /// matters.
     fn update(&self, id: &str, update: impl FnOnce(&mut Job)) -> Option<Job> {
         let mut jobs = self.inner.active_jobs.lock().unwrap();
         let job = jobs.get_mut(id)?;
@@ -953,20 +1098,18 @@ impl JobManager {
         update(job);
         job.updated_at = unix_timestamp();
         let snapshot = job.clone();
-        drop(jobs);
         let persisted = match self.persist(&snapshot) {
             Ok(()) => true,
             Err(error) => {
-                if let Ok(mut jobs) = self.inner.active_jobs.lock() {
-                    jobs.insert(id.to_string(), previous.clone());
-                }
+                jobs.insert(id.to_string(), previous.clone());
                 tracing::error!(event = "admin_job_persist_failed", job_id = %id, error = %error, "failed to persist management job");
                 false
             }
         };
         if persisted && !matches!(snapshot.state, JobState::Queued | JobState::Running) {
-            self.inner.active_jobs.lock().unwrap().remove(id);
+            jobs.remove(id);
         }
+        drop(jobs);
         Some(if persisted { snapshot } else { previous })
     }
 
@@ -1143,7 +1286,12 @@ impl JobManager {
     }
 
     fn persist(&self, job: &Job) -> Result<(), ArchiveError> {
-        let temporary = self.inner.directory.join(format!(".{}.tmp", job.id));
+        // A per-write temporary name: two writers for one job would otherwise
+        // share one temporary path and rename each other's file away.
+        let temporary =
+            self.inner
+                .directory
+                .join(format!(".{}-{}.tmp", job.id, new_job_id(unix_timestamp())));
         let final_path = self.inner.directory.join(format!("{}.json", job.id));
         let bytes = serde_json::to_vec(job)
             .map_err(|error| ArchiveError::IntegrityMismatch(error.to_string()))?;
@@ -1241,6 +1389,11 @@ pub fn router(
         )
         .route("/api/admin/v1/jobs", get(list_jobs).post(create_job))
         .route("/api/admin/v1/jobs/{id}", get(job).delete(cancel_job))
+        .route("/api/admin/v1/acquisitions", get(list_acquisitions))
+        .route(
+            "/api/admin/v1/acquisitions/{id}",
+            axum::routing::delete(cancel_acquisition),
+        )
         .with_state(state))
 }
 
@@ -1398,17 +1551,21 @@ async fn cancel_job(
         )
             .into_response();
     }
-    match state.jobs.cancel(&id) {
-        Ok(job) => Json(JobView::from(job)).into_response(),
+    match state.jobs.cancel(&id, state.pullthrough.as_deref()) {
+        Ok((job, report)) => Json(JobCancelView {
+            cancellation: report.as_str(),
+            job: JobView::from(job),
+        })
+        .into_response(),
         Err("not_found") => (
             StatusCode::NOT_FOUND,
             Json(ErrorBody { error: "not_found" }),
         )
             .into_response(),
-        Err("not_cancellable") => (
-            StatusCode::CONFLICT,
+        Err("invalid_request") => (
+            StatusCode::BAD_REQUEST,
             Json(ErrorBody {
-                error: "not_cancellable",
+                error: "invalid_request",
             }),
         )
             .into_response(),
@@ -1420,6 +1577,81 @@ async fn cancel_job(
         )
             .into_response(),
     }
+}
+
+/// Lists the acquisitions in flight, including client-driven ones (Issue 0076),
+/// with what holds each transfer slot and what is waiting (Issue 0077).
+async fn list_acquisitions(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+    if !authorized(&state.config, &headers) {
+        return unauthorized(&state.config);
+    }
+    let Some(pullthrough) = state.pullthrough.as_ref() else {
+        return Json(AcquisitionsView {
+            transfer_limit: 0,
+            transferring: 0,
+            waiting: 0,
+            items: Vec::new(),
+        })
+        .into_response();
+    };
+    Json(pullthrough.in_flight_acquisitions()).into_response()
+}
+
+async fn cancel_acquisition(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if !authorized(&state.config, &headers) {
+        return unauthorized(&state.config);
+    }
+    if !csrf_authorized(&headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: "csrf_required",
+            }),
+        )
+            .into_response();
+    }
+    if !is_acquisition_id(&id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: "invalid_request",
+            }),
+        )
+            .into_response();
+    }
+    match state
+        .pullthrough
+        .as_ref()
+        .and_then(|pullthrough| pullthrough.cancel_acquisition(&id))
+    {
+        Some(outcome) => Json(AcquisitionCancelView {
+            cancellation: outcome.as_str(),
+            id,
+        })
+        .into_response(),
+        // Nothing is in flight under that identifier. An acquisition that had
+        // already finished is not in flight either, so this is reported as
+        // "no such acquisition" rather than as a failed cancellation.
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody { error: "not_found" }),
+        )
+            .into_response(),
+    }
+}
+
+/// Acquisition identifiers are ModelKeep's own, so they are validated as the
+/// fixed shape they have rather than trusted from the path.
+fn is_acquisition_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
 async fn status(state: AdminState, headers: HeaderMap, pullthrough_enabled: bool) -> Response {
@@ -1750,6 +1982,10 @@ fn classify_pullthrough_error(
         PullThroughError::Storage => "storage",
         PullThroughError::UnsafePath => "unsafe_path",
         PullThroughError::Conflict => "conflict",
+        // A job whose own cancellation stopped the acquisition never reaches a
+        // failure record: its record is already terminal `cancelled`. This class
+        // is what another job or request sharing the same acquisition sees.
+        PullThroughError::Cancelled => "cancelled",
     };
     (class, error.to_string())
 }
@@ -3708,5 +3944,554 @@ mod tests {
         let recovered = reopened.get("legacy-outcome").unwrap().unwrap();
         assert_eq!(recovered.outcome, None);
         assert!(recovered.include.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Issue 0076 (cancel a running acquisition) and Issue 0077 / ADR-0021
+    // (a job queued behind the transfer gate).
+    // ------------------------------------------------------------------
+
+    /// A fetcher that blocks each transfer until released, so a test can act
+    /// while an acquisition is running.
+    struct HeldFetcher {
+        commit: String,
+        calls: std::sync::atomic::AtomicUsize,
+        arrived: Mutex<usize>,
+        released: (Mutex<bool>, std::sync::Condvar),
+        arrivals: std::sync::Condvar,
+    }
+
+    impl HeldFetcher {
+        fn new() -> Self {
+            Self {
+                commit: "e".repeat(40),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                arrived: Mutex::new(0),
+                released: (Mutex::new(false), std::sync::Condvar::new()),
+                arrivals: std::sync::Condvar::new(),
+            }
+        }
+
+        fn release(&self) {
+            *self.released.0.lock().unwrap() = true;
+            self.released.1.notify_all();
+        }
+
+        fn await_arrival(&self, count: usize) {
+            let mut arrived = self.arrived.lock().unwrap();
+            while *arrived < count {
+                let (next, timeout) = self
+                    .arrivals
+                    .wait_timeout(arrived, std::time::Duration::from_secs(10))
+                    .unwrap();
+                arrived = next;
+                assert!(!timeout.timed_out(), "no fetch reached the hold");
+            }
+        }
+    }
+
+    impl UpstreamFetcher for HeldFetcher {
+        fn fetch(
+            &self,
+            request: &crate::upstream::FetchRequest,
+        ) -> Result<crate::upstream::FetchedRevision, crate::upstream::UpstreamError> {
+            self.fetch_cancellable(request, &|_| {}, &crate::upstream::Cancellation::new())
+        }
+
+        fn fetch_cancellable(
+            &self,
+            request: &crate::upstream::FetchRequest,
+            _progress: &(dyn Fn(FetchProgress) + Send + Sync),
+            cancel: &crate::upstream::Cancellation,
+        ) -> Result<crate::upstream::FetchedRevision, crate::upstream::UpstreamError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.arrived.lock().unwrap() += 1;
+            self.arrivals.notify_all();
+            let mut released = self.released.0.lock().unwrap();
+            while !*released {
+                if cancel.is_cancelled() {
+                    return Err(crate::upstream::UpstreamError::Cancelled);
+                }
+                let (next, _timeout) = self
+                    .released
+                    .1
+                    .wait_timeout(released, std::time::Duration::from_millis(10))
+                    .unwrap();
+                released = next;
+            }
+            drop(released);
+            std::fs::create_dir_all(&request.staging)
+                .map_err(crate::upstream::UpstreamError::Io)?;
+            std::fs::write(request.staging.join("config.json"), b"model")
+                .map_err(crate::upstream::UpstreamError::Io)?;
+            Ok(crate::upstream::FetchedRevision {
+                commit: self.commit.clone(),
+                files: vec!["config.json".into()],
+                staging: request.staging.clone(),
+            })
+        }
+    }
+
+    fn submit_prefetch(
+        manager: &JobManager,
+        archive: &Arc<Archive>,
+        pullthrough: &Arc<PullThrough>,
+        repo_id: &str,
+        include: Option<Vec<&str>>,
+        key: &str,
+    ) -> Job {
+        manager
+            .submit(
+                JobRequest {
+                    kind: JobKind::Prefetch,
+                    repo_type: RepositoryType::Model,
+                    repo_id: Some(repo_id.into()),
+                    revision: Some("main".into()),
+                    include: include
+                        .map(|patterns| patterns.into_iter().map(str::to_string).collect()),
+                    exclude: None,
+                },
+                Some(key),
+                archive.clone(),
+                Some(pullthrough.clone()),
+                test_principal(),
+            )
+            .unwrap()
+            .0
+    }
+
+    fn await_job_state(manager: &JobManager, id: &str, state: JobState) -> Job {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let job = manager.get(id).unwrap().expect("job record exists");
+            if job.state == state {
+                return job;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "job {id} stayed in {:?} rather than reaching {state:?}",
+                job.state
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn await_job_phase(manager: &JobManager, id: &str, phase: &str) -> Job {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let job = manager.get(id).unwrap().expect("job record exists");
+            if job.phase == phase {
+                return job;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "job {id} stayed in phase {:?} rather than reaching {phase:?}",
+                job.phase
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn cancelling_a_running_prefetch_reaches_a_terminal_state_and_publishes_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Arc::new(Archive::new(directory.path()).unwrap());
+        let manager = JobManager::open(&archive).unwrap();
+        let fetcher = Arc::new(HeldFetcher::new());
+        let pullthrough = Arc::new(PullThrough::new(
+            archive.as_ref().clone(),
+            fetcher.clone() as Arc<_>,
+        ));
+        let job = submit_prefetch(
+            &manager,
+            &archive,
+            &pullthrough,
+            "org/running",
+            None,
+            "cancel-running",
+        );
+        fetcher.await_arrival(1);
+        await_job_state(&manager, &job.id, JobState::Running);
+
+        let (cancelled, report) = manager.cancel(&job.id, Some(&pullthrough)).unwrap();
+        assert_eq!(report, CancelReport::Cancelled);
+        assert_eq!(cancelled.state, JobState::Cancelled);
+        assert_eq!(cancelled.phase, "cancelled");
+        assert!(cancelled.finished_at.is_some());
+
+        // The record is terminal and stays terminal: the acquisition that was
+        // interrupted never rewrites it as completed or failed.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let stored = manager.get(&job.id).unwrap().unwrap();
+        assert_eq!(stored.state, JobState::Cancelled);
+        assert!(archive.list_revisions("org/running").unwrap().is_empty());
+        assert!(pullthrough.in_flight_acquisitions().items.is_empty());
+
+        // Cancelling something that already finished says so instead of failing.
+        let (_, again) = manager.cancel(&job.id, Some(&pullthrough)).unwrap();
+        assert_eq!(again, CancelReport::AlreadyTerminal);
+        assert!(matches!(
+            manager.cancel("no-such-job", Some(&pullthrough)),
+            Err("not_found")
+        ));
+        fetcher.release();
+    }
+
+    #[test]
+    fn cancelling_a_running_job_stops_its_helper_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Arc::new(Archive::new(directory.path()).unwrap());
+        let manager = JobManager::open(&archive).unwrap();
+        let commit = "a".repeat(40);
+        let pid_file = directory.path().join("helper.pid");
+        let helper = directory.path().join("helper.sh");
+        // The helper records its own pid, reports a resolved commit so the
+        // staging stays resumable, then blocks. `exec` keeps the pid, so the pid
+        // recorded here is the process a cancellation must stop.
+        fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\necho '{{\"type\":\"resolved\",\"commit\":\"{commit}\"}}'\nexec sleep 300\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        let pullthrough = Arc::new(PullThrough::new(
+            archive.as_ref().clone(),
+            Arc::new(crate::upstream::OfficialHfFetcher {
+                python: "sh".into(),
+                helper,
+            }),
+        ));
+        let job = submit_prefetch(
+            &manager,
+            &archive,
+            &pullthrough,
+            "org/helper",
+            None,
+            "cancel-helper",
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !pid_file.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the helper never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let pid = fs::read_to_string(&pid_file).unwrap().trim().to_string();
+        assert!(
+            std::path::Path::new("/proc").join(&pid).exists(),
+            "helper {pid} was not running before the cancellation"
+        );
+
+        let (_, report) = manager.cancel(&job.id, Some(&pullthrough)).unwrap();
+        assert_eq!(report, CancelReport::Cancelled);
+        // No orphan and no zombie: whoever cancels kills and reaps the helper.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::path::Path::new("/proc").join(&pid).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "helper {pid} survived the cancellation"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            await_job_state(&manager, &job.id, JobState::Cancelled).state,
+            JobState::Cancelled
+        );
+        assert!(archive.list_revisions("org/helper").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_running_job_of_every_kind_can_be_cancelled_into_a_terminal_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Arc::new(Archive::new(directory.path()).unwrap());
+        let manager = JobManager::open(&archive).unwrap();
+        for (index, kind) in [
+            JobKind::Prefetch,
+            JobKind::Refresh,
+            JobKind::Verify,
+            JobKind::Audit,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut job = stored_job(&format!("running-{index}"), index as u64);
+            job.kind = kind;
+            job.state = JobState::Running;
+            job.phase = "running".into();
+            job.started_at = None;
+            job.finished_at = None;
+            job.repo_id = (kind != JobKind::Audit).then(|| "org/model".to_string());
+            job.revision = (kind != JobKind::Audit).then(|| "main".to_string());
+            assert!(manager.persist_new(&job).unwrap());
+            manager
+                .inner
+                .active_jobs
+                .lock()
+                .unwrap()
+                .insert(job.id.clone(), job.clone());
+
+            // No acquisition is attached here, so this exercises the record's own
+            // transition for every kind, including the two that have no
+            // acquisition to stop at all.
+            let (cancelled, report) = manager.cancel(&job.id, None).unwrap();
+            assert_eq!(report, CancelReport::Cancelled, "{kind:?}");
+            assert_eq!(cancelled.state, JobState::Cancelled, "{kind:?}");
+            assert_eq!(
+                manager.get(&job.id).unwrap().unwrap().state,
+                JobState::Cancelled,
+                "{kind:?} was not recorded as cancelled"
+            );
+        }
+    }
+
+    #[test]
+    fn a_job_waiting_behind_the_transfer_gate_is_queued_visible_and_cancellable() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Arc::new(Archive::new(directory.path()).unwrap());
+        let manager = JobManager::open(&archive).unwrap();
+        let fetcher = Arc::new(HeldFetcher::new());
+        let pullthrough = Arc::new(PullThrough::new(
+            archive.as_ref().clone(),
+            fetcher.clone() as Arc<_>,
+        ));
+        let running = submit_prefetch(
+            &manager,
+            &archive,
+            &pullthrough,
+            "org/gated",
+            Some(vec!["config.json"]),
+            "gate-running",
+        );
+        fetcher.await_arrival(1);
+        await_job_state(&manager, &running.id, JobState::Running);
+
+        // A second selection for the same repository cannot transfer yet
+        // (ADR-0021), so its job waits in `queued`.
+        let waiting = submit_prefetch(
+            &manager,
+            &archive,
+            &pullthrough,
+            "org/gated",
+            Some(vec!["tokenizer.json"]),
+            "gate-waiting",
+        );
+        let queued = await_job_phase(&manager, &waiting.id, TRANSFER_WAIT_PHASE);
+        assert_eq!(queued.state, JobState::Queued);
+        assert_eq!(
+            fetcher.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the queued job started transferring"
+        );
+        // Visible through the same listing an operator reads.
+        let listed = manager.list_page(50, None).unwrap();
+        let shown = listed
+            .items
+            .iter()
+            .find(|item| item.id == waiting.id)
+            .expect("the queued job is listed");
+        assert_eq!(shown.state, JobState::Queued);
+        assert_eq!(shown.phase, TRANSFER_WAIT_PHASE);
+        let view = pullthrough.in_flight_acquisitions();
+        assert_eq!(view.waiting, 1);
+        assert_eq!(view.transferring, 1);
+
+        // And cancellable while it waits.
+        let (cancelled, report) = manager.cancel(&waiting.id, Some(&pullthrough)).unwrap();
+        assert_eq!(report, CancelReport::Cancelled);
+        assert_eq!(cancelled.state, JobState::Cancelled);
+        assert_eq!(
+            await_job_state(&manager, &waiting.id, JobState::Cancelled).state,
+            JobState::Cancelled
+        );
+        // Cancelling the waiter left the running transfer alone.
+        assert_eq!(pullthrough.in_flight_acquisitions().transferring, 1);
+        fetcher.release();
+        assert_eq!(
+            await_job_state(&manager, &running.id, JobState::Completed).state,
+            JobState::Completed
+        );
+        assert_eq!(fetcher.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn the_admin_api_lists_and_cancels_an_in_flight_acquisition() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        let fetcher = Arc::new(HeldFetcher::new());
+        let pullthrough = Arc::new(PullThrough::new(archive.clone(), fetcher.clone() as Arc<_>));
+        let app = router(
+            archive,
+            Config::token("127.0.0.1:0".parse().unwrap(), "secret"),
+            Some(pullthrough.clone()),
+        )
+        .unwrap();
+        let acquiring = {
+            let pullthrough = pullthrough.clone();
+            std::thread::spawn(move || pullthrough.ensure("org/api", "main", &[]))
+        };
+        fetcher.await_arrival(1);
+
+        // Unauthorized readers learn nothing about what is in flight.
+        let denied = app
+            .clone()
+            .oneshot(request("/api/admin/v1/acquisitions", None))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let listed = app
+            .clone()
+            .oneshot(request("/api/admin/v1/acquisitions", Some("secret")))
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed: serde_json::Value =
+            serde_json::from_slice(&to_bytes(listed.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(listed["transfer_limit"], 2);
+        assert_eq!(listed["transferring"], 1);
+        assert_eq!(listed["waiting"], 0);
+        assert_eq!(listed["items"][0]["repo_id"], "org/api");
+        assert_eq!(listed["items"][0]["requested_revision"], "main");
+        assert_eq!(listed["items"][0]["operation"], "pull_through");
+        assert_eq!(listed["items"][0]["state"], "transferring");
+        // Attribution is deliberately absent: the download plane carries no
+        // principal, so no field claims one.
+        assert!(listed["items"][0].get("principal").is_none());
+        let id = listed["items"][0]["id"].as_str().unwrap().to_string();
+
+        // A state-changing request without CSRF is refused.
+        let no_csrf = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/admin/v1/acquisitions/{id}"))
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(no_csrf.status(), StatusCode::FORBIDDEN);
+
+        let cancelled = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/admin/v1/acquisitions/{id}"))
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .header("x-modelkeep-csrf", "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancelled.status(), StatusCode::OK);
+        let cancelled: serde_json::Value =
+            serde_json::from_slice(&to_bytes(cancelled.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(cancelled["cancellation"], "cancelled");
+        assert_eq!(
+            acquiring.join().unwrap(),
+            Err(crate::pullthrough::PullThroughError::Cancelled)
+        );
+
+        // Nothing is in flight under that identifier any more.
+        let gone = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/admin/v1/acquisitions/{id}"))
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .header("x-modelkeep-csrf", "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(gone.status(), StatusCode::NOT_FOUND);
+        let unsafe_id = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/admin/v1/acquisitions/..%2Fetc")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .header("x-modelkeep-csrf", "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unsafe_id.status(), StatusCode::BAD_REQUEST);
+        fetcher.release();
+    }
+
+    #[tokio::test]
+    async fn the_admin_api_cancels_a_running_job_and_reports_what_it_did() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        let fetcher = Arc::new(HeldFetcher::new());
+        let pullthrough = Arc::new(PullThrough::new(archive.clone(), fetcher.clone() as Arc<_>));
+        let app = router(
+            archive,
+            Config::token("127.0.0.1:0".parse().unwrap(), "secret"),
+            Some(pullthrough.clone()),
+        )
+        .unwrap();
+        let created = app.clone().oneshot(prefetch_request()).await.unwrap();
+        assert_eq!(created.status(), StatusCode::ACCEPTED);
+        let created: serde_json::Value =
+            serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let id = created["id"].as_str().unwrap().to_string();
+        fetcher.await_arrival(1);
+
+        let cancelled = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/admin/v1/jobs/{id}"))
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .header("x-modelkeep-csrf", "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancelled.status(), StatusCode::OK);
+        let cancelled: serde_json::Value =
+            serde_json::from_slice(&to_bytes(cancelled.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(cancelled["cancellation"], "cancelled");
+        // The job record is reported in the same shape the other job routes use.
+        assert_eq!(cancelled["state"], "cancelled");
+        assert_eq!(cancelled["id"], id.as_str());
+
+        let again = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/admin/v1/jobs/{id}"))
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .header("x-modelkeep-csrf", "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.status(), StatusCode::OK);
+        let again: serde_json::Value =
+            serde_json::from_slice(&to_bytes(again.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(again["cancellation"], "already_terminal");
+        assert_eq!(again["state"], "cancelled");
+        fetcher.release();
     }
 }

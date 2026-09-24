@@ -91,6 +91,13 @@ byte/file counters, timestamps, principal, terminal `outcome`, and safe failure
 classification/message. States are `queued`, `running`, `completed`, `failed`, and
 `cancelled`.
 
+`queued` means the job holds no upstream transfer slot. An acquisition job stays
+`queued` while it resolves (`phase` `resolving_revision`) and while it waits behind the
+per-repository transfer gate (`phase` `waiting_for_transfer_slot`, ADR-0021), and
+becomes `running` when its transfer starts. A job that is `queued` with a `started_at`
+is therefore one that has begun work but is not yet transferring; it is visible and
+cancellable throughout. `verify` and `audit` become `running` as soon as they start.
+
 `include` and `exclude` report the normalized selection the job acquires; both are
 empty for a whole-repository job.
 
@@ -179,6 +186,29 @@ later request for a path that revision does not hold consults upstream and exten
 same revision (`outcome` `extended`) instead of re-acquiring the repository. To archive
 the rest of a repository, submit the same target without patterns.
 
+### Transfer serialization
+
+At most one acquisition transfers per repository at a time, keyed by repository type
+and repository ID, and at most `MODELKEEP_MAX_TRANSFERRING_ACQUISITIONS` transfer
+across all repositories — **2** by default, whole numbers of at least 1
+([`ADR-0021`](adr/0021-one-transferring-acquisition-per-repository.md)). The effective
+value is reported at startup as `startup_configuration.max_transferring_acquisitions`
+and on `GET /api/admin/v1/acquisitions` as `transfer_limit`.
+
+Waiting is FIFO among the acquisitions that could run; one whose repository is busy
+does not hold a free slot against an unrelated repository. A waiting job stays `queued`.
+
+Two consequences matter operationally. First, overlapping selections stop paying twice:
+by the time a queued acquisition runs, it reconciles its selection against what the
+archive now holds and transfers only the remainder, which is often nothing. Second,
+head-of-line blocking is real and deliberate — a large acquisition delays everything
+else for its repository and holds one of a small number of global slots. That is why
+cancellation exists; use `GET /api/admin/v1/acquisitions` to see what holds each slot.
+
+Resolve-only and metadata work is never gated, so a prefetch whose selection is already
+archived is answered promptly even while another transfer for the same repository is
+running.
+
 Prefer an immutable 40-character commit for deterministic prefetch and verify tasks.
 Use a mutable ref only when the requested operation is specifically to resolve or
 refresh that ref. Before starting a potentially large transfer, inspect repository
@@ -211,10 +241,95 @@ DELETE /api/admin/v1/jobs/{job_id}
 X-ModelKeep-CSRF: 1
 ```
 
-Only a queued job can be cancelled. Running acquisition is not remotely cancelled by
-this API. Cancellation and container interruption are different: after a restart, a
-previously active job becomes a terminal interrupted failure, and any safe staging
-resume belongs to a newly submitted job.
+A job can be cancelled whether it is queued or running, of any kind. The response is
+`200` with the job record plus a `cancellation` field saying what the request did:
+
+- `cancelled`: the job is now terminal `cancelled`. Its acquisition was stopped, its
+  helper process was stopped and reaped, and nothing was published.
+- `already_terminal`: the job had already finished, failed, or been cancelled. The
+  returned record says which. This is an answer, not an error.
+- `already_finishing`: the acquisition had already passed its publication point, so it
+  completes and publishes. Nothing was cancelled. Poll the job for its terminal state.
+
+`404 {"error":"not_found"}` means there is no such job.
+
+Cancellation is an interruption, not a deletion. No archived revision is removed, and
+the bytes the acquisition had already transferred are kept as resumable fetch staging
+([`ADR-0017`](adr/0017-resumable-fetch-staging.md)), so a later acquisition for the
+same target under the same or a narrower selection adopts them and transfers less than
+a fresh start. Cleanup of that staging stays with the existing lease-expiry path.
+
+A `verify` or `audit` job has no upstream acquisition to stop. Its record becomes
+terminal `cancelled` immediately and is never overwritten, but the archive walk it had
+already started runs to completion in this process and its result is discarded. The
+job is cancelled; the reading it was doing is not interrupted.
+
+Cancelling a job cancels the acquisition it is running. Because identical work is
+collapsed by single-flight, that one acquisition may also be serving client download
+requests; those requests are answered `502` as well. This follows from sharing the
+transfer and is not separately configurable.
+
+Cancellation and container interruption are different: after a restart, a previously
+active job becomes a terminal interrupted failure, and any safe staging resume belongs
+to a newly submitted job.
+
+### Acquisitions in flight
+
+```http
+GET /api/admin/v1/acquisitions
+```
+
+Lists every upstream acquisition in flight, including those a client download request
+started rather than a job. The response reports the transfer gate as well:
+
+```json
+{"transfer_limit":2,"transferring":1,"waiting":1,
+ "items":[{"id":"acq-000000000007","repo_type":"model","repo_id":"org/repo",
+           "requested_revision":"main","include":[],"exclude":[],
+           "operation":"pull_through","state":"transferring","phase":"downloading",
+           "transferred_bytes":10485760,"total_bytes":null,
+           "started_at":1774310000,"cancelled":false}]}
+```
+
+- `transfer_limit` is the effective global limit on concurrent transfers
+  ([`ADR-0021`](adr/0021-one-transferring-acquisition-per-repository.md)),
+  `transferring` is how many hold a slot, and `waiting` how many are queued for one.
+- `state` is `resolving` (asking upstream what a selection covers, which is never
+  gated), `waiting_for_transfer_slot` (queued behind the gate, transferring nothing),
+  or `transferring` (holding a slot). Together with `repo_id` this is what shows which
+  acquisition is blocking a repository.
+- `operation` is `pull_through` for a download or prefetch acquisition and `refresh`
+  for a ref refresh.
+- `include` and `exclude` are the normalized selection; both empty means the whole
+  repository.
+- `transferred_bytes` counts only bytes that advanced, on the same basis as the
+  `acquisition_progress` event. `total_bytes` is `null` when upstream has not reported
+  a size.
+- `cancelled` is true for an acquisition that has been asked to stop and has not yet
+  finished unwinding.
+
+There is deliberately **no field saying who requested an acquisition.** The download
+data plane carries no principal — [`ADR-0015`](adr/0015-separate-management-control-plane.md)
+keeps identity on the management plane — so any attribution here would be a guess, and
+a partial hint is worse than none for deciding whether to stop a multi-day transfer.
+
+The identifiers are per-process and are not stable across a restart; they address an
+acquisition that is running now, nothing more.
+
+```http
+DELETE /api/admin/v1/acquisitions/{acquisition_id}
+X-ModelKeep-CSRF: 1
+```
+
+Stops an acquisition, whichever kind of request started it. The response is `200` with
+`{"cancellation":"...","id":"..."}` where `cancellation` is `cancelled`,
+`already_cancelled`, or `already_finished` (it had passed its publication point and
+completes). `404 {"error":"not_found"}` means nothing is in flight under that
+identifier — including an acquisition that has already ended.
+
+Every client request waiting on the acquisition is answered `502`, and any management
+job running it reaches terminal `cancelled`. Other acquisitions are unaffected, and
+serving already archived files is unaffected.
 
 ## Error handling
 
@@ -222,9 +337,14 @@ resume belongs to a newly submitted job.
   acquisition pattern; a selection on a kind that does not acquire;
 - `401`: missing/invalid bearer authorization or missing trusted Tailscale capability;
 - `403`: state-changing request omitted `X-ModelKeep-CSRF: 1`;
-- `404`: requested repository or job does not exist;
-- `409`: idempotency conflict or job state does not permit the requested action;
+- `404`: requested repository or job does not exist, or no acquisition is in flight
+  under the given identifier;
+- `409`: idempotency conflict;
 - `500`: internal metadata/storage error.
+
+A cancellation request never answers `409`. What it found is reported in the
+`cancellation` field of a `200`, because "it had already finished" is an operational
+answer and hiding it behind an error loses it.
 
 For an asynchronous operation, the HTTP submission response and the terminal job
 result are separate. Preserve that distinction in automation and user-facing reports.
