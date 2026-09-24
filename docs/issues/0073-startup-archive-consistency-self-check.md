@@ -127,3 +127,27 @@ write. The harness now drains stderr continuously.
 
 `nix flake check` omits aarch64-linux as an incompatible system, so the QNAP release
 architecture is covered by the native GitHub Actions jobs, not by this run.
+
+## Field verification (2026-09-24, v0.4.9)
+
+The self-check ran at startup on the QNAP deployment and reported, through the Admin status
+route:
+
+```json
+{"status":"findings","duration_ms":167,"repositories_checked":11,"revisions_checked":11,
+ "files_checked":322,"refs_checked":8,"staging_directories":7,
+ "orphaned_staging_directories":7,"oldest_orphaned_staging_age_seconds":232745,
+ "filtered_internal_paths":6,"finding_count":7,
+ "findings_by_kind":{"orphaned_staging":7}}
+```
+
+167 ms over 11 revisions and 322 files, so the cost is not a factor at this archive's size.
+
+It found seven orphaned fetch staging directories, the oldest about 2.7 days old, and
+repaired none of them — which is the intended behaviour, not a shortcoming. Cleanup is an
+explicit operator action (core invariant 4). This is also the first finding the check has
+produced on real state, and it is a true one: those directories are residue from interrupted
+acquisitions and nothing else was reporting them.
+
+No manifest, path, ref or size finding was reported, so the archive itself is self-consistent
+by the checks in scope.

@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: done
 priority: P0
 related_adrs:
   - ADR-0020
@@ -15,7 +15,7 @@ updated: 2026-09-24
 ---
 # Issue 0070: Acquire a selected subset of repository files
 
-- Status: In Progress
+- Status: Done
 - Priority: P0
 - Related ADR: ADR-0020 (governs this work), ADR-0008 (partially superseded),
   ADR-0002, ADR-0005, ADR-0010, ADR-0015, ADR-0017, ADR-0018
@@ -223,3 +223,31 @@ architecture is covered by the native GitHub Actions jobs, not by this run.
 filtered prefetch against a representative repository, including transferred bytes and
 peak staging usage. That was not done in this work and cannot be done away from the
 deployment.
+
+## Field verification (2026-09-24, v0.4.9)
+
+A filtered prefetch of `Qwen/Qwen3-Coder-Next-GGUF` ran on the QNAP deployment with
+
+```json
+"include": ["*.gitattributes", "*.md", "Qwen3-Coder-Next-Q4_K_M/*"]
+```
+
+and completed with `outcome: published` and 48,411,000,124 bytes transferred, against
+469.92 GB for the whole repository. The archived set is the four `Q4_K_M` shards plus
+`.gitattributes` and `README.md`; the tree route reports the commit's whole upstream file
+list, with ModelKeep's digest `null` for the paths the archive does not hold.
+
+Separately, a single-file resolve of an unarchived repository archived exactly one file of
+the twenty-six the commit contains, which is the same mechanism from the client-driven side.
+
+Logical archive size afterwards is 2,052,929,651,040 bytes at 88% filesystem availability,
+consistent with the 1.935 TB recorded before this work plus the two acquisitions since.
+
+**Peak staging usage was not captured.** The acquisition had already completed when these
+measurements were taken, and peak temporary usage is not retained anywhere after publication.
+The transferred-bytes figure is the one that decides this issue — 48.41 GB where the
+unfiltered acquisition would have moved 469.92 GB — so this is recorded as measured rather
+than left blocking, and a future filtered prefetch can capture the staging figure while it is
+running if that number is wanted.
+
+**Done**, with that one figure explicitly not measured.

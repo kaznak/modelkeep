@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: done
 priority: P0
 related_adrs:
   - ADR-0005
@@ -10,7 +10,7 @@ updated: 2026-09-24
 ---
 # Issue 0069: Return a bounded, observable response for a cold-miss resolve
 
-- Status: In Progress
+- Status: Done
 - Priority: P0
 - Related ADR: ADR-0005, ADR-0008, ADR-0017
 
@@ -162,3 +162,26 @@ architecture is covered by the native GitHub Actions jobs, not by this run.
 **Remaining before this issue can close**: repeat the original reproduction on a
 quiescent QNAP instance, with no restart test in flight, and record the sanitized result
 here. That was not done in this work and cannot be done away from the deployment.
+
+## Field verification (2026-09-24, v0.4.9)
+
+The original reproduction was repeated on the QNAP deployment after a restart, with no
+other test in flight, which is the quiescent condition this issue required.
+
+```text
+GET /openai-community/gpt2/resolve/main/config.json
+  v0.4.7 as reported:  status=000  size=0    t=40.0s   (no response headers)
+  v0.4.9 measured:     status=200  size=665  t=2.1s
+```
+
+The response carried a content-derived `ETag` and `x-repo-commit`. The repository was not
+archived beforehand; afterwards the archive held exactly one file, `config.json`, while the
+tree route reported all 26 files the commit contains. So the symptom is gone for the reason
+expected: the request acquired the one path it asked for instead of the repository.
+
+The larger of the two causes was the whole-repository acquisition fixed by Issue 0070. The
+deadline itself did not come into play here, because acquiring 665 bytes finishes well inside
+it; the bounded-response path remains covered by the deterministic checks rather than by this
+measurement.
+
+Nothing in this issue remains unverified. **Done.**
