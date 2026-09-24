@@ -654,79 +654,130 @@ impl Archive {
         result.map_err(ArchiveError::from)
     }
 
+    /// Reclaims staging that a process which is gone left behind.
+    ///
+    /// Each entry is reclaimed on its own account (Issue 0087). An entry this
+    /// process cannot rename or remove — a file left by another uid through a
+    /// share, a NAS artifact appearing under the volume, a directory a
+    /// concurrent writer is still filling — is reported and skipped, because
+    /// refusing to start would take a mirror that serves correctly from durable
+    /// state offline over junk in a scratch directory. Nothing else changes:
+    /// what recovery deletes or moves, and what it conservatively leaves for
+    /// manual inspection, is still what ADR-0009 and ADR-0017 say.
+    ///
+    /// Failing to read the staging directory itself is not a per-entry failure
+    /// and still aborts, because then no entry was attempted at all.
     pub fn recover_incomplete(&self) -> ArchiveResult<usize> {
+        let staging_root = self.root.join("tmp");
         let mut recovered = 0;
-        for entry in fs::read_dir(self.root.join("tmp"))? {
-            let entry = entry?;
-            let path = entry.path();
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            let lease = path.join(STAGING_LEASE_FILE);
-            let Ok(metadata) = fs::read_to_string(&lease) else {
-                continue;
+        for entry in fs::read_dir(&staging_root)? {
+            let (name, outcome) = match entry {
+                Ok(entry) => (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    self.recover_staging_entry(&staging_root, &entry),
+                ),
+                // The directory iterator failed before it named anything, so
+                // there is no entry to name; the remaining entries are still
+                // attempted.
+                Err(error) => (
+                    String::new(),
+                    Err(SkippedStagingEntry::new(RECOVERY_ACTION_EXAMINE, error)),
+                ),
             };
-            let Some(expires_at) = metadata
-                .lines()
-                .find_map(|line| line.strip_prefix("expires_at=")?.parse::<u64>().ok())
-            else {
-                continue;
-            };
-            if expires_at > unix_timestamp() {
-                continue;
+            match outcome {
+                Ok(true) => recovered += 1,
+                Ok(false) => {}
+                Err(skipped) => report_skipped_staging_entry(&name, skipped),
             }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let fetch_identity =
-                if name.starts_with("fetch-abandoned-") || name.starts_with(".fetch-active-") {
-                    read_fetch_staging_metadata(&path).ok()
-                } else {
-                    None
-                };
-            if name.starts_with("fetch-abandoned-") {
-                if fetch_identity
-                    .as_ref()
-                    .is_some_and(|metadata| metadata.resolved_commit.is_some())
-                {
-                    continue;
-                }
-            } else if name.starts_with(".fetch-active-")
-                && fetch_identity
-                    .as_ref()
-                    .is_some_and(|metadata| metadata.resolved_commit.is_some())
+        }
+        Ok(recovered)
+    }
+
+    /// Reclaims one staging entry, reporting whether it was discarded.
+    ///
+    /// Every failure that belongs to this entry alone is returned rather than
+    /// propagated, so the caller can name it and carry on with the rest of the
+    /// directory. Lease metadata that is absent or unrecognizable is still not a
+    /// failure: ADR-0009 keeps that state for manual inspection, so it is left
+    /// alone here exactly as before, silently and with nothing removed.
+    fn recover_staging_entry(
+        &self,
+        staging_root: &Path,
+        entry: &fs::DirEntry,
+    ) -> Result<bool, SkippedStagingEntry> {
+        let path = entry.path();
+        let is_directory = entry
+            .file_type()
+            .map_err(|error| SkippedStagingEntry::new(RECOVERY_ACTION_EXAMINE, error))?
+            .is_dir();
+        if !is_directory {
+            return Ok(false);
+        }
+        let lease = path.join(STAGING_LEASE_FILE);
+        let Ok(metadata) = fs::read_to_string(&lease) else {
+            return Ok(false);
+        };
+        let Some(expires_at) = metadata
+            .lines()
+            .find_map(|line| line.strip_prefix("expires_at=")?.parse::<u64>().ok())
+        else {
+            return Ok(false);
+        };
+        if expires_at > unix_timestamp() {
+            return Ok(false);
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let fetch_identity =
+            if name.starts_with("fetch-abandoned-") || name.starts_with(".fetch-active-") {
+                read_fetch_staging_metadata(&path).ok()
+            } else {
+                None
+            };
+        if name.starts_with("fetch-abandoned-") {
+            if fetch_identity
+                .as_ref()
+                .is_some_and(|metadata| metadata.resolved_commit.is_some())
             {
-                let abandoned = self
-                    .root
-                    .join("tmp")
-                    .join(format!("fetch-abandoned-{}", operation_id()));
-                fs::rename(&path, abandoned)?;
-                sync_directory(&self.root.join("tmp"))?;
-                if let Some(identity) = &fetch_identity {
-                    tracing::info!(
-                        event = "incomplete_fetch_recovered",
-                        repo_type = %identity.repo_type,
-                        repo_id = %identity.repo_id,
-                        requested_revision = %identity.requested_revision,
-                        commit = identity.resolved_commit.as_deref().unwrap_or(""),
-                        recovery_action = "preserved_for_resume",
-                        "recovered incomplete fetch staging"
-                    );
-                }
-                continue;
+                return Ok(false);
             }
-            fs::remove_dir_all(path)?;
-            recovered += 1;
+        } else if name.starts_with(".fetch-active-")
+            && fetch_identity
+                .as_ref()
+                .is_some_and(|metadata| metadata.resolved_commit.is_some())
+        {
+            let abandoned = staging_root.join(format!("fetch-abandoned-{}", operation_id()));
+            fs::rename(&path, abandoned)
+                .map_err(|error| SkippedStagingEntry::new(RECOVERY_ACTION_PRESERVE, error))?;
+            // A rename that is not flushed is not yet reclaimed, so an unflushed
+            // one is reported as skipped rather than announced as preserved.
+            sync_directory(staging_root)
+                .map_err(|error| SkippedStagingEntry::new(RECOVERY_ACTION_PRESERVE, error))?;
             if let Some(identity) = &fetch_identity {
                 tracing::info!(
                     event = "incomplete_fetch_recovered",
                     repo_type = %identity.repo_type,
                     repo_id = %identity.repo_id,
                     requested_revision = %identity.requested_revision,
-                    recovery_action = "discarded",
+                    commit = identity.resolved_commit.as_deref().unwrap_or(""),
+                    recovery_action = "preserved_for_resume",
                     "recovered incomplete fetch staging"
                 );
             }
+            return Ok(false);
         }
-        Ok(recovered)
+        fs::remove_dir_all(&path)
+            .map_err(|error| SkippedStagingEntry::new(RECOVERY_ACTION_DISCARD, error))?;
+        if let Some(identity) = &fetch_identity {
+            tracing::info!(
+                event = "incomplete_fetch_recovered",
+                repo_type = %identity.repo_type,
+                repo_id = %identity.repo_id,
+                requested_revision = %identity.requested_revision,
+                recovery_action = "discarded",
+                "recovered incomplete fetch staging"
+            );
+        }
+        Ok(true)
     }
 
     pub fn list_revisions(&self, repo_id: &str) -> ArchiveResult<Vec<String>> {
@@ -2721,6 +2772,90 @@ fn staging_selection_is_adoptable(recorded: &[String], requested: &[String]) -> 
     recorded.is_empty() || recorded == requested
 }
 
+/// `recovery_action` values for an entry startup recovery could not reclaim.
+///
+/// They name the attempt, where `incomplete_fetch_recovered` names a completed
+/// action: `examine` is reading the directory entry at all, and the other two
+/// are the two reclamations ADR-0017 allows — renaming identified staging into
+/// the adoptable form, and discarding staging that cannot be resumed.
+const RECOVERY_ACTION_EXAMINE: &str = "examine";
+const RECOVERY_ACTION_PRESERVE: &str = "preserve_for_resume";
+const RECOVERY_ACTION_DISCARD: &str = "discard";
+
+/// One staging entry startup recovery could not reclaim (Issue 0087).
+struct SkippedStagingEntry {
+    /// What recovery was attempting, in the `recovery_action` vocabulary.
+    action: &'static str,
+    error: io::Error,
+}
+
+impl SkippedStagingEntry {
+    fn new(action: &'static str, error: io::Error) -> Self {
+        Self { action, error }
+    }
+}
+
+/// Names one staging entry recovery skipped, and what it could not do to it.
+///
+/// An entry that cannot be reclaimed is operationally meaningful — someone has
+/// to look at it, because nothing here ever will again — so it is reported at a
+/// level an operator sees, with a class of its own: it is neither an archive
+/// storage failure of an acquisition nor a publication conflict, and no
+/// published revision is involved. Only the entry's own name is reported, never
+/// the archive path it sits under, and the failure is reported by its kind
+/// rather than by a message that would carry that path.
+fn report_skipped_staging_entry(name: &str, skipped: SkippedStagingEntry) {
+    tracing::warn!(
+        event = "staging_recovery_skipped",
+        staging = %bounded_archive_detail(name),
+        recovery_action = skipped.action,
+        error_class = "recovery_skipped",
+        io_kind = staging_io_kind(&skipped.error),
+        "startup recovery could not reclaim one staging entry"
+    );
+}
+
+/// The kind of an I/O failure, without the path it happened on.
+fn staging_io_kind(error: &io::Error) -> &'static str {
+    match error.kind() {
+        io::ErrorKind::StorageFull => "out_of_space",
+        io::ErrorKind::PermissionDenied => "permission_denied",
+        io::ErrorKind::DirectoryNotEmpty => "not_empty",
+        io::ErrorKind::ReadOnlyFilesystem => "read_only",
+        _ => "other",
+    }
+}
+
+/// One bounded, single-line rendering of archive-derived detail (Issue 0085).
+///
+/// Both callers name something the archive did not choose. A repository id, a
+/// revision and a file name arrive in a request, and a staging directory's name
+/// is whatever created it, which under a shared volume need not have been
+/// ModelKeep. Replacing anything unprintable stops a crafted name from forging a
+/// second log record, and the bound stops it from flooding one. This is the
+/// treatment Issue 0084 gives a helper's message; the difference is only that
+/// here the text is ours to build.
+pub(crate) fn bounded_archive_detail(value: &str) -> String {
+    const LIMIT: usize = 200;
+    let printable: String = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let single_line = printable.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single_line.chars().count() > LIMIT {
+        let kept: String = single_line.chars().take(LIMIT).collect();
+        format!("{}...[truncated]", kept.trim_end())
+    } else {
+        single_line
+    }
+}
+
 /// Reports a staging collision and names it as one (Issue 0083).
 ///
 /// The finer class belongs here rather than in the message a caller renders:
@@ -3783,6 +3918,161 @@ mod tests {
         assert_eq!(archive.recover_incomplete().unwrap(), 1);
         assert!(!staging.exists());
         assert!(!directory.path().join("models/org/model/revisions").exists());
+    }
+
+    /// Makes `path` unremovable by this process, and proves that it is.
+    ///
+    /// Dropping write permission on a directory stops its entries from being
+    /// unlinked, which is what `remove_dir_all` has to do first. That has no
+    /// effect for a caller privileged enough to ignore it, so this asserts the
+    /// premise rather than assuming it (Issue 0087): a check that silently does
+    /// not reach the failure path would be worse than no check, because it would
+    /// assert the fix without proving it.
+    #[cfg(unix)]
+    fn block_removal(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o555)).unwrap();
+        match fs::remove_dir_all(path) {
+            Ok(()) => panic!(
+                "removal of {} could not be blocked in this environment, so this \
+                 check did not exercise the failure path it asserts; it has to run \
+                 as a uid that ordinary directory permissions apply to",
+                path.display()
+            ),
+            Err(error) => {
+                assert_eq!(
+                    error.kind(),
+                    io::ErrorKind::PermissionDenied,
+                    "removal was refused for a reason other than the permissions \
+                     this fixture set, so the premise is not the one it set up"
+                );
+                assert!(
+                    path.join(STAGING_LEASE_FILE).is_file(),
+                    "the refused removal destroyed part of the fixture"
+                );
+            }
+        }
+    }
+
+    /// Lets the fixture be cleaned up again once the check is done with it.
+    #[cfg(unix)]
+    fn allow_removal(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Issue 0087: one entry this process cannot remove is not a reason to stop.
+    ///
+    /// The failure is made to happen in the filesystem rather than injected at a
+    /// seam, so what is under test is the real `remove_dir_all` failing for the
+    /// real reason a share artifact or a foreign uid's file makes it fail.
+    #[cfg(unix)]
+    #[test]
+    fn recovery_skips_an_unremovable_entry_and_reclaims_the_rest() {
+        let (writer, _guard) = capture_logs();
+        let (archive, directory) = archive();
+        let published = archive
+            .publish_revision(request(&"a".repeat(40), b"{}"))
+            .unwrap();
+        let staging_root = directory.path().join("tmp");
+
+        let reclaimable: Vec<PathBuf> = (0..3)
+            .map(|_| {
+                let staging = archive.create_fetch_staging().unwrap();
+                fs::write(staging.join("partial.bin"), b"partial").unwrap();
+                fs::write(
+                    staging.join(STAGING_LEASE_FILE),
+                    "nonce=test\npid=1\nexpires_at=0\n",
+                )
+                .unwrap();
+                staging
+            })
+            .collect();
+        let resumable = archive
+            .acquire_fetch_staging("org/model", "main", &[])
+            .unwrap()
+            .path;
+        record_fetch_resolved_commit(&resumable, "org/model", "main", &[], &"b".repeat(40))
+            .unwrap();
+        fs::write(
+            resumable.join(STAGING_LEASE_FILE),
+            "nonce=expired\npid=1\nexpires_at=0\n",
+        )
+        .unwrap();
+
+        let blocked = staging_root.join("stuck-staging");
+        fs::create_dir(&blocked).unwrap();
+        fs::write(
+            blocked.join(STAGING_LEASE_FILE),
+            "nonce=stuck\npid=1\nexpires_at=0\n",
+        )
+        .unwrap();
+        block_removal(&blocked);
+
+        // Partial progress is progress: this returns `Ok`, so startup continues
+        // instead of crash-looping over a scratch directory (main.rs step 4).
+        let recovered = archive.recover_incomplete().unwrap();
+
+        assert_eq!(recovered, reclaimable.len());
+        for staging in &reclaimable {
+            assert!(!staging.exists(), "{} survived recovery", staging.display());
+        }
+        // The rename path carried on as well, not only the discard path.
+        assert!(!resumable.exists());
+        let adoptable = fs::read_dir(&staging_root)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("fetch-abandoned-")
+            })
+            .count();
+        assert_eq!(adoptable, 1);
+        // Nothing that could not be reclaimed was deleted or moved either: this
+        // changes error handling, not reclamation policy (ADR-0009).
+        assert!(blocked.is_dir());
+        assert!(blocked.join(STAGING_LEASE_FILE).is_file());
+        // The published revision is untouched and still readable across the run.
+        assert_eq!(fs::read(published.join("config.json")).unwrap(), b"{}");
+
+        let output = writer.output();
+        assert!(output.contains("staging_recovery_skipped"), "{output}");
+        assert!(output.contains("stuck-staging"), "{output}");
+        assert!(
+            output.contains("\"error_class\":\"recovery_skipped\""),
+            "{output}"
+        );
+        assert!(
+            output.contains("\"recovery_action\":\"discard\""),
+            "{output}"
+        );
+        assert!(
+            output.contains("\"io_kind\":\"permission_denied\""),
+            "{output}"
+        );
+        // The archive root is not reported, as `fetch_staging_conflict` does not
+        // report it.
+        assert!(
+            !output.contains(&directory.path().display().to_string()),
+            "{output}"
+        );
+
+        allow_removal(&blocked);
+    }
+
+    /// A crafted entry name cannot forge a log record or flood one (Issue 0085).
+    #[test]
+    fn skipped_staging_entry_detail_is_bounded_and_single_line() {
+        let forged = "stuck\n{\"event\":\"archive_published\"}";
+        assert_eq!(
+            bounded_archive_detail(forged),
+            "stuck {\"event\":\"archive_published\"}"
+        );
+        let long = bounded_archive_detail(&"n".repeat(500));
+        assert!(long.ends_with("...[truncated]"), "{long}");
+        assert_eq!(long.chars().count(), 200 + "...[truncated]".len());
     }
 
     #[test]

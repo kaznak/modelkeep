@@ -37,6 +37,7 @@ headers, bearer tokens, signed URLs, or upstream error payloads.
 | `admin_archive_error` | WARN | `error` |
 | `incomplete_fetch_preserved` | WARN | `repo_id`, `requested_revision` |
 | `incomplete_fetch_recovered` | INFO | `repo_id`, `requested_revision`, `recovery_action`; resumable staging also has immutable `commit` |
+| `staging_recovery_skipped` | WARN | `staging` (bounded directory name only), `recovery_action`, `error_class=recovery_skipped`, `io_kind` |
 | `fetch_staging_conflict` | WARN | `repo_type`, `repo_id`, `requested_revision`, `staging` (directory name only), `lease_expires_in_seconds`, `error_class=staging_conflict` |
 | `acquisition_progress` | INFO | `request_kind`, `repo_id`, `requested_revision`, `path`, `phase`, `acquired_bytes`, `total_bytes` |
 | `acquisition_deadline_exceeded` | WARN | `request_kind`, `repo_id`, `requested_revision`, `path`, `deadline_seconds`, `acquired_bytes` |
@@ -272,6 +273,43 @@ under `orphaned_staging` in the meantime. Because those directory names begin wi
 a dot, `ls` and `du tmp/*` do not list them; `self-check` and
 `archive_self_check_finding` are what report them.
 
+`staging_recovery_skipped` (WARN) names one entry under the staging directory
+that startup recovery could not reclaim; recovery then carries on with the
+remaining entries (Issue 0087). It exists because the alternative was worse:
+recovery was a single loop that propagated the first failed rename or removal out
+of `serve`, so one entry the runtime user cannot remove — a share artifact such
+as `@Recycle` appearing under the archive volume, a file left by an SMB or NFS
+client under a different uid, `ENOTEMPTY` from a concurrent writer while the
+directory is walked — emitted `archive_recovery_failed`, then `process_failed`,
+and took a mirror that was serving correctly from durable state offline. None of
+those is archive corruption and none threatens a published revision, so skipping
+one scratch entry is strictly better than refusing to start.
+
+`staging` is the entry's own name, bounded the way Issue 0085 bounds a path,
+because a name under a shared volume need not have been chosen by ModelKeep; the
+archive path it sits under is not reported, as `fetch_staging_conflict` does not
+report it. `recovery_action` names what was attempted, where
+`incomplete_fetch_recovered` names a completed action: `examine` is reading the
+directory entry at all, `preserve_for_resume` is the rename into the adoptable
+form or the flush that makes it durable, and `discard` is the removal. `io_kind`
+is the failure's kind without the path it happened on, and for this event it is
+one of `permission_denied`, `not_empty`, `read_only`, `out_of_space`, or `other`.
+
+`error_class=recovery_skipped` is deliberately its own class. It is not
+`storage`: nothing was being written to the archive, no published revision is
+involved, and it sends an operator to one scratch entry rather than to disk
+health. It is also not a reason to serve partial data — nothing about
+publication changes, and the entry is left exactly as it lies for manual
+inspection (ADR-0009). `modelkeep self-check` keeps counting it under
+`orphaned_staging` until someone removes it, which is the standing record that it
+is still there; this event is the notification that it happened.
+
+Recovery still aborts when the staging directory itself cannot be read, because
+then no entry was attempted at all; that is the one remaining
+`archive_recovery_failed` from this step. `recovered_staging_directories` counts
+the entries discarded and never the ones skipped, so a startup that skipped
+something reports it only through this event.
+
 ## Archive self-check
 
 The self-check runs once at startup, beside serving, and emits one
@@ -330,7 +368,10 @@ succeeded (or, for the initial parse, is emitted instead of it):
 3. `archive_initialization_started`, then either `archive_initialization_failed`
    (aborts) or `archive_initialization_completed`.
 4. `archive_recovery_started`, then either `archive_recovery_failed` (aborts) or
-   `archive_recovery_completed` with `recovered_staging_directories`.
+   `archive_recovery_completed` with `recovered_staging_directories`. A single
+   staging entry that cannot be reclaimed no longer aborts this step: it emits
+   `staging_recovery_skipped` and recovery continues, so `archive_recovery_failed`
+   here now means the staging directory itself could not be read (Issue 0087).
 5. Archive readiness is checked; failure emits `archive_readiness_failed` and
    aborts. Success emits no dedicated event; the archive self-check is spawned in
    the background at this point (see "Archive self-check" above) and startup

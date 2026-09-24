@@ -519,6 +519,131 @@ def check_startup_reclaims_expired_active_staging(binary, root, log_path):
     print("startup recovery: expired marker renamed for resume, live lease untouched")
 
 
+def block_removal(path):
+    """Makes `path` unremovable by this process, and proves that it is.
+
+    Dropping write permission on a directory stops its entries from being
+    unlinked, which is what removing the directory has to do first. That has no
+    effect for a caller privileged enough to ignore it, so the premise is
+    asserted rather than assumed (Issue 0087): a check that silently does not
+    reach the failure path would be worse than no check, because it would assert
+    the fix without proving it.
+    """
+    path.chmod(0o555)
+    try:
+        shutil.rmtree(path)
+    except PermissionError:
+        assert (
+            path / ".modelkeep-staging-lease"
+        ).is_file(), "the refused removal destroyed part of the fixture"
+        return
+    except OSError as error:
+        raise AssertionError(
+            "removal was refused for a reason other than the permissions this "
+            f"fixture set, so the premise is not the one it set up: {error!r}"
+        ) from error
+    raise AssertionError(
+        f"removal of {path} could not be blocked in this environment, so this "
+        "check did not exercise the failure path it asserts; it has to run as a "
+        "uid that ordinary directory permissions apply to"
+    )
+
+
+def check_startup_isolates_an_unremovable_staging_entry(binary, root, log_path):
+    """Issue 0087: junk in a scratch directory cannot take the mirror offline.
+
+    Three entries are left under the staging directory: one the runtime user
+    cannot remove, one it can, and one identified download it must rename for a
+    later resume. The unremovable one must cost exactly itself.
+    """
+    archive = build_archive(binary, root / "stuck")
+    removable = archive / "tmp" / "stuck-removable"
+    removable.mkdir(parents=True)
+    (removable / "partial.bin").write_bytes(RETAINED_PARTIAL)
+    (removable / ".modelkeep-staging-lease").write_text(
+        "nonce=dead\npid=1\nexpires_at=0\n"
+    )
+    resumable = leave_killed_active_staging(
+        archive, ".fetch-active-stuck-neighbour", "org/model", 0
+    )
+    blocked = archive / "tmp" / "stuck-blocked"
+    blocked.mkdir(parents=True)
+    (blocked / ".modelkeep-staging-lease").write_text(
+        "nonce=stuck\npid=1\nexpires_at=0\n"
+    )
+    before = tree_digest(archive, skip=("tmp", "state"))
+    block_removal(blocked)
+
+    try:
+        with log_path.open("wb") as log:
+            # Startup reaching readiness at all is the first assertion: under
+            # `restart: unless-stopped` an abort here is a crash loop.
+            with server(binary, archive, log) as (endpoint, _admin):
+                with urllib.request.urlopen(
+                    f"{endpoint}/org/model/resolve/main/config.json", timeout=5
+                ) as response:
+                    assert response.status == 200
+                    assert response.read() == b"{}"
+
+        events = [
+            json.loads(line)["fields"]
+            for line in log_path.read_text(errors="replace").splitlines()
+            if line.startswith("{")
+        ]
+        names = [event.get("event") for event in events]
+        assert "archive_recovery_completed" in names, names
+        assert "archive_recovery_failed" not in names, names
+        assert "process_failed" not in names, names
+        completed = next(
+            event for event in events if event.get("event") == "archive_recovery_completed"
+        )
+        assert completed["recovered_staging_directories"] == 1, completed
+
+        skipped = [
+            event for event in events if event.get("event") == "staging_recovery_skipped"
+        ]
+        assert len(skipped) == 1, skipped
+        assert skipped[0]["staging"] == "stuck-blocked", skipped
+        assert skipped[0]["error_class"] == "recovery_skipped", skipped
+        assert skipped[0]["recovery_action"] == "discard", skipped
+        assert skipped[0]["io_kind"] == "permission_denied", skipped
+        # The entry is named, the archive path it sits under is not.
+        assert str(archive) not in json.dumps(skipped[0]), skipped
+
+        # Every other reclaimable entry was still reclaimed, by both paths
+        # recovery has: the one it discards and the one it renames for resume.
+        assert not removable.exists(), "a reclaimable entry survived recovery"
+        assert not resumable.exists(), "an identified download was not renamed"
+        adoptable = sorted((archive / "tmp").glob("fetch-abandoned-*"))
+        assert len(adoptable) == 1, adoptable
+        assert (adoptable[0] / "partial.bin").read_bytes() == RETAINED_PARTIAL
+
+        # The entry that could not be reclaimed is left exactly as it was: this
+        # changes error handling, not reclamation policy (ADR-0009). No partial
+        # data became observable, and no published revision was touched.
+        assert blocked.is_dir()
+        assert (blocked / ".modelkeep-staging-lease").is_file()
+        assert tree_digest(archive, skip=("tmp", "state")) == before
+
+        # The startup self-check still counts what recovery could not reclaim.
+        _, report = self_check(binary, archive)
+        orphaned = sorted(
+            finding["path"]
+            for finding in report["findings"]
+            if finding["finding"] == "orphaned_staging"
+        )
+        assert "stuck-blocked" in orphaned, report
+        assert orphaned == sorted(["stuck-blocked", adoptable[0].name]), report
+        assert report["orphaned_staging_directories"] == 2, report
+    finally:
+        # Restore write permission so the fixture can be cleaned up.
+        blocked.chmod(0o755)
+    print(
+        "startup: skipped one unremovable staging entry, reclaimed the rest, "
+        "and served throughout"
+    )
+
+
 def main():
     binary = Path(sys.argv[1])
     with tempfile.TemporaryDirectory() as temporary:
@@ -530,6 +655,9 @@ def main():
         check_runs_with_upstream_unreachable(binary, root)
         check_startup_reclaims_expired_active_staging(
             binary, root, root / "reclaim.log"
+        )
+        check_startup_isolates_an_unremovable_staging_entry(
+            binary, root, root / "stuck.log"
         )
         archive, _ = check_duration_is_measured_against_revision_count(binary, root)
         check_startup_reports_findings_without_delaying_serving(

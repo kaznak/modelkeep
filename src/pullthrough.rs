@@ -11,8 +11,8 @@ use crate::upstream::{
     UpstreamRepositoryFiles,
 };
 use crate::{
-    is_hf_commit, Archive, ArchiveError, FetchStagingError, RepositoryType, SourceFile,
-    UpstreamFile,
+    bounded_archive_detail, is_hf_commit, Archive, ArchiveError, FetchStagingError, RepositoryType,
+    SourceFile, UpstreamFile,
 };
 
 /// Identity of one in-flight acquisition.
@@ -2044,34 +2044,6 @@ fn log_archive_failure(
         ),
     }
     error.into()
-}
-
-/// One bounded, single-line rendering of archive-derived detail (Issue 0085).
-///
-/// A repository id, a revision and a file name all arrive in a request, so a
-/// path or a ref name built from them is untrusted text. Replacing anything
-/// unprintable stops a crafted name from forging a second log record, and the
-/// bound stops it from flooding one. This is the treatment Issue 0084 gives a
-/// helper's message; the difference is only that here the text is ours to build.
-fn bounded_archive_detail(value: &str) -> String {
-    const LIMIT: usize = 200;
-    let collapsed: String = value
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect();
-    let single_line = collapsed.split_whitespace().collect::<Vec<_>>().join(" ");
-    if single_line.chars().count() > LIMIT {
-        let kept: String = single_line.chars().take(LIMIT).collect();
-        format!("{}...[truncated]", kept.trim_end())
-    } else {
-        single_line
-    }
 }
 
 /// Answers a failed staging acquisition (Issue 0083).
