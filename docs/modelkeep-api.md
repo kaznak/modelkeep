@@ -272,31 +272,81 @@ revision. No `x-linked-etag` is sent; the supported clients accept the digest in
 alone. The measurement behind this shape, for both pinned client versions, is
 [`docs/observations/hugging-face-content-validator-2026-09-24.md`](observations/hugging-face-content-validator-2026-09-24.md).
 
-### What the `tree` route's `oid` is, and how it relates to the `ETag`
+### Verify a file against `modelkeep.sha256`
 
-A `tree` entry's `oid` is an object id for that path at that commit. Which one it is
-follows one rule, applied per file and in this order:
+Both metadata routes carry a per-file `modelkeep` object, and **`modelkeep.sha256` is the
+field to verify bytes against**. It is the digest ModelKeep computed over the bytes it
+holds, the value it validates its own archive against, and exactly the `ETag` the
+`resolve` route serves for that path, without the quotes. It is present for every file
+the archive holds, whether or not upstream manages that file with LFS, and it is `null`
+for a path ModelKeep does not hold, where there are no bytes it can stand behind.
 
-1. **the git object id upstream recorded for that path**, when the revision has a
-   recorded upstream file list naming one. This is what the Hub itself reports there.
-   It is a fact about the commit, recorded verbatim, and is **not** a digest ModelKeep
-   verified — so it is unrelated to the `ETag`, and for a non-LFS file it is a
-   different function of the bytes altogether;
-2. otherwise **ModelKeep's own content digest** of the bytes it holds for that path,
-   which is exactly the `ETag` value without its quotes;
-3. otherwise **`null`**, for a path ModelKeep does not hold and for which upstream
-   recorded no object id.
+```jsonc
+// GET /api/models/org/model/tree/<commit>
+[
+  {
+    "type": "file",
+    "path": "model.safetensors",
+    "size": 29,
+    "oid": "8095a62ccb4d806da7666fcda07467e2d150218e",
+    "modelkeep": { "sha256": "73ce509c…c8a2798" }
+  }
+]
+```
 
-ModelKeep never reports a digest for bytes it does not hold, and never presents an
-upstream value as one it verified. `size` follows the same principle: it is what
-ModelKeep will serve when it holds the file, upstream's recorded length when it does
-not, and `null` when neither states one. No `lfs` block and no `xetHash` are ever
-reported: both would advertise an object identity ModelKeep has not verified, and a
-supported client that sees them skips the `HEAD` request that carries the validator
-ModelKeep actually stands behind
-([`docs/observations/hugging-face-tree-listing-2026-09-24.md`](observations/hugging-face-tree-listing-2026-09-24.md)).
+```jsonc
+// GET /api/models/org/model/revision/<commit>
+{
+  "sha": "…",
+  "siblings": [
+    {
+      "rfilename": "model.safetensors",
+      "size": 29,
+      "blobId": "8095a62ccb4d806da7666fcda07467e2d150218e",
+      "modelkeep": { "sha256": "73ce509c…c8a2798" }
+    }
+  ]
+}
+```
 
-Two consequences follow, and both are intended:
+The object is nested so later additions need no new top-level name; today it holds
+`sha256` alone. Both pinned `huggingface_hub` versions ignore it: an unknown top-level
+key and an unknown per-file key disturb neither of them, measured for both in
+[`docs/observations/hugging-face-lfs-reporting-2026-09-24.md`](observations/hugging-face-lfs-reporting-2026-09-24.md).
+
+### The Hub's fields keep the Hub's meanings
+
+`oid` on the `tree` route and `blobId` on the `revision` route are one value under the
+two names the Hub uses for it: **the git object id upstream recorded for that path**. It
+is a fact about the commit, recorded verbatim, and is **not** a digest ModelKeep
+verified — for a non-LFS file it is a different function of the bytes altogether, and for
+an LFS-managed file it is the id of the pointer blob. It is **`null`** when ModelKeep has
+no recorded value, and nothing stands in for it: a revision archived before the upstream
+file list was recorded, or imported from a client cache, reports `null` there for every
+file and is not migrated. ModelKeep's digest is never reported under these names. A
+deployment before this change reported it as the `tree` route's `oid` wherever no
+upstream object id had been recorded, so a caller that read `oid` as a content digest
+must read `modelkeep.sha256` instead.
+
+`size` follows the same principle: it is what ModelKeep will serve when it holds the
+file, upstream's recorded length when it does not, and `null` when neither states one.
+
+**No `lfs` object and no `xetHash` are reported**, which is a deliberate deviation from
+the Hub for two measured reasons
+([`docs/observations/hugging-face-lfs-reporting-2026-09-24.md`](observations/hugging-face-lfs-reporting-2026-09-24.md)):
+
+- the Hub's `lfs` object states a `pointerSize`, and both pinned clients raise
+  `KeyError: 'pointerSize'` and fail the whole download when it is missing. ModelKeep
+  does not record a pointer size for any file, so it would have to invent one — the same
+  substitution this surface exists to remove;
+- `lfs.oid` is a content digest, and a client may take it as the file's validator
+  instead of requesting the `HEAD` that carries ModelKeep's. Relaying upstream's value
+  there would move the validator onto a number ModelKeep never verified.
+
+A caller that wants the content digest therefore reads `modelkeep.sha256`, which is
+always ModelKeep's own and always equals what `resolve` serves.
+
+Two consequences follow from a content-derived validator, and both are intended:
 
 - **Files with identical bytes carry the same validator and are allowed to share it.**
   `huggingface_hub` names each blob in its cache after the validator, so it stores one

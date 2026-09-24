@@ -1,5 +1,5 @@
 ---
-status: open
+status: done
 priority: P2
 related_adrs:
   - ADR-0020
@@ -8,7 +8,7 @@ updated: 2026-09-24
 ---
 # Issue 0079: Report Hub fields faithfully, and add ModelKeep's own
 
-- Status: Open
+- Status: Done
 - Priority: P2
 - Related ADR: ADR-0020
 
@@ -135,3 +135,43 @@ recipe written on 2026-09-24, so the cost is documenting the new location — wh
 acceptance criteria require anyway. Tolerance of an unknown property is established for 1.27.0 and
 still open for 0.36.0; if 0.36.0 rejects it, the fallback is to keep the Hub fields faithful
 and publish the digest on a separate route rather than to overload `oid` again.
+
+## Implementation status
+
+Implemented on 2026-09-24. Verified on x86_64-linux with `cargo fmt --check`,
+`cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`,
+and `nix flake check`, each with its exit status taken directly.
+
+The Hub's fields carry the Hub's meanings: a file's upstream git object id is reported as
+`oid` in a tree entry and `blobId` in a `revision` sibling, and is absent where no record
+holds one rather than substituted. ModelKeep's digest moved to `modelkeep: {"sha256": ...}`
+on both routes, present for every archived file, `null` for a file the archive does not
+hold, and equal to the `ETag` the resolve route serves. `docs/modelkeep-api.md` names it as
+the field to verify against.
+
+**`lfs` is not emitted, and the reason is not the one this issue was filed with.** Two
+measurements, recorded in
+[`hugging-face-lfs-reporting-2026-09-24.md`](../observations/hugging-face-lfs-reporting-2026-09-24.md):
+an `lfs` object without `pointerSize` makes both pinned clients fail the whole download with
+`KeyError: 'pointerSize'`, and ModelKeep records no pointer size, so a faithful `lfs` would
+require inventing one. And `lfs.oid` alone does not move the validator: the `HEAD` skip in
+1.27.0 needs xet availability, a valid `xetHash`, an LFS sha256 and an LFS size together, so
+with `lfs.oid` and no `xetHash` both versions still issue the `HEAD`, name the blob after the
+served `ETag`, and ignore a deliberately divergent `lfs.oid`.
+
+That corrects what ADR-0022 decision 7 originally claimed — that `lfs` being present is
+enough to move the validator — which was too broad. The decision stands; its reasoning was
+replaced.
+
+The wire name for a sibling's git object id is `blobId`, not `blob_id`. That was found by a
+real-client check failing with `blob_id=None`, not by reading the client's source.
+
+Unknown-property tolerance is now measured for both versions rather than one.
+
+Four existing assertions that pinned `oid` as the digest were replaced by six that assert
+`oid` is upstream's object id, assert it is **not** the digest, and assert the digest in its
+new home — so the two fields cannot quietly merge again.
+
+**Remaining**: directory entries and pagination are untouched; a large repository's tree is
+still returned in one response. Emitting a faithful `lfs` later requires recording a pointer
+size, which is an addition to ADR-0022 decision 1 and a change to the helper.

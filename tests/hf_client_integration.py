@@ -430,6 +430,9 @@ def assert_a_client_filter_narrows_the_first_acquisition(
     )
     assert recorded["commit"] == COMMIT
     assert [entry["path"] for entry in recorded["files"]] == UPSTREAM_FILES, recorded
+    assert [entry.get("blob_id") for entry in recorded["files"]] == [
+        upstream_blob_id(path) for path in UPSTREAM_FILES
+    ], recorded
     assert '"event":"upstream_metadata_answered"' in logs[0], logs[0]
 
     # Warm and offline: no helper and no HF_ENDPOINT, so upstream is
@@ -444,14 +447,147 @@ def assert_a_client_filter_narrows_the_first_acquisition(
         held = [entry for entry in tree if entry["path"] == "config.json"][0]
         absent = [entry for entry in tree if entry["path"] == "model.safetensors"][0]
         assert held["size"] == 34, held
-        # The mirror holds it, so its object id is the digest it serves and
-        # validates against; it never claims one for bytes it does not hold.
-        assert held["oid"] == archived["config.json"], held
+        # `oid` is upstream's git object id, which travelled the whole chain: the
+        # fixture reported it, the upstream mirror published it as `blob_id`, the
+        # real helper read it, and this mirror recorded it (Issue 0079). It is not
+        # a digest of anything ModelKeep holds.
+        assert held["oid"] == upstream_blob_id("config.json"), held
+        assert held["oid"] != archived["config.json"], held
+        # ModelKeep's own digest lives in ModelKeep's own property, and is the
+        # validator the mirror serves and verifies against.
+        assert held["modelkeep"]["sha256"] == archived["config.json"], held
         status, headers, _ = resolve_headers(
             endpoint, REPO_ID, COMMIT, "config.json", method="HEAD"
         )
-        assert headers["ETag"] == f'"{held["oid"]}"', headers
-        assert absent["oid"] is None, absent
+        assert headers["ETag"] == f'"{held["modelkeep"]["sha256"]}"', headers
+        # A file the mirror does not hold: upstream's object id is reported,
+        # because the commit states it, and no digest is claimed for bytes the
+        # mirror does not have.
+        assert absent["oid"] == upstream_blob_id("model.safetensors"), absent
+        assert absent["modelkeep"]["sha256"] is None, absent
+
+
+def upstream_blob_id(path):
+    """The git object id the model fixture reports for a path.
+
+    The same rule as `tests/fixtures/hf_fetch_fixture.py`: a git blob id is a
+    sha1 over the blob, so it is deliberately not any digest of the content, and
+    a check that compares the two catches a response reporting one under the
+    other's name (Issue 0079).
+    """
+    return hashlib.sha1(b"blob:" + path.encode()).hexdigest()
+
+
+def assert_metadata_reports_hub_fields_and_modelkeeps_digest(binary, archive, root):
+    """Issue 0079 acceptance, black-box against a real supported client.
+
+    Both metadata routes report the Hub's fields with the Hub's meanings — `oid`
+    and `blob_id` are upstream's git object id, never a digest — and carry
+    ModelKeep's own property beside them, whose `sha256` is the validator the
+    `resolve` route serves. The bytes are verified against that property, which is
+    what the documentation tells a caller to do.
+
+    Nothing is relayed and no `lfs` object is reported: upstream recorded an LFS
+    digest for the `.safetensors` files, and it reaches no response. Emitting
+    `lfs` would move the validator a supported client uses off the value ModelKeep
+    computes and serves, and both pinned versions reject an `lfs` object without
+    `pointerSize`, which ModelKeep does not record. See
+    `docs/observations/hugging-face-lfs-reporting-2026-09-24.md`.
+
+    The mirror is offline throughout: no helper and no `HF_ENDPOINT`, so every
+    answer comes from the archive.
+    """
+    digests = archived_digests(archive, REPO_ID, COMMIT)
+    recorded = json.loads(
+        (
+            revision_directory(archive, REPO_ID, COMMIT)
+            / ".modelkeep-upstream-files.json"
+        ).read_text()
+    )
+    # The precondition that makes the LFS half of this check mean anything.
+    assert [
+        entry["path"] for entry in recorded["files"] if entry.get("lfs_sha256")
+    ] == [path for path in UPSTREAM_FILES if path.endswith(".safetensors")], recorded
+
+    with server(binary, archive) as endpoint:
+        with urllib.request.urlopen(
+            f"{endpoint}/api/models/{REPO_ID}/tree/{COMMIT}"
+        ) as response:
+            tree = json.loads(response.read())
+        with urllib.request.urlopen(
+            f"{endpoint}/api/models/{REPO_ID}/revision/{COMMIT}"
+        ) as response:
+            info = json.loads(response.read())
+        siblings = {sibling["rfilename"]: sibling for sibling in info["siblings"]}
+        assert sorted(entry["path"] for entry in tree) == UPSTREAM_FILES, tree
+        assert sorted(siblings) == UPSTREAM_FILES, info
+
+        for entry in tree:
+            path = entry["path"]
+            sibling = siblings[path]
+            # No `lfs` object and no `xetHash` in either route, for an
+            # LFS-managed file as much as for a plain one. A relayed LFS digest
+            # cannot be distinguished from ModelKeep's own here, because upstream
+            # reports the real digest of the same bytes; the divergent case is
+            # pinned by the Rust test
+            # `an_lfs_managed_file_reports_no_lfs_object_and_one_verifiable_digest`.
+            assert "lfs" not in entry, entry
+            assert "lfs" not in sibling, sibling
+            assert "xetHash" not in entry, entry
+            assert "pointerSize" not in json.dumps([entry, sibling]), entry
+            # The Hub's fields, with the Hub's meanings, in both routes.
+            assert entry["oid"] == upstream_blob_id(path), entry
+            assert sibling["blobId"] == entry["oid"], sibling
+            assert sibling["size"] == entry["size"], sibling
+            # ModelKeep's own property, on every file the archive holds, equal in
+            # both routes and equal to the validator `resolve` serves.
+            digest = entry["modelkeep"]["sha256"]
+            assert digest == digests[path], entry
+            assert sibling["modelkeep"] == entry["modelkeep"], sibling
+            assert digest != entry["oid"], entry
+            status, headers, _ = resolve_headers(
+                endpoint, REPO_ID, COMMIT, path, method="HEAD"
+            )
+            assert status == 200, (path, status)
+            assert headers["ETag"] == f'"{digest}"', headers
+            # The documented recipe: read the tree, fetch the bytes, verify them
+            # against ModelKeep's property.
+            _, _, payload = resolve_headers(
+                endpoint, REPO_ID, COMMIT, path, method="GET"
+            )
+            assert hashlib.sha256(payload).hexdigest() == digest, path
+
+        # Both pinned clients read the same answers without being disturbed by the
+        # unknown `modelkeep` property: 1.27.0 keeps unknown top-level keys and
+        # ignores unknown per-file keys, 0.36.0 ignores both. What is required here
+        # is only that neither rejects them.
+        api = HfApi(endpoint=endpoint)
+        client_info = api.repo_info(REPO_ID, revision=COMMIT, files_metadata=True)
+        assert sorted(sibling.rfilename for sibling in client_info.siblings) == (
+            UPSTREAM_FILES
+        ), client_info.siblings
+        for sibling in client_info.siblings:
+            assert sibling.lfs is None, sibling
+            assert sibling.blob_id == upstream_blob_id(sibling.rfilename), sibling
+            assert sibling.size == siblings[sibling.rfilename]["size"], sibling
+        listed = list(api.list_repo_tree(REPO_ID, revision=COMMIT, recursive=True))
+        assert sorted(item.path for item in listed) == UPSTREAM_FILES, listed
+        for item in listed:
+            assert item.lfs is None, item
+            assert item.blob_id == upstream_blob_id(item.path), item
+
+        client = Path(
+            snapshot_download(
+                repo_id=REPO_ID,
+                revision=COMMIT,
+                endpoint=endpoint,
+                local_dir=str(root / "faithful-metadata-client"),
+            )
+        )
+        for path, digest in digests.items():
+            assert hashlib.sha256((client / path).read_bytes()).hexdigest() == (
+                digest
+            ), path
 
 
 def load_module(path):
@@ -792,6 +928,9 @@ def main():
                     for relative, expected in expected_payloads.items():
                         assert (actual / relative).read_bytes() == expected
 
+            assert_metadata_reports_hub_fields_and_modelkeeps_digest(
+                binary, archive, root
+            )
             assert_content_derived_validators_keep_shards_distinct(
                 binary, collision_fixture, root
             )

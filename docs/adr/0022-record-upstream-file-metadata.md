@@ -55,12 +55,33 @@ permanently valid; it cannot go stale the way a claim about our own state could.
 6. Reconciliation uses the record where it applies, removing the upstream round trip it
    previously required.
 
-7. The per-file identity in a tree response is, in order: the recorded upstream git object
-   id; else ModelKeep's own content digest, which is the value the resolve route advertises
-   as `ETag`; else absent rather than substituted. `lfs` and `xetHash` are not emitted.
-   Measured: with `lfs` present, `huggingface_hub` 1.27.0 skips its `HEAD` and takes
-   `lfs.oid` as the validator, which silently moves the validator off the value ModelKeep
-   serves and verifies.
+7. Metadata responses carry the Hub's fields with the Hub's meanings, and ModelKeep's own
+   information beside them rather than inside them.
+
+   A file's upstream git object id is reported under the Hub's name for it — `oid` in a
+   tree entry, `blobId` in a `revision` sibling — or is absent when no record holds one. It
+   is never substituted with a digest of ModelKeep's own.
+
+   ModelKeep's digest is reported as `modelkeep: {"sha256": ...}` on every entry of both
+   routes. It is the value the resolve route advertises as `ETag`, it is present for every
+   file the archive holds, and it is `null` for a file the archive does not hold, because
+   ModelKeep will not claim a digest for bytes it has not got. This is the field a client
+   verifies a local copy against.
+
+   `lfs` and `xetHash` are not emitted. Two measurements decide that, and the second
+   corrects a claim an earlier draft of this record made:
+
+   - An `lfs` object without `pointerSize` makes both pinned clients fail the whole
+     download with `KeyError: 'pointerSize'`. ModelKeep does not record a pointer size, so
+     emitting `lfs` faithfully would mean inventing one.
+   - `lfs.oid` alone does **not** move the validator. This record previously said that
+     `lfs` being present makes 1.27.0 skip its `HEAD`; that was too broad. The skip requires
+     xet availability, a valid `xetHash`, an LFS sha256 and an LFS size together. With
+     `lfs.oid` present and no `xetHash`, both versions still issue the `HEAD` and name the
+     blob after the served `ETag`, and a deliberately divergent `lfs.oid` goes unused.
+
+   Emitting a faithful `lfs` later requires recording a pointer size, which is an addition
+   to decision 1 and a change to the helper.
 
 8. A ref learned from an upstream metadata answer is held in memory only, and is used to
    create a ref that does not exist once the corresponding revision is published. No
@@ -105,8 +126,10 @@ success that returned an incomplete model.
 The cost boundary for an unfiltered download is consequently the client's own filter plus
 the ability to stop a transfer (Issue 0076). There is no size gate.
 
-`repository_info` siblings still carry only `rfilename`, so a chain in which one ModelKeep
-points at another does not propagate the record. Issue 0079 covers the reporting surface.
+A chain in which one ModelKeep points at another propagates the record, because the
+`revision` siblings now carry the Hub's per-file fields: the upstream git object id travels
+as `blobId` and is recorded by the mirror downstream. That path is exercised end to end by
+the supported-client checks.
 
 Legacy and imported revisions keep working with no record and no migration; they gain one
 the next time they are acquired.
@@ -125,3 +148,8 @@ the next time they are acquired.
   measured.
 - A ref learned from a metadata answer creates only a missing ref and never moves an
   existing one.
+- `oid` and `blobId` carry upstream's git object id and are asserted *not* to equal
+  ModelKeep's digest, so the two cannot quietly become the same field again.
+- Every archived file carries `modelkeep.sha256` equal to the `ETag` served for it, and a
+  file the archive does not hold carries `null` there while still reporting its upstream
+  object id.

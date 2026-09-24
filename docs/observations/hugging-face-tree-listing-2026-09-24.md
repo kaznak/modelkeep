@@ -59,13 +59,19 @@ repository therefore persists on the client after ModelKeep stops understating i
 
 ## Consequence for ModelKeep
 
+The last two points below were superseded on the same day by Issue 0079 and
+[`hugging-face-lfs-reporting-2026-09-24.md`](hugging-face-lfs-reporting-2026-09-24.md),
+which measured the `HEAD`-skip guard more narrowly and moved ModelKeep's digest out of
+`oid` into a property of its own. What that record states is what the code does.
+
 - both metadata routes answer from one file list, so `siblings` and `tree` cannot drift;
 - every `tree` entry carries `path`, `size` and `oid` keys, with `null` where ModelKeep
   has no value to state rather than an invented one;
-- `oid` is upstream's recorded git object id where the revision has one, and otherwise
-  ModelKeep's own content digest, which is the `ETag` value. The precedence is
+- ~~`oid` is upstream's recorded git object id where the revision has one, and otherwise
+  ModelKeep's own content digest, which is the `ETag` value~~ — `oid` is upstream's
+  recorded git object id or `null`; the digest is `modelkeep.sha256`. The rule is
   documented in [`modelkeep-api.md`](../modelkeep-api.md);
-- `lfs` and `xetHash` are never reported.
+- `lfs` and `xetHash` are never reported, for the reasons the newer record measures.
 
 ## Reproducing
 

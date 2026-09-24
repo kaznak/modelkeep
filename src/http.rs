@@ -319,14 +319,34 @@ async fn dataset_info(
 
 /// One file in a repository metadata answer.
 ///
-/// `size` and `oid` are `None` when neither the archive nor the recorded
-/// upstream file list states one; ModelKeep reports the absence rather than
-/// inventing a value.
+/// The fields split by who they belong to (Issue 0079). `size` and `oid` are the
+/// Hub's, carried with the Hub's meaning: `oid` is the git object id upstream
+/// recorded for that path and nothing else. `digest` is ModelKeep's own, the
+/// sha256 of the bytes it holds and serves for that path, which is the value the
+/// `resolve` route advertises as `ETag`.
+///
+/// Every one of them is `None` when nothing states it: `oid` when the revision
+/// has no recorded upstream file list, `digest` when the archive does not hold
+/// the file. ModelKeep reports the absence rather than substituting the other
+/// value for it, which is what made the two fields mean each other's names
+/// before.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MetadataFile {
     path: String,
     size: Option<u64>,
     oid: Option<String>,
+    digest: Option<String>,
+}
+
+/// ModelKeep's own per-file property, beside the Hub's fields.
+///
+/// A nested object rather than a bare key, so a later addition needs no new
+/// top-level name and no consumer has to learn a second place to look. `sha256`
+/// is the digest ModelKeep serves as the file's `ETag` and validates its own
+/// bytes against, and it is `null` for a path the archive does not hold, where
+/// ModelKeep has no bytes to stand behind.
+fn modelkeep_property(file: &MetadataFile) -> serde_json::Value {
+    serde_json::json!({ "sha256": file.digest })
 }
 
 /// What the metadata routes answer for one revision.
@@ -344,7 +364,8 @@ impl RepositoryMetadata {
     /// so no answer can point a client around the mirror (core invariant 10).
     /// `oid` is upstream's git object id for the commit, which is what the Hub
     /// itself reports there, and never a digest ModelKeep claims to have
-    /// verified.
+    /// verified. `digest` is `None` throughout: the archive holds none of these
+    /// files yet, so there is no value ModelKeep serves and stands behind.
     fn from_upstream(metadata: crate::upstream::UpstreamRepositoryFiles) -> Self {
         let mut files = metadata
             .files
@@ -353,6 +374,7 @@ impl RepositoryMetadata {
                 path: file.path,
                 size: file.size,
                 oid: file.blob_id,
+                digest: None,
             })
             .collect::<Vec<_>>();
         files.sort_by(|left, right| left.path.cmp(&right.path));
@@ -376,10 +398,25 @@ async fn repository_info(
     else {
         return cold_miss_pending_response(false, state.cold_miss.metadata_retry_after_seconds());
     };
+    // The Hub's `files_metadata` shape — `rfilename`, `size`, `blobId` — with
+    // the Hub's meanings, plus ModelKeep's own property beside them (Issue
+    // 0079). The wire name is `blobId`: both pinned clients read
+    // `sibling.get("blobId")` here and expose it as `RepoSibling.blob_id`, and a
+    // sibling spelled `blob_id` leaves the client's own attribute `None`. The
+    // `tree` route spells the same value `oid`, which is the Hub's name there.
+    // No `lfs` object: see `modelkeep-api.md` for the deviation and the
+    // measurement behind it.
     let siblings = answer
         .files
         .iter()
-        .map(|file| serde_json::json!({ "rfilename": file.path }))
+        .map(|file| {
+            serde_json::json!({
+                "rfilename": file.path,
+                "size": file.size,
+                "blobId": file.oid,
+                "modelkeep": modelkeep_property(file),
+            })
+        })
         .collect::<Vec<_>>();
     Ok(Json(serde_json::json!({
         "id": repo_id, "sha": answer.commit, "private": false, "downloads": 0,
@@ -424,6 +461,7 @@ async fn repository_tree(
                 "path": file.path,
                 "size": file.size,
                 "oid": file.oid,
+                "modelkeep": modelkeep_property(file),
             })
         })
         .collect::<Vec<_>>();
@@ -549,11 +587,14 @@ async fn upstream_metadata(
 /// shards missing and calling it a successful download. A revision without a
 /// record reports exactly the archived set, as before.
 ///
-/// `oid` is, per file and in order: the git object id upstream recorded for that
-/// path, then ModelKeep's own content digest of the bytes it holds — the value
-/// the `resolve` route returns as `ETag` — then nothing. ModelKeep never reports
-/// a digest for bytes it does not hold, and never presents an upstream value as
-/// one it verified. `size` is what ModelKeep will serve when it holds the file.
+/// `oid` is the git object id upstream recorded for that path, and nothing else:
+/// a revision with no record, or a path the record does not name, reports no
+/// `oid` rather than a digest standing in for one (Issue 0079). ModelKeep's own
+/// digest is reported in its own property instead, for every path the archive
+/// holds, and is the value the `resolve` route returns as `ETag`. ModelKeep never
+/// reports a digest for bytes it does not hold, and never presents an upstream
+/// value as one it verified. `size` is what ModelKeep will serve when it holds
+/// the file.
 fn archived_metadata(
     archive: &Archive,
     repo_type: RepositoryType,
@@ -588,8 +629,8 @@ fn archived_metadata(
                 size: file["size"].as_u64(),
                 oid: recorded
                     .get(path)
-                    .and_then(|recorded| recorded.blob_id.clone())
-                    .or_else(|| file["sha256"].as_str().map(str::to_string)),
+                    .and_then(|recorded| recorded.blob_id.clone()),
+                digest: file["sha256"].as_str().map(str::to_string),
             },
         );
     }
@@ -598,6 +639,7 @@ fn archived_metadata(
             path: path.clone(),
             size: recorded.size,
             oid: recorded.blob_id.clone(),
+            digest: None,
         });
     }
     Ok(RepositoryMetadata {
@@ -2186,21 +2228,29 @@ mod tests {
         assert_eq!(tree.as_array().unwrap().len(), 1);
         assert_eq!(tree[0]["path"], "config.json");
         assert_eq!(tree[0]["size"], 10);
-        // Without a recorded upstream value, `oid` is ModelKeep's own content
-        // digest: the value the `resolve` route returns as `ETag`.
-        let digest = tree[0]["oid"].as_str().unwrap().to_string();
+        // Issue 0079: the git object id was never recorded for this revision, so
+        // it is reported as absent. Nothing stands in for it — not ModelKeep's
+        // digest, which is reported in ModelKeep's own property, and not any
+        // other value.
+        assert_eq!(tree[0]["oid"], serde_json::Value::Null);
+        assert_eq!(info["siblings"][0]["blobId"], serde_json::Value::Null);
+        assert!(tree[0].get("lfs").is_none(), "{tree}");
+        let digest = tree[0]["modelkeep"]["sha256"].as_str().unwrap().to_string();
+        assert_eq!(info["siblings"][0]["modelkeep"]["sha256"], digest);
         let file = get(&app, "/org/model/resolve/main/config.json").await;
         assert_eq!(file.headers()[header::ETAG], format!("\"{digest}\""));
     }
 
     /// The documented meaning of a tree `oid`, pinned against `resolve`.
     ///
-    /// Where the revision has a recorded upstream file list, `oid` is upstream's
-    /// git object id for the commit — a fact about the commit, not a digest
-    /// ModelKeep verified — and is unrelated to the `ETag`. Where it has none,
-    /// `oid` is ModelKeep's content digest and equals the `ETag` exactly.
+    /// `oid` is upstream's git object id for the commit — a fact about the commit,
+    /// not a digest ModelKeep verified — and is unrelated to the `ETag`.
+    /// ModelKeep's own digest is reported beside it, in ModelKeep's own property,
+    /// and equals the `ETag` exactly. Where no object id was recorded, `oid` is
+    /// absent and the digest is still there, so the two never stand in for each
+    /// other (Issue 0079).
     #[tokio::test]
-    async fn the_tree_object_id_is_upstreams_where_recorded_and_ours_otherwise() {
+    async fn the_tree_object_id_is_upstreams_and_the_digest_is_modelkeeps_own() {
         let directory = tempfile::tempdir().unwrap();
         let archive = Archive::new(directory.path()).unwrap();
         let fetcher = Arc::new(MetadataFetcher::new(
@@ -2223,8 +2273,12 @@ mod tests {
         let etag = file.headers()[header::ETAG].to_str().unwrap().to_string();
         assert_eq!(etag, format!("\"{}\"", crate::sha256(b"cold-http")));
         assert_ne!(etag.trim_matches('"'), blob_id);
+        // ModelKeep's own digest is the `ETag`, in ModelKeep's own property, and
+        // is never what `oid` holds.
+        assert_eq!(tree[0]["modelkeep"]["sha256"], etag.trim_matches('"'));
 
-        // The same revision without its record answers the older way.
+        // The same revision without its record still answers, and still carries
+        // the digest. Only the value it never recorded goes absent.
         std::fs::remove_file(
             archive
                 .revision_path("org/model", METADATA_COMMIT)
@@ -2233,7 +2287,183 @@ mod tests {
         )
         .unwrap();
         let tree = json_body(get(&app, "/api/models/org/model/tree/main").await).await;
-        assert_eq!(tree[0]["oid"], etag.trim_matches('"'));
+        assert_eq!(tree[0]["oid"], serde_json::Value::Null);
+        assert_eq!(tree[0]["modelkeep"]["sha256"], etag.trim_matches('"'));
+    }
+
+    /// Issue 0079, the LFS decision, pinned so a relayed digest cannot reappear.
+    ///
+    /// ModelKeep reports no `lfs` object even where upstream recorded an LFS
+    /// sha256 for the path, so the validator a supported client uses stays the
+    /// `ETag` ModelKeep computed from the bytes it holds. The recorded upstream
+    /// LFS digest is deliberately a value ModelKeep never serves, and this test
+    /// fails if it ever reaches a response body — which is exactly what emitting
+    /// `lfs` would do, and what would move the client's validator off the value
+    /// ModelKeep verifies. See
+    /// `docs/observations/hugging-face-lfs-reporting-2026-09-24.md`.
+    #[tokio::test]
+    async fn an_lfs_managed_file_reports_no_lfs_object_and_one_verifiable_digest() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        let commit = METADATA_COMMIT;
+        archive
+            .publish_revision(crate::PublishRequest {
+                repo_id: "org/model".into(),
+                requested_revision: "main".into(),
+                commit: commit.into(),
+                files: vec![crate::ArchiveFile {
+                    path: "model.safetensors".into(),
+                    bytes: b"lfs-managed-payload".to_vec(),
+                }],
+            })
+            .unwrap();
+        archive.update_ref("org/model", "main", commit).unwrap();
+        // A digest that is not the digest of the archived bytes, so relaying it
+        // is observable rather than accidentally correct.
+        let upstream_lfs_digest = crate::sha256(b"a digest modelkeep never serves");
+        assert_ne!(upstream_lfs_digest, crate::sha256(b"lfs-managed-payload"));
+        archive
+            .record_upstream_files_for_type(
+                RepositoryType::Model,
+                "org/model",
+                commit,
+                &[crate::UpstreamFile {
+                    path: "model.safetensors".into(),
+                    size: Some(19),
+                    blob_id: Some("e".repeat(40)),
+                    lfs_sha256: Some(upstream_lfs_digest.clone()),
+                }],
+            )
+            .unwrap();
+        let app = router(archive);
+
+        let file = get(&app, "/org/model/resolve/main/model.safetensors").await;
+        let etag = file.headers()[header::ETAG].to_str().unwrap().to_string();
+        let served = etag.trim_matches('"').to_string();
+        assert_eq!(served, crate::sha256(b"lfs-managed-payload"));
+
+        for uri in [
+            "/api/models/org/model/revision/main",
+            "/api/models/org/model/tree/main",
+        ] {
+            let body = to_bytes(get(&app, uri).await.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8_lossy(&body).into_owned();
+            assert!(!body.contains("\"lfs\""), "{uri}: {body}");
+            assert!(!body.contains("xetHash"), "{uri}: {body}");
+            assert!(!body.contains("pointerSize"), "{uri}: {body}");
+            // The validator a client can read from a listing is ModelKeep's own
+            // digest, and upstream's LFS digest appears nowhere.
+            assert!(!body.contains(&upstream_lfs_digest), "{uri}: {body}");
+            assert!(body.contains(&served), "{uri}: {body}");
+        }
+
+        let tree = json_body(get(&app, "/api/models/org/model/tree/main").await).await;
+        assert_eq!(tree[0]["oid"], "e".repeat(40));
+        assert_eq!(tree[0]["modelkeep"]["sha256"], served);
+        let info = json_body(get(&app, "/api/models/org/model/revision/main").await).await;
+        assert_eq!(info["siblings"][0]["blobId"], "e".repeat(40));
+        assert_eq!(info["siblings"][0]["modelkeep"]["sha256"], served);
+    }
+
+    /// Issue 0079: ModelKeep's property is on every file the archive holds, in
+    /// both routes, and its digest is the one `resolve` advertises. For a file the
+    /// archive does not hold the property is present and states nothing, because
+    /// there are no bytes ModelKeep can stand behind.
+    #[tokio::test]
+    async fn every_archived_file_carries_modelkeeps_digest_in_both_routes() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        let fetcher = Arc::new(MetadataFetcher::new(
+            METADATA_COMMIT,
+            &[
+                ("config.json", b"cold-http"),
+                ("model-00001-of-00002.safetensors", b"shard-one"),
+            ],
+        ));
+        let pullthrough = Arc::new(PullThrough::new(archive.clone(), fetcher));
+        let app = router_with_pullthrough(archive.clone(), pullthrough);
+
+        // One file requested, so the revision holds one of the two it reports.
+        assert_eq!(
+            get(&app, "/org/model/resolve/main/config.json")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+
+        let tree = json_body(get(&app, "/api/models/org/model/tree/main").await).await;
+        let info = json_body(get(&app, "/api/models/org/model/revision/main").await).await;
+        let entries = tree.as_array().unwrap();
+        let siblings = info["siblings"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(siblings.len(), 2);
+        for (entry, sibling) in entries.iter().zip(siblings) {
+            let path = entry["path"].as_str().unwrap();
+            assert_eq!(sibling["rfilename"], path);
+            // The property is a nested object in both routes, so a later
+            // addition needs no new name.
+            assert!(entry["modelkeep"].is_object(), "{entry}");
+            assert!(sibling["modelkeep"].is_object(), "{sibling}");
+            assert_eq!(entry["modelkeep"], sibling["modelkeep"]);
+            let held = get(
+                &app,
+                &format!("/org/model/resolve/cccccccccccccccccccccccccccccccccccccccc/{path}"),
+            )
+            .await;
+            match entry["modelkeep"]["sha256"].as_str() {
+                Some(digest) => {
+                    assert_eq!(path, "config.json");
+                    assert_eq!(held.headers()[header::ETAG], format!("\"{digest}\""));
+                }
+                // The archive does not hold this one: no digest is claimed, and
+                // no other value is substituted for it.
+                None => {
+                    assert_eq!(path, "model-00001-of-00002.safetensors");
+                    assert_eq!(entry["modelkeep"]["sha256"], serde_json::Value::Null);
+                }
+            }
+        }
+    }
+
+    /// Issue 0079: the `revision` route's siblings carry the Hub's per-file fields
+    /// with the Hub's meanings, and ModelKeep's property beside them. They used to
+    /// carry `rfilename` alone, which made the digest reachable only through the
+    /// `tree` route's `oid`.
+    #[tokio::test]
+    async fn revision_siblings_carry_the_hub_per_file_fields_and_modelkeeps_own() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        let fetcher = Arc::new(MetadataFetcher::new(
+            METADATA_COMMIT,
+            &[("config.json", b"cold-http")],
+        ));
+        let blob_id = fetcher.reported()[0].blob_id.clone().unwrap();
+        let pullthrough = Arc::new(PullThrough::new(archive.clone(), fetcher));
+        let app = router_with_pullthrough(archive.clone(), pullthrough);
+        assert_eq!(
+            get(&app, "/org/model/resolve/main/config.json")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+
+        let info = json_body(get(&app, "/api/models/org/model/revision/main").await).await;
+        let sibling = &info["siblings"][0];
+        assert_eq!(sibling["rfilename"], "config.json");
+        assert_eq!(sibling["size"], 9);
+        assert_eq!(sibling["blobId"], blob_id);
+        assert!(sibling.get("lfs").is_none(), "{sibling}");
+        let file = get(&app, "/org/model/resolve/main/config.json").await;
+        let etag = file.headers()[header::ETAG].to_str().unwrap().to_string();
+        assert_eq!(sibling["modelkeep"]["sha256"], etag.trim_matches('"'));
+        // The two routes report one file list, so they cannot drift apart in what
+        // they say about a file either.
+        let tree = json_body(get(&app, "/api/models/org/model/tree/main").await).await;
+        assert_eq!(tree[0]["size"], sibling["size"]);
+        assert_eq!(tree[0]["oid"], sibling["blobId"]);
+        assert_eq!(tree[0]["modelkeep"], sibling["modelkeep"]);
     }
 
     #[tokio::test]
