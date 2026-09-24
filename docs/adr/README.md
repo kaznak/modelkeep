@@ -27,3 +27,4 @@ Initial records:
 - ADR-0018 — reconstructible indexes for paged management job history
 - ADR-0019 — separate model and dataset archive namespaces
 - ADR-0020 — selection-scoped revision acquisition (partially supersedes ADR-0008)
+- ADR-0021 — serialize transferring acquisitions, per repository and with a global limit
