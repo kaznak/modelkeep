@@ -910,6 +910,7 @@ MVP 後の候補:
 - ~~Hubのfieldをそのmeaningで報告し、ModelKeepのdigestは独自propertyへ — [Issue 0079](https://github.com/kaznak/modelkeep/commit/3e95df9)~~
 - ~~起動時のarchive自己検査（上流非依存・自動修復なし） — [Issue 0073](https://github.com/kaznak/modelkeep/commit/c6f5120)~~。運用手段は[Issue 0081](issues/0081-give-the-operator-actions-for-what-the-self-check-reports.md)
 - ~~構造化eventリファレンスの完成とずれを防ぐcheck — [Issue 0075](https://github.com/kaznak/modelkeep/commit/628a079)~~
+- ~~進行中バイトの計上（非再帰globの修正と、両転送経路の実測） — [Issue 0082](https://github.com/kaznak/modelkeep/commit/3a2b5e9)~~。起票の根拠だったMeasurement Aは**製品の欠陥ではなく測定の誤り**で、reporterは最初から進行中バイトを計上していた。一方でサブディレクトリのファイルを取りこぼす別の欠陥が見つかり、そちらを修正した
 - ~~self-checkの所見に対する操作手段（保持stagingのlisting・保持の種別・実サイズ、名前指定の削除、self-checkのAPI起動） — [Issue 0081](https://github.com/kaznak/modelkeep/commit/5b75b94)~~。運用手順から`rm -rf`が消え、0087の`staging_recovery_skipped`とself-checkをAPIだけで突き合わせられる
 - ~~起動recoveryのper-entry隔離（1エントリの回収失敗でcontainerがcrash loopしていた） — [Issue 0087](https://github.com/kaznak/modelkeep/commit/87aa954)~~。回収できないエントリは`staging_recovery_skipped`で名指しし、残りは回収して起動を続ける
 - ~~全archive failureのlogging（`_ => {}`の除去と、失敗対象を名指しする境界づけ済みfield） — [Issue 0085](https://github.com/kaznak/modelkeep/commit/0f465c9)~~。0083のconflictが「どこから来たか」をlogが答えられなかったdefect
