@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import io
 import json
 import tempfile
@@ -669,6 +670,221 @@ class FailureReportingTests(unittest.TestCase):
         # Exit 1 is reserved for a helper that failed without reporting a class:
         # the parent reports that as the helper's own contract failure.
         self.assertNotIn(1, hf_fetch.EXIT_CODES.values())
+
+
+
+# --- In-flight byte accounting (Issue 0082) ---------------------------------
+#
+# Where the official client stages a file's bytes while it transfers: its
+# local-folder layout puts a file's download metadata at
+# `<output>/.cache/huggingface/download/<path in repo>.metadata` and the partial
+# bytes next to that metadata file, under a hashed basename ending in
+# `.incomplete`. A file in a repository subdirectory therefore stages into a
+# mirrored subdirectory, which is the part the reporter has to follow.
+#
+# These tests reconstruct only the shape of that layout, never the client's own
+# private path helpers, and they do not stand alone: the mirrored subdirectory is
+# asserted against the real shipped client in `tests/hf_client_integration.py`,
+# which drives a production acquisition and inspects what the client actually
+# created. The hashed basename carries no meaning here beyond being distinct and
+# ending in `.incomplete`, which is all the reporter may rely on.
+STAGING_ETAG = "deadbeef"
+
+
+def staged_incomplete_path(output, relative, attempt=None):
+    """The staging file the client writes `relative`'s arriving bytes into.
+
+    `attempt` distinguishes the per-process staging names the current client
+    uses, so one file can legitimately have more than one staging file on disk.
+    """
+    metadata = Path(output, ".cache", "huggingface", "download", relative)
+    short_hash = hashlib.sha1(metadata.name.encode()).hexdigest()[:8]
+    suffix = "" if attempt is None else f".{attempt:08x}"
+    staged = metadata.with_name(f"{short_hash}.{STAGING_ETAG}{suffix}.incomplete")
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    return staged
+
+
+def byte_events(stream):
+    return [
+        event
+        for event in map(json.loads, stream.getvalue().splitlines())
+        if event.get("unit") == "bytes"
+    ]
+
+
+def file_events(stream):
+    return [
+        event
+        for event in map(json.loads, stream.getvalue().splitlines())
+        if event.get("unit") == "files"
+    ]
+
+
+class InFlightProgressTests(unittest.TestCase):
+    """What a running acquisition reports while large files are in flight.
+
+    Every assertion here is against a known transferred amount: the tests stage
+    an exact number of bytes and require the reported figure to be that number,
+    rather than requiring that some event was emitted.
+    """
+
+    def test_in_flight_bytes_of_a_file_in_a_subdirectory_are_counted(self):
+        stream = io.StringIO()
+        reporter = hf_fetch.ProgressReporter(stream=stream, minimum_interval=0)
+        with tempfile.TemporaryDirectory() as output:
+            reporter.set_expected(
+                output, [("config.json", 4), ("onnx/model.onnx", 1024)]
+            )
+            Path(output, "config.json").write_bytes(b"cfg\n")
+            staged_incomplete_path(output, "onnx/model.onnx").write_bytes(b"x" * 600)
+            reporter._report_files()
+
+        reported = byte_events(stream)
+        self.assertEqual(reported[-1]["completed"], 4 + 600)
+        self.assertEqual(reported[-1]["total"], 4 + 1024)
+        # One file is complete; the 600 bytes come from the file still in flight
+        # in a subdirectory, so they cannot be confused with a completion.
+        self.assertEqual(file_events(stream)[-1]["completed"], 1)
+
+    def test_reported_bytes_follow_arriving_bytes_not_file_completions(self):
+        """The production reporting interval must not hide arriving bytes.
+
+        The reporter is built with the interval the helper actually runs with, so
+        a selection dominated by a few large files has to report the bytes that
+        arrive within one interval rather than only what completes. Both large
+        files here are in a subdirectory, which is where the under-reporting of
+        Issue 0082 lives.
+        """
+        stream = io.StringIO()
+        reporter = hf_fetch.ProgressReporter(stream=stream, minimum_interval=5.0)
+        chunk = 1 << 16
+        expected = [
+            ("config.json", 4),
+            ("weights/shard-00001-of-00002.safetensors", 3 * chunk),
+            ("weights/shard-00002-of-00002.safetensors", 2 * chunk),
+        ]
+        total = 4 + 5 * chunk
+        arriving = []
+        with tempfile.TemporaryDirectory() as output:
+            reporter.set_expected(output, expected)
+            progress = reporter.tqdm_class()(total=total, unit="B")
+            Path(output, "config.json").write_bytes(b"cfg\n")
+            arrived = 4
+            arriving.append(arrived)
+            progress.update(4)
+            for relative, size in expected[1:]:
+                staged = staged_incomplete_path(output, relative)
+                staged.write_bytes(b"")
+                written = 0
+                while written < size:
+                    step = min(chunk, size - written)
+                    with staged.open("ab") as handle:
+                        handle.write(b"x" * step)
+                    written += step
+                    arrived += step
+                    arriving.append(arrived)
+                    progress.update(step)
+                published = Path(output, relative)
+                published.parent.mkdir(parents=True, exist_ok=True)
+                published.write_bytes(staged.read_bytes())
+                staged.unlink()
+                progress.update(0)
+            progress.close()
+
+        reported = [event["completed"] for event in byte_events(stream)]
+        # Exactly the amounts staged, in order, with the repeats a completion
+        # produces collapsed: the reported figure is the bytes on disk and
+        # nothing else.
+        self.assertEqual(reported, [0] + arriving)
+        self.assertEqual(reported[-1], total)
+        self.assertTrue(all(value <= total for value in reported), reported)
+        # Between the two file completions the figure moved. 4 + 3 * chunk is the
+        # first shard's completion; 4 + 4 * chunk is the second shard half-way
+        # through, before anything else completed.
+        self.assertIn(4 + 3 * chunk, reported)
+        self.assertIn(4 + 4 * chunk, reported)
+        self.assertLess(
+            reported.index(4 + 3 * chunk), reported.index(4 + 4 * chunk)
+        )
+        self.assertEqual(file_events(stream)[-1]["completed"], 3)
+
+    def test_reported_bytes_never_exceed_the_total(self):
+        """Staging left behind by an earlier attempt cannot inflate the figure.
+
+        The current client stages each attempt under its own name, so a retried
+        transfer can leave more staged bytes on disk than the file is long. The
+        reported figure is a fraction of a known total and must stay one.
+        """
+        stream = io.StringIO()
+        reporter = hf_fetch.ProgressReporter(stream=stream, minimum_interval=0)
+        with tempfile.TemporaryDirectory() as output:
+            reporter.set_expected(output, [("weights/model.bin", 10)])
+            Path(output, "weights").mkdir(parents=True, exist_ok=True)
+            Path(output, "weights", "model.bin").write_bytes(b"0123456789")
+            for attempt in range(2):
+                staged_incomplete_path(
+                    output, "weights/model.bin", attempt=attempt
+                ).write_bytes(b"0123456789")
+            reporter._report_files(force=True, finalized=True)
+
+        reported = [event["completed"] for event in byte_events(stream)]
+        self.assertTrue(all(value <= 10 for value in reported), reported)
+        self.assertEqual(reported[-1], 10)
+
+    def test_unchanged_in_flight_bytes_are_not_reported_as_fresh_progress(self):
+        """A stalled transfer must stay visibly stalled.
+
+        A transfer that has staged bytes but is not receiving any reports the
+        same figure, and a repeated identical figure is not progress: it must not
+        be emitted again, or a stalled acquisition would be indistinguishable
+        from a slow one.
+        """
+        stream = io.StringIO()
+        reporter = hf_fetch.ProgressReporter(stream=stream, minimum_interval=0)
+        with tempfile.TemporaryDirectory() as output:
+            reporter.set_expected(output, [("onnx/model.onnx", 64)])
+            staged_incomplete_path(output, "onnx/model.onnx").write_bytes(b"x" * 7)
+            reporter._report_files()
+            reporter._report_files()
+            reporter._report_files()
+
+        reported = [event["completed"] for event in byte_events(stream)]
+        self.assertEqual(reported, [0, 7])
+
+    def test_staging_that_disappears_mid_report_keeps_the_bytes_already_counted(self):
+        """A staging file renamed into place while the reporter reads the tree.
+
+        The client publishes a completed file by renaming its staging file, so a
+        staging path can vanish between being listed and being measured. That is
+        an ordinary race, not a reason to report zero bytes in flight and make a
+        progressing transfer look like it went backwards.
+        """
+        stream = io.StringIO()
+        reporter = hf_fetch.ProgressReporter(stream=stream, minimum_interval=0)
+        with tempfile.TemporaryDirectory() as output:
+            reporter.set_expected(
+                output, [("a/first.bin", 100), ("b/second.bin", 100)]
+            )
+            staged_incomplete_path(output, "a/first.bin").write_bytes(b"x" * 40)
+            vanishing = staged_incomplete_path(output, "b/second.bin")
+            vanishing.write_bytes(b"x" * 30)
+            original_stat = Path.stat
+
+            def stat_with_a_vanishing_file(self, *args, **kwargs):
+                if self == vanishing:
+                    vanishing.unlink()
+                return original_stat(self, *args, **kwargs)
+
+            Path.stat = stat_with_a_vanishing_file
+            try:
+                reporter._report_files()
+            finally:
+                Path.stat = original_stat
+
+        reported = [event["completed"] for event in byte_events(stream)]
+        # The 40 staged bytes of the file that is still there are still counted.
+        self.assertEqual(reported[-1], 40)
 
 
 if __name__ == "__main__":

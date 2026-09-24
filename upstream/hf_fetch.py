@@ -6,6 +6,7 @@ import contextlib
 import fnmatch
 import json
 import re
+import stat
 import sys
 import threading
 import time
@@ -233,6 +234,22 @@ def report_failure(error, stream=None):
 
 
 class ProgressReporter:
+    #: Where the official client stages a file's arriving bytes. Its local-folder
+    #: layout keeps a file's download metadata at
+    #: `<output>/.cache/huggingface/download/<path in the repository>.metadata`
+    #: and the partial bytes beside that metadata file, under a hashed basename
+    #: ending in `.incomplete`. A file in a repository subdirectory therefore
+    #: stages into a mirrored subdirectory, which is why the search below is
+    #: recursive (Issue 0082): a non-recursive one found nothing for a path like
+    #: `onnx/model.onnx`, so a repository whose large files live in
+    #: subdirectories reported no progress at all until each file completed.
+    STAGING_DIRECTORY = (".cache", "huggingface", "download")
+    #: Only the basename's suffix is relied on. The rest of the staging name is
+    #: the client's business: the current client stages each attempt under its
+    #: own unique name, so one expected file may have more than one staging file
+    #: on disk, which is why the reported figure is still clamped to the total.
+    STAGING_PATTERN = "*.incomplete"
+
     def __init__(self, stream=None, minimum_interval=5.0):
         self.stream = stream or sys.stdout
         self.minimum_interval = minimum_interval
@@ -268,6 +285,36 @@ class ProgressReporter:
             return
         self._report_files(force=True)
 
+    def _in_flight_bytes(self):
+        """The bytes of this acquisition's unfinished files that are on disk.
+
+        The search is confined to the client's staging directory: a repository
+        file whose own name ends in `.incomplete` is ordinary archived content
+        and is counted when it completes, not while it arrives.
+
+        Every staging file is measured on its own. The client publishes a
+        completed file by renaming its staging file, so a staging path can vanish
+        between being listed and being measured; that race must not discard the
+        bytes of everything else in flight, which would report a progressing
+        transfer as having gone backwards.
+        """
+        if self.output is None:
+            return 0
+        staging = self.output.joinpath(*self.STAGING_DIRECTORY)
+        try:
+            staged = list(staging.rglob(self.STAGING_PATTERN))
+        except OSError:
+            return 0
+        in_flight = 0
+        for path in staged:
+            try:
+                metadata = path.stat()
+            except OSError:
+                continue
+            if stat.S_ISREG(metadata.st_mode):
+                in_flight += metadata.st_size
+        return in_flight
+
     def _report_files(self, force=False, finalized=False):
         if self.output is None or self.download_finalized:
             return
@@ -282,15 +329,7 @@ class ProgressReporter:
             if path.is_file() and ((size is not None and metadata.st_size == size) or (size is None and finalized)):
                 completed += 1
                 completed_bytes += metadata.st_size
-        download_metadata = self.output / ".cache" / "huggingface" / "download"
-        try:
-            incomplete = download_metadata.glob("*.incomplete")
-            partial_bytes = sum(
-                path.stat().st_size for path in incomplete if path.is_file()
-            )
-        except OSError:
-            partial_bytes = 0
-        completed_bytes += partial_bytes
+        completed_bytes += self._in_flight_bytes()
         if self.expected and all(size is not None for size in self.expected.values()):
             completed_bytes = min(completed_bytes, sum(self.expected.values()))
         changed = completed != self.completed_files

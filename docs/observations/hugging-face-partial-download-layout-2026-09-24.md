@@ -44,6 +44,44 @@ while a watcher thread listed `download/` every 10 ms. Ten distinct `.incomplete
 seen across 247 samples, all directly under `download/`, which is consistent with that
 repository having every file at its root.
 
+### Only one of the two pinned versions calls back during a file transfer
+
+Both pinned versions were read from the Nix store. `snapshot_download` takes a `tqdm_class`,
+and both versions' docstrings say the same thing about it:
+
+> Note that the `tqdm_class` is not passed to each individual download.
+
+In `0.36.0` that is the whole story. `tqdm_class` appears at exactly one call site,
+`thread_map(..., tqdm_class=tqdm_class or hf_tqdm)`, which is the bar counting completed
+files; `_inner_hf_hub_download` is called without it. **A caller's class is therefore invoked
+only at file boundaries, and no amount of work on ModelKeep's side can make it report bytes
+arriving within a file.**
+
+In `1.27.0` there is a second mechanism. An internal `_AggregatedTqdm` is passed to each
+individual download, and the caller's `tqdm_class` is used for the aggregate bar that
+`_AggregatedTqdm` feeds. So the caller does see per-chunk updates — indirectly, through the
+aggregate, not because the class reached the individual download.
+
+Measured on a 24 MiB file in a subdirectory, driven through the production helper against a
+local upstream, the reported figure moved in 10 MiB steps between file completions:
+
+```text
+bytes completed=0         total=25165868
+files completed=0/2
+bytes completed=44        total=25165868     config.json completed
+files completed=1/2
+bytes completed=10485804  total=25165868     44 + 10 MiB
+bytes completed=20971564  total=25165868     44 + 20 MiB
+bytes completed=25165868  total=25165868
+files completed=2/2
+```
+
+The step size is the client's transfer chunk. `flake.nix` pins the image's helper interpreter
+to `1.27.0`, so the deployment has this; the `0.36.0` integration check is a compatibility
+floor, not the deployed path. That asymmetry is why one assertion in the client integration
+suite is conditioned on the client version rather than asserted for both: it is a fact about
+the versions, not a weakened expectation.
+
 ## What this establishes for ModelKeep, and what it does not
 
 ModelKeep's helper counts bytes in flight with
@@ -63,8 +101,13 @@ was a prefetch of `Qwen/Qwen2.5-3B-Instruct`, whose shards are at the repository
 glob saw them. The roughly 2.68 GB that the reported figure was missing there came from
 somewhere else, and this observation rules out one candidate rather than finding the cause.
 
-**Not established: where those bytes were.** The measurement that would settle it is a
-transfer of the same shape with Xet disabled and then enabled, inspecting the staging
+**Established: in-flight reporting exists only on `1.27.0`.** On `0.36.0` the helper cannot be
+called during a file transfer at all, so a selection of one large file reports nothing between
+its start and its completion however the staging directory is counted. The deployment runs
+`1.27.0`.
+
+**Not established: where Measurement A's bytes were.** The measurement that would settle it is
+a transfer of the same shape with Xet disabled and then enabled, inspecting the staging
 directory's actual size rather than the archive filesystem's free space — the shared-volume
 comparison is what made the original report wrong. That needs the deployment and is not done.
 

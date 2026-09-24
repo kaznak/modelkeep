@@ -890,6 +890,206 @@ def assert_content_derived_validators_keep_shards_distinct(
     assert '"event":"acquisition' not in offline_logs[0], offline_logs[0]
 
 
+# An upstream fixture whose payload is one large file in a repository
+# subdirectory (Issue 0082). The client's download-metadata directory mirrors the
+# repository's directory structure, so this is the shape a non-recursive staging
+# search could not see. The path and the size come from the environment, so the
+# fixture and the assertions cannot disagree about them.
+NESTED_REPO_ID = "org/nested-weights"
+NESTED_SUBDIRECTORY_FILE = "weights/model-00001-of-00001.safetensors"
+# Several of the client's 10 MiB transfer chunks, so bytes arrive in steps while
+# the one large file is in flight rather than all at once at its completion.
+NESTED_TRANSFER_CHUNK = 10 * 1024 * 1024
+NESTED_PAYLOAD_SIZE = 24 * 1024 * 1024
+
+NESTED_UPSTREAM_HELPER = r'''#!/usr/bin/env python3
+"""Upstream fixture: one small file and one large file in a subdirectory."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+
+COMMIT = "a" * 40
+SUBDIRECTORY_FILE = os.environ["MODELKEEP_NESTED_FILE"]
+PAYLOAD_SIZE = int(os.environ["MODELKEEP_NESTED_PAYLOAD_SIZE"])
+FILLER = b"MODELKEEP-IN-FLIGHT-FIXTURE-"
+
+payloads = {
+    "config.json": b'{"model_type":"modelkeep-in-flight-fixture"}',
+    SUBDIRECTORY_FILE: (FILLER * (PAYLOAD_SIZE // len(FILLER) + 1))[:PAYLOAD_SIZE],
+}
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--repo-id", required=True)
+parser.add_argument("--repo-type", choices=("model", "dataset"), default="model")
+parser.add_argument("--revision", required=True)
+parser.add_argument("--output")
+parser.add_argument("--file", action="append")
+parser.add_argument("--exclude", action="append")
+parser.add_argument("--resolve-only", action="store_true", dest="resolve_only")
+args = parser.parse_args()
+
+files = sorted(payloads)
+repository_files = []
+for path in files:
+    entry = {
+        "path": path,
+        "size": len(payloads[path]),
+        "blob_id": hashlib.sha1(b"blob:" + path.encode()).hexdigest(),
+    }
+    if path.endswith(".safetensors"):
+        entry["lfs_sha256"] = hashlib.sha256(payloads[path]).hexdigest()
+    repository_files.append(entry)
+
+if not args.resolve_only:
+    if not args.output:
+        parser.error("--output is required unless --resolve-only is given")
+    output = Path(args.output)
+    for path in files:
+        target = output / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payloads[path])
+
+print(
+    json.dumps(
+        {
+            "type": "result",
+            "commit": COMMIT,
+            "files": files,
+            "repository_files": repository_files,
+        },
+        separators=(",", ":"),
+    ),
+    flush=True,
+)
+'''
+
+
+def assert_in_flight_bytes_of_a_subdirectory_file_are_reported(
+    binary, root, actual_helper
+):
+    """Issue 0082, with the production helper driving a real supported client.
+
+    A selection dominated by one large file in a repository subdirectory is
+    acquired by the production helper as ModelKeep runs it: its own process, its
+    own event channel, the shipped `huggingface_hub` client, and a ModelKeep
+    instance as upstream so the transfer is deterministic and local. This is the
+    plain HTTP transfer path, which is the one Measurement A took.
+
+    Two things are asserted against amounts that are known independently of the
+    reporter. First, where the client stages a subdirectory file's arriving bytes:
+    the client itself creates the mirrored subdirectory, so the layout the helper
+    has to follow is observed rather than reconstructed. Second, the reported
+    figure: it never exceeds the total, it equals the total at completion, and
+    while the large file is still in flight it already accounts for the bytes that
+    have arrived.
+
+    The in-flight assertion is made against the client the helper ships with. On
+    `huggingface_hub` 0.36 `snapshot_download` does not pass the caller's
+    `tqdm_class` down to the individual file downloads, so a helper running on it
+    is called back only at file boundaries and cannot report anything during a
+    file; on 1.27 the per-chunk updates are aggregated into bars built from the
+    caller's class. The image pins 1.27 for the helper, and 0.36 remains covered
+    here as a downloading client and for the terminal figure.
+    """
+    upstream_archive = root / "in-flight-upstream"
+    fixture = root / "nested_upstream_helper.py"
+    fixture.write_text(NESTED_UPSTREAM_HELPER)
+    with server(
+        binary,
+        upstream_archive,
+        fixture,
+        extra_environment={
+            "MODELKEEP_NESTED_FILE": NESTED_SUBDIRECTORY_FILE,
+            "MODELKEEP_NESTED_PAYLOAD_SIZE": str(NESTED_PAYLOAD_SIZE),
+        },
+    ) as upstream_endpoint:
+        # Archive the revision first, so the production helper's transfer below is
+        # served from the archive and races nothing.
+        warm = Path(
+            snapshot_download(
+                repo_id=NESTED_REPO_ID,
+                revision="main",
+                endpoint=upstream_endpoint,
+                local_dir=str(root / "in-flight-warm"),
+            )
+        )
+        payload_size = (warm / NESTED_SUBDIRECTORY_FILE).stat().st_size
+        assert payload_size == NESTED_PAYLOAD_SIZE, payload_size
+        total = payload_size + (warm / "config.json").stat().st_size
+
+        # The shipped client's own staging layout for a file in a subdirectory.
+        staging = warm / ".cache" / "huggingface" / "download"
+        staged = sorted(
+            path.relative_to(staging).as_posix() for path in staging.rglob("*.metadata")
+        )
+        assert f"{NESTED_SUBDIRECTORY_FILE}.metadata" in staged, staged
+        # Nothing for that file sits directly in the staging directory, which is
+        # why a non-recursive search over it counted none of its arriving bytes.
+        assert not [
+            path.name
+            for path in staging.glob("*.metadata")
+            if Path(NESTED_SUBDIRECTORY_FILE).name in path.name
+        ], staged
+
+        output = root / "in-flight-helper-output"
+        environment = os.environ.copy()
+        environment["HF_ENDPOINT"] = upstream_endpoint
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(actual_helper),
+                "--repo-type",
+                "model",
+                "--repo-id",
+                NESTED_REPO_ID,
+                "--revision",
+                "main",
+                "--output",
+                str(output),
+            ],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        assert completed.returncode == 0, (
+            completed.returncode,
+            completed.stdout[-2000:],
+            completed.stderr[-2000:],
+        )
+
+    assert (output / NESTED_SUBDIRECTORY_FILE).stat().st_size == payload_size
+    events = [json.loads(line) for line in completed.stdout.splitlines()]
+    reported = []
+    files_completed = None
+    in_flight = []
+    for event in events:
+        if event.get("type") != "progress":
+            continue
+        if event.get("unit") == "files":
+            files_completed = event["completed"]
+            continue
+        if event.get("unit") != "bytes":
+            continue
+        assert event["total"] == total, (event, total)
+        reported.append(event["completed"])
+        # A figure of at least one transfer chunk that is not yet the total can
+        # only be the arriving bytes of the large file: the other file is a few dozen bytes
+        # long, and this is observed before both files are complete.
+        if NESTED_TRANSFER_CHUNK <= event["completed"] < total and (
+            files_completed is None or files_completed < 2
+        ):
+            in_flight.append(event["completed"])
+    assert reported, completed.stdout
+    assert max(reported) <= total, reported
+    assert reported[-1] == total, reported
+    assert files_completed == 2, completed.stdout
+    if not huggingface_hub_version.startswith("0."):
+        assert in_flight, (reported, total)
+
+
 def main():
     binary = Path(sys.argv[1])
     helper = Path(sys.argv[2])
@@ -1046,6 +1246,9 @@ def main():
                 binary, root, actual_helper, archive
             )
             assert_a_failed_acquisition_records_why(binary, root, actual_helper)
+            assert_in_flight_bytes_of_a_subdirectory_file_are_reported(
+                binary, root, actual_helper
+            )
 
             # Released archives can outlive the writer that created their manifest.
             # Simulate an old manifest that accidentally listed transient downloader
