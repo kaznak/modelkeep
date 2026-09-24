@@ -455,6 +455,13 @@ def assert_a_failed_acquisition_records_why(binary, root, actual_helper):
     assert '"error_class":"failed"' not in logs, logs
     assert '"safe_reason":"upstream client failure: PermissionError:' in logs, logs
     assert "Permission denied" in logs, logs
+    # The job record carries the reason too, not just the class: this is what an
+    # operator reads from the Admin API rather than from the container log.
+    assert job["error_class"] == "upstream", job
+    assert job["message"] == f"upstream client failure: {event['message']}", job
+    assert job["message"] != "upstream acquisition failed", job
+    assert "Permission denied" in job["message"], job
+    assert "/hf-home/hub" in job["message"], job
 
 
 def assert_a_client_filter_narrows_the_first_acquisition(

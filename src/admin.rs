@@ -1975,7 +1975,7 @@ fn classify_pullthrough_error(
     let class = match error {
         PullThroughError::UpstreamUnavailable
         | PullThroughError::UpstreamInvalidOutput(_)
-        | PullThroughError::UpstreamFailed => "upstream",
+        | PullThroughError::UpstreamFailed(_) => "upstream",
         PullThroughError::UpstreamNotFound => "not_found",
         PullThroughError::UpstreamUnauthorized => "authorization",
         PullThroughError::Integrity => "integrity",
@@ -2161,6 +2161,114 @@ mod tests {
             message,
             "upstream invalid output: helper returned an empty snapshot"
         );
+    }
+
+    /// Issue 0084: the job record carries the reason, not only the class.
+    #[test]
+    fn a_reported_upstream_failure_records_its_sanitized_reason() {
+        let error = crate::pullthrough::PullThroughError::from(
+            crate::upstream::UpstreamError::HelperFailure(
+                crate::upstream::HelperFailure::reported(
+                    crate::upstream::HelperFailureClass::ClientFailure,
+                    Some("PermissionError"),
+                    Some("PermissionError: [Errno 13] Permission denied: '/hf-home/hub'"),
+                ),
+            ),
+        );
+        let (class, message) = classify_pullthrough_error(error);
+        assert_eq!(class, "upstream");
+        assert_eq!(
+            message,
+            "upstream client failure: PermissionError: [Errno 13] Permission denied: '/hf-home/hub'"
+        );
+    }
+
+    #[test]
+    fn an_upstream_failure_without_a_reason_keeps_the_fixed_wording() {
+        let (class, message) =
+            classify_pullthrough_error(crate::pullthrough::PullThroughError::UpstreamFailed(None));
+        assert_eq!(class, "upstream");
+        assert_eq!(message, "upstream acquisition failed");
+    }
+
+    /// Issue 0084, against a real helper process: the reason the helper reported
+    /// reaches the job record, while the credential-bearing channels it did not
+    /// report on — stderr, and an untyped stdout diagnostic — reach nothing.
+    #[test]
+    fn a_reported_failure_reason_reaches_the_job_record_without_credentials() {
+        let writer = capture_global_logs();
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Arc::new(Archive::new(directory.path()).unwrap());
+        let manager = JobManager::open(&archive).unwrap();
+        let mut job = stored_job("reported-failure-job", 1);
+        job.kind = JobKind::Prefetch;
+        job.state = JobState::Queued;
+        job.phase = "queued".into();
+        job.repo_id = Some("public/model".into());
+        job.revision = Some("main".into());
+        job.started_at = None;
+        job.finished_at = None;
+        assert!(manager.persist_new(&job).unwrap());
+        manager
+            .inner
+            .active_jobs
+            .lock()
+            .unwrap()
+            .insert(job.id.clone(), job.clone());
+        let helper = directory.path().join("reporting-helper.sh");
+        std::fs::write(
+            &helper,
+            concat!(
+                "#!/bin/sh\n",
+                "echo '{\"resumed\":true,\"transport\":\"https://signed.example?token=stdout-secret\"}'\n",
+                "echo 'Bearer stderr-secret' >&2\n",
+                "echo '{\"type\":\"failure\",\"version\":1,\"class\":\"client_failure\",",
+                "\"exception\":\"PermissionError\",",
+                "\"message\":\"PermissionError: [Errno 13] Permission denied: /hf-home/hub\"}'\n",
+                "exit 14\n",
+            ),
+        )
+        .unwrap();
+        let pullthrough = Arc::new(PullThrough::new(
+            (*archive).clone(),
+            Arc::new(OfficialHfFetcher {
+                python: "sh".into(),
+                helper,
+            }),
+        ));
+
+        manager.run(&job.id, archive, Some(pullthrough));
+
+        let failed = manager.get(&job.id).unwrap().unwrap();
+        assert_eq!(failed.state, JobState::Failed);
+        let state = serde_json::to_string(&failed).unwrap();
+        let output = writer.output();
+        // The credential assertions come first, so that a reason built from a
+        // channel ModelKeep is supposed to ignore is reported as the leak it is
+        // rather than as a mismatched string.
+        for secret in [
+            "signed.example",
+            "stdout-secret",
+            "Bearer stderr-secret",
+            "stderr-secret",
+        ] {
+            assert!(!state.contains(secret), "{secret} leaked into {state}");
+            assert!(!output.contains(secret), "{secret} leaked into {output}");
+        }
+        assert_eq!(failed.error_class.as_deref(), Some("upstream"));
+        assert_eq!(
+            failed.message.as_deref(),
+            Some("upstream client failure: PermissionError: [Errno 13] Permission denied: /hf-home/hub")
+        );
+        assert!(state.contains("Permission denied"), "{state}");
+        for expected in [
+            "admin_job_failed",
+            "reported-failure-job",
+            "Permission denied",
+            r#""error_class":"client_failure""#,
+        ] {
+            assert!(output.contains(expected), "missing {expected}: {output}");
+        }
     }
 
     #[test]

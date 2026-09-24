@@ -132,6 +132,21 @@ For an invalid fetch-helper contract, `admin_job_failed.error_class` is `upstrea
 and `safe_reason` contains only ModelKeep's fixed description of the rejected
 contract condition. Raw helper stdout and stderr are never included.
 
+For an acquisition that failed for a reason its class does not give on its own,
+`admin_job_failed.safe_reason` and the job record's `message` carry that reason
+(Issue 0084) — the same sanitized text `upstream_fetch_failed.safe_reason`
+reports, so the Admin API and the container log agree. This is what replaced
+`upstream acquisition failed`, which said nothing an operator could act on.
+The `error_class` of the job record stays at the granularity the Admin API
+already defines (`upstream`, `not_found`, `authorization`, …); the helper's finer
+class is in `upstream_fetch_failed.error_class` and at the start of the reason.
+What keeps this text free of credentials is not that the error carries no
+payload — it now does — but that the reason can only have come from the helper's
+own sanitizer by way of ModelKeep's bounding: the only way to obtain one is to
+derive it from an upstream error, so there is no route by which a raw helper line,
+a signed URL or a header could become a job record's message. Raw helper stdout
+and stderr are still never included.
+
 For storage failures, `io_kind=out_of_space` identifies ENOSPC. Other I/O failures
 use `io_kind=other`. ModelKeep never deletes an archived revision in response to
 either event. Capacity measurements and threshold alerting are specified separately

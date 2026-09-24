@@ -7,7 +7,8 @@ use serde::Serialize;
 use crate::singleflight::{Joined, SingleFlight};
 use crate::upstream::{
     CancelOutcome, Cancellation, FetchProgress, FetchRequest, FileSelection, HelperFailureClass,
-    InvalidOutputReason, InventoryRequest, UpstreamError, UpstreamFetcher, UpstreamRepositoryFiles,
+    InvalidOutputReason, InventoryRequest, SanitizedReason, UpstreamError, UpstreamFetcher,
+    UpstreamRepositoryFiles,
 };
 use crate::{is_hf_commit, Archive, ArchiveError, RepositoryType, SourceFile, UpstreamFile};
 
@@ -522,13 +523,28 @@ impl AcquisitionResult {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Why a pull-through request could not be answered.
+///
+/// This type used to be `Copy` and payload-free, and that absence of a payload
+/// was how it was kept clear of credentials. That guarantee has moved
+/// (Issue 0084): what keeps a reason credential-free is now that the helper
+/// sanitizes it where the exception and its context are known, that ModelKeep
+/// bounds it as untrusted input, and that the only way to obtain a
+/// [`SanitizedReason`] is to derive it from an [`UpstreamError`]. Depending on
+/// the payload's absence instead was weaker, because any later change could have
+/// added one and lost the property without anything noticing.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PullThroughError {
     UpstreamUnavailable,
     UpstreamNotFound,
     UpstreamUnauthorized,
     UpstreamInvalidOutput(InvalidOutputReason),
-    UpstreamFailed,
+    /// An acquisition that failed for a reason the class alone does not give.
+    ///
+    /// The reason is present whenever the failure came from upstream, which is
+    /// every path ModelKeep itself produces; `None` is what a caller that has no
+    /// `UpstreamError` to derive one from reports.
+    UpstreamFailed(Option<SanitizedReason>),
     UnsafePath,
     Integrity,
     Storage,
@@ -549,7 +565,10 @@ impl std::fmt::Display for PullThroughError {
             Self::UpstreamInvalidOutput(reason) => {
                 return write!(formatter, "upstream invalid output: {reason}")
             }
-            Self::UpstreamFailed => "upstream acquisition failed",
+            // The reason already begins with ModelKeep's description of the
+            // class, so it replaces the fixed wording rather than decorating it.
+            Self::UpstreamFailed(Some(reason)) => return formatter.write_str(reason.as_str()),
+            Self::UpstreamFailed(None) => "upstream acquisition failed",
             Self::UnsafePath => "unsafe archive path",
             Self::Integrity => "archive integrity failure",
             Self::Storage => "archive storage failure",
@@ -1974,27 +1993,33 @@ fn log_archive_failure(
 
 impl From<UpstreamError> for PullThroughError {
     fn from(error: UpstreamError) -> Self {
-        match error {
+        // This conversion is the one place a reason enters management state, and
+        // it can only take the one `SanitizedReason::of` derives from the error
+        // it is converting (Issue 0084).
+        match &error {
             UpstreamError::Unavailable => Self::UpstreamUnavailable,
             UpstreamError::NotFound => Self::UpstreamNotFound,
             UpstreamError::Unauthorized => Self::UpstreamUnauthorized,
-            UpstreamError::InvalidOutput(reason) => Self::UpstreamInvalidOutput(reason),
+            UpstreamError::InvalidOutput(reason) => Self::UpstreamInvalidOutput(*reason),
             UpstreamError::Storage => Self::Storage,
-            UpstreamError::Failed | UpstreamError::Io(_) => Self::UpstreamFailed,
+            UpstreamError::Failed | UpstreamError::Io(_) => {
+                Self::UpstreamFailed(Some(SanitizedReason::of(&error)))
+            }
             // A reported class decides the request-facing answer (Issue 0084).
-            // `PullThroughError` is deliberately a payload-free `Copy` error, so
-            // the class maps onto the answers that already exist and the
-            // sanitized diagnostic travels in the structured event rather than
-            // in the error value: rate limiting is an upstream that would not
-            // serve this acquisition now, which is what `UpstreamUnavailable`
-            // already means to a client.
+            // A class that already names what happened maps onto the answer that
+            // already means it — rate limiting is an upstream that will not serve
+            // this acquisition now, which is what `UpstreamUnavailable` means to a
+            // client. The class that names nothing on its own is the one that
+            // carries the reason.
             UpstreamError::HelperFailure(failure) => match failure.class() {
                 HelperFailureClass::Unavailable | HelperFailureClass::RateLimited => {
                     Self::UpstreamUnavailable
                 }
                 HelperFailureClass::NotFound => Self::UpstreamNotFound,
                 HelperFailureClass::Unauthorized => Self::UpstreamUnauthorized,
-                HelperFailureClass::ClientFailure => Self::UpstreamFailed,
+                HelperFailureClass::ClientFailure => {
+                    Self::UpstreamFailed(Some(SanitizedReason::of(&error)))
+                }
             },
             UpstreamError::Cancelled => Self::Cancelled,
         }
@@ -2696,10 +2721,17 @@ mod tests {
             ))),
         );
 
+        let error = pull.ensure("org/model", "main", &[]).unwrap_err();
+        // The reason survives into the error value, which is what the job record
+        // is built from (Issue 0084).
+        let PullThroughError::UpstreamFailed(Some(reason)) = &error else {
+            panic!("the reason was dropped: {error:?}");
+        };
         assert_eq!(
-            pull.ensure("org/model", "main", &[]),
-            Err(PullThroughError::UpstreamFailed)
+            reason.as_str(),
+            "upstream client failure: PermissionError: [Errno 13] Permission denied: '/hf-home/hub'"
         );
+        assert_eq!(error.to_string(), reason.as_str());
 
         let output = writer.output();
         assert!(output.contains("upstream_fetch_failed"), "{output}");
@@ -2741,7 +2773,11 @@ mod tests {
             (
                 HelperFailureClass::ClientFailure,
                 "client_failure",
-                PullThroughError::UpstreamFailed,
+                PullThroughError::UpstreamFailed(Some(SanitizedReason::of(
+                    &UpstreamError::HelperFailure(crate::upstream::HelperFailure::from_class(
+                        HelperFailureClass::ClientFailure,
+                    )),
+                ))),
             ),
         ] {
             let (writer, guard) = capture_logs();

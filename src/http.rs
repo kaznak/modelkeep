@@ -985,7 +985,7 @@ fn status_for_pullthrough_error(error: PullThroughError) -> StatusCode {
         PullThroughError::UpstreamNotFound => StatusCode::NOT_FOUND,
         PullThroughError::UpstreamUnauthorized => StatusCode::UNAUTHORIZED,
         PullThroughError::UpstreamUnavailable
-        | PullThroughError::UpstreamFailed
+        | PullThroughError::UpstreamFailed(_)
         | PullThroughError::Cancelled => StatusCode::BAD_GATEWAY,
         PullThroughError::Storage => StatusCode::INSUFFICIENT_STORAGE,
         PullThroughError::UnsafePath => StatusCode::BAD_REQUEST,

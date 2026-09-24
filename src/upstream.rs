@@ -572,6 +572,36 @@ impl UpstreamError {
     }
 }
 
+/// A reason that has been through [`UpstreamError::safe_reason`] (Issue 0084).
+///
+/// This exists so that ModelKeep's management state cannot carry a reason by any
+/// other route. The field is private and [`Self::of`] is the only constructor,
+/// so no module outside this one can put a raw client message, a helper line or
+/// any other untrusted text into one: the only way to obtain a value of this
+/// type is to hand it an `UpstreamError`, whose `safe_reason` is what performs
+/// the reduction. That is what replaced the previous guarantee, which was that
+/// the error carried no payload at all — a property any later change could have
+/// removed silently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SanitizedReason(String);
+
+impl SanitizedReason {
+    /// The reason for this failure, and the only way to make one.
+    pub fn of(error: &UpstreamError) -> Self {
+        Self(error.safe_reason())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for SanitizedReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 /// A credential-safe description of a rejected fetch-helper contract.
 ///
 /// This deliberately is not an arbitrary string: helper stdout and stderr can
