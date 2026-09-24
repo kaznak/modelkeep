@@ -20,9 +20,16 @@ serve one file's bytes as another's.
 
 ## Problem
 
-File responses advertise `ETag: "{commit}-{size}"` (`src/http.rs:668`). Within one
-revision the commit is constant, so **any two files of the same byte length share an
-ETag**. Sharded weights are where this bites, because shard sizes are usually uniform.
+File responses advertise `ETag: "{commit}-{size}"` (`src/http.rs:668`). A length is a
+property of the content, not a fingerprint of it: within one revision the commit is
+constant, so **any two files of the same byte length share an ETag**, however different
+their bytes. Sharded weights are where this lands, because shard sizes are usually
+uniform, so there collisions are the normal case rather than an edge one.
+
+The goal is not to make distinct files carry distinct values by construction. It is for
+the value to *be* the content fingerprint, so that files with identical bytes share it —
+which is correct, and is how the Hub deduplicates LFS objects by `oid` — and files with
+different bytes cannot.
 
 HTTP does not require an ETag to be unique across URLs, so this is not a bare protocol
 violation. It is a compatibility defect against the service ModelKeep presents itself as.
@@ -96,12 +103,17 @@ is not.
 
 ## Acceptance criteria
 
-- Two files of equal size in one revision are served with different validators, and a
-  real supported client stores them as distinct blobs with correct contents.
+- The advertised validator is a fingerprint of the file's content. Two files of equal size
+  but different bytes in one revision are served with different validators, and a real
+  supported client stores them as distinct blobs with correct contents.
+- Two files with byte-identical content are allowed to share a validator, and a real client
+  sharing one blob between them is a correct outcome, not a failure. A test states this, so
+  a later change cannot "fix" deduplication away.
 - `If-None-Match` carrying one file's validator does not produce `304` for a different
   file.
-- A regression fixture contains at least two same-size files in one revision, and it fails
-  against the current implementation.
+- A regression fixture contains at least two same-size, different-content files in one
+  revision, and it fails against the current implementation. It also contains two
+  byte-identical files, to pin the sharing case.
 - Both pinned client versions download a sharded fixture and every file's bytes match what
   the archive holds, verified by digest rather than by size.
 - Range and `HEAD` responses carry the same validator as the full response.
