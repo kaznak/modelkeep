@@ -106,10 +106,18 @@ called during a file transfer at all, so a selection of one large file reports n
 its start and its completion however the staging directory is counted. The deployment runs
 `1.27.0`.
 
-**Not established: where Measurement A's bytes were.** The measurement that would settle it is
-a transfer of the same shape with Xet disabled and then enabled, inspecting the staging
-directory's actual size rather than the archive filesystem's free space — the shared-volume
-comparison is what made the original report wrong. That needs the deployment and is not done.
+**Established: the plain HTTP path is fully visible to the reporter.** Measured by running the
+production helper against a 548,105,171-byte root-level file with `HF_HUB_DISABLE_XET=1`, while
+a watcher sized the output tree every second. The reported figure equalled the staging
+directory's own size on **every one of 68 samples, to the byte**, until the file was
+materialized and staging fell to 125 bytes.
+
+So nothing about the transport hides bytes from the reporter, and Issue 0082's Measurement A
+had no defect to explain. The arithmetic settles it: the ten completed files of
+`Qwen/Qwen2.5-3B-Instruct` sum to 11,537,943 bytes, and the reported figures were 36,667,596
+and 56,683,812 — that is 25,129,653 and 45,145,869 bytes of data in flight, growing by
+20,016,216, which is exactly the delta the samples showed. **The reporter was counting bytes in
+flight the whole time.**
 
 ## Method note
 
