@@ -28,3 +28,4 @@ Initial records:
 - ADR-0019 — separate model and dataset archive namespaces
 - ADR-0020 — selection-scoped revision acquisition (partially supersedes ADR-0008)
 - ADR-0021 — serialize transferring acquisitions, per repository and with a global limit
+- ADR-0022 — record upstream file metadata and answer metadata without acquiring (refines ADR-0020)

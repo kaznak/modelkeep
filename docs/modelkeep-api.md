@@ -62,30 +62,67 @@ A request for an archived snapshot is a warm read. A request for a missing ref o
 starts upstream acquisition and publishes to durable storage. Consequently, an
 apparently read-only client command can consume substantial network and archive
 capacity. Before requesting an unknown large repository, establish its likely size and
-obtain authorization appropriate to that cost. Repository metadata for a revision the
-archive has never seen acquires the whole repository; a request for a single file the
-archive does not hold acquires that file.
+obtain authorization appropriate to that cost. A request for a single file the archive
+does not hold acquires that file; repository metadata acquires nothing.
 
-A client's own `--include` / `allow_patterns` does **not** narrow a first acquisition.
-The client reads repository metadata before it requests any file, and metadata for a
-revision the archive has never seen acquires the whole repository, so the filtering
-happens after ModelKeep has already paid for everything. Measured against both pinned
-clients: a filtered download of an unseen repository archives the full snapshot.
+### A client's own filter narrows the first acquisition
 
-To archive a subset, submit a filtered `prefetch` through the [Admin API](admin-api.md)
-and read it warm afterwards. Once a revision is published, a request for a path it does
-not hold acquires that path alone and adds it to the same revision, so filtering works
-from then on.
+`--include` / `allow_patterns` works on a repository the mirror has never seen. The
+client reads repository metadata before it requests any file, and ModelKeep answers
+that from upstream's file list **without acquiring anything**, so the per-file requests
+that follow transfer only what the filter kept:
+
+```sh
+HF_ENDPOINT="$MODELKEEP_ENDPOINT" hf download org/model --include 'q4/*'
+```
+
+Two consequences follow, and both matter operationally:
+
+- a metadata request costs one upstream metadata round trip and writes nothing to the
+  archive. Nothing is published, cached, or reserved by reading metadata;
+- **a download with no filter asks for every file**, so the whole repository is still
+  acquired one file at a time. The filter is the only thing that bounds the cost, and a
+  forgotten one is stopped by cancelling the running acquisition through the
+  [Admin API](admin-api.md) ([`Issue 0076`](issues/0076-cancel-a-running-acquisition.md)).
+
+A filtered `prefetch` through the [Admin API](admin-api.md) remains the way to archive
+a subset ahead of time, and is still preferable for a large repository, because it is
+asynchronous and reports progress.
+
+### A revision may hold a subset of its repository
 
 The archive records what it holds and asserts nothing about upstream completeness
 ([`ADR-0020`](adr/0020-selection-scoped-revision-acquisition.md)). A revision may
 therefore hold a subset of the upstream repository — from a filtered prefetch through
-the [Admin API](admin-api.md), from a single-file request, or from an imported cache.
-Repository metadata reports exactly the archived set and never fabricates entries. A
+the [Admin API](admin-api.md), from a single-file request, or from an imported cache. A
 request for a path a revision does not hold is a miss, not a `404` from the archive:
 whether the path exists is upstream's answer, and when upstream has it the file is
 added to that same revision rather than published as a second one. A published path is
 never overwritten or removed.
+
+What repository metadata reports depends on whether the revision knows its commit's
+upstream file list. ModelKeep records that list when an acquisition obtains it, which
+it does from the same upstream call it already makes to resolve the revision. A commit
+is immutable, so its file list cannot go stale:
+
+| Revision state | Repository metadata reports |
+|---|---|
+| Archived, with a recorded file list | every file the commit holds upstream, including the ones the archive does not |
+| Archived, without one — published before this existed, or imported from a client cache | exactly the archived set, as before |
+| Not archived | every file upstream reports, obtained without acquiring |
+
+Reporting a file the archive does not hold is deliberate. A partially archived revision
+that reported only its subset handed a client a sharded model with shards missing and
+let it report a successful download. A client that asks for a reported file gets it,
+because the request extends the same revision from upstream — so an unfiltered download
+of a partially archived revision **fails while upstream is unavailable** instead of
+silently completing without those files. That failure is the correct outcome; use a
+filter that matches what the archive holds, or prefetch the rest.
+
+ModelKeep never fabricates a metadata entry. A revision whose file list is unknown
+reports what it holds, and a metadata answer that could not be obtained is a
+classified failure (`502` when upstream is unreachable), never an empty or partial file
+list presented as complete.
 
 ModelKeep serves payloads itself and does not redirect a client to Hugging Face or
 Xet. Do not add fallback logic that silently changes `HF_ENDPOINT` or follows a
@@ -126,15 +163,21 @@ window. Both versions then retry a `503` on their own — 0.36.0 with its own
 1s/2s/4s/8s/8s backoff, 1.27.0 following `Retry-After` — so a cold miss that
 completes within roughly a minute is transparently recovered by the client.
 
-### Repository metadata waits by default
+### Repository metadata does not wait for an acquisition
 
 `GET` on `/api/.../revision/{revision}` and `/api/.../tree/{revision}` for a revision
-the archive has never seen waits for the whole repository acquisition to finish and
-then answers normally. It is **not** bounded by the `resolve` deadline, and by
-default it is not bounded at all. The request can therefore stay open for minutes or
-hours on a large repository.
+the archive has never seen is answered from upstream's file list, which costs one
+upstream metadata round trip and no transfer. There is nothing to wait for, so the
+deadline below does not normally apply at all.
 
-That is deliberate, and it rests on two measurements:
+It still applies on one path: a fetch helper that cannot report upstream's per-file
+metadata leaves ModelKeep with no file list to answer from, and the request falls back
+to acquiring the revision and answering from the archive. That fallback waits for the
+whole repository acquisition to finish. It is **not** bounded by the `resolve`
+deadline, and by default it is not bounded at all, so the request can stay open for
+minutes or hours on a large repository.
+
+That default is deliberate, and it rests on two measurements:
 
 - Neither client applies its 10-second `resolve` read timeout to a metadata request.
   0.36.0 waited 30 s and 1.27.0 waited 12 s per metadata request, and both then
@@ -144,15 +187,12 @@ That is deliberate, and it rests on two measurements:
   raises `LocalEntryNotFoundError` and `list_repo_tree` raises `HfHubHTTPError`.
   There is no status that buys a client-side retry here, unlike on `resolve`.
 
-Bounding metadata by default would therefore make the first mirror of any repository
-whose acquisition outlasts the deadline fail outright, which is ModelKeep's central
-use. 1.27.0 requests `revision` and then `tree` during a download; 0.36.0 requests
-`revision` only, so both routes behave the same way.
-
-The practical consequence is a client that appears to hang while the mirror fills.
-Do not read a large repository cold through the download endpoint: submit a prefetch
-job through the [Admin API](admin-api.md), follow it to a terminal job state, and
-then download, which is then a warm read.
+Bounding metadata by default would therefore make any request that falls back to an
+acquisition fail outright rather than slowly succeed. 1.27.0 requests `revision` and
+then `tree` during a download, and takes its file list from `tree`; 0.36.0 requests
+`revision` only and takes its file list from `siblings`. Both routes therefore have to
+answer for a revision the archive has never seen, and they answer with the same file
+set.
 
 An operator who prefers a prompt answer over a long wait can opt in:
 
@@ -225,13 +265,36 @@ file's bytes, quoted, and nothing else:
 ETag: "73ce509c5365f1acd906cce8d6e9339aa2b7b055507cf84fcde50bc97c8a2798"
 ```
 
-It is the same digest the `tree` route reports as that file's `oid`. The whole
-response, a `HEAD`, and a `206` for a byte range all carry the digest of the **whole
-file**, and `If-None-Match` is compared against that same value, so a `304` means the
-caller holds these bytes rather than merely a file of this length in this revision. No
-`x-linked-etag` is sent; the supported clients accept the digest in `ETag` alone. The
-measurement behind this shape, for both pinned client versions, is
+The whole response, a `HEAD`, and a `206` for a byte range all carry the digest of the
+**whole file**, and `If-None-Match` is compared against that same value, so a `304`
+means the caller holds these bytes rather than merely a file of this length in this
+revision. No `x-linked-etag` is sent; the supported clients accept the digest in `ETag`
+alone. The measurement behind this shape, for both pinned client versions, is
 [`docs/observations/hugging-face-content-validator-2026-09-24.md`](observations/hugging-face-content-validator-2026-09-24.md).
+
+### What the `tree` route's `oid` is, and how it relates to the `ETag`
+
+A `tree` entry's `oid` is an object id for that path at that commit. Which one it is
+follows one rule, applied per file and in this order:
+
+1. **the git object id upstream recorded for that path**, when the revision has a
+   recorded upstream file list naming one. This is what the Hub itself reports there.
+   It is a fact about the commit, recorded verbatim, and is **not** a digest ModelKeep
+   verified — so it is unrelated to the `ETag`, and for a non-LFS file it is a
+   different function of the bytes altogether;
+2. otherwise **ModelKeep's own content digest** of the bytes it holds for that path,
+   which is exactly the `ETag` value without its quotes;
+3. otherwise **`null`**, for a path ModelKeep does not hold and for which upstream
+   recorded no object id.
+
+ModelKeep never reports a digest for bytes it does not hold, and never presents an
+upstream value as one it verified. `size` follows the same principle: it is what
+ModelKeep will serve when it holds the file, upstream's recorded length when it does
+not, and `null` when neither states one. No `lfs` block and no `xetHash` are ever
+reported: both would advertise an object identity ModelKeep has not verified, and a
+supported client that sees them skips the `HEAD` request that carries the validator
+ModelKeep actually stands behind
+([`docs/observations/hugging-face-tree-listing-2026-09-24.md`](observations/hugging-face-tree-listing-2026-09-24.md)).
 
 Two consequences follow, and both are intended:
 
@@ -295,6 +358,11 @@ Tree requests accept the query fields used by supported clients. File responses
 support `HEAD`, byte ranges, and conditional requests needed by those clients. These
 routes are documented for diagnosis and interoperability; ordinary automation should
 still use the official client.
+
+A metadata response is assembled by ModelKeep from a file list, never relayed from
+upstream. Nothing upstream says about where its payload lives — a redirect, a Xet hash,
+a signed URL — reaches a client, so no metadata answer can send a client around the
+mirror.
 
 ## Choose the correct interface
 

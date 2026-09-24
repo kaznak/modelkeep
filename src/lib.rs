@@ -162,6 +162,66 @@ struct ManifestFile {
     sha256: String,
 }
 
+/// The internal file recording a commit's upstream file list.
+///
+/// It lives inside the revision directory and is named with the
+/// `.modelkeep-` prefix, so [`is_internal_archive_path`] excludes it from the
+/// manifest, from every file listing, and from serving: an older ModelKeep
+/// binary reading this archive cannot see it, and no client can request it.
+pub(crate) const UPSTREAM_FILES_FILE: &str = ".modelkeep-upstream-files.json";
+
+/// One file as upstream reported it at an immutable commit.
+///
+/// A commit is immutable, so this is a fact that does not go stale. It is
+/// recorded verbatim and is never presented as a statement about bytes
+/// ModelKeep holds or has verified: `blob_id` is upstream's git object id and
+/// `lfs_sha256` its LFS object digest, both upstream's values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpstreamFile {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lfs_sha256: Option<String>,
+}
+
+impl UpstreamFile {
+    /// This entry with every untrusted field either accepted or dropped.
+    ///
+    /// Upstream metadata reaches ModelKeep through a helper's stdout and is
+    /// served back to clients, so it is untrusted input: a path that is not a
+    /// safe relative archive path rejects the whole entry, and an object id
+    /// that is not a plain hexadecimal digest is dropped rather than echoed.
+    pub fn sanitized(self) -> Option<Self> {
+        validate_relative_file_path(&self.path).ok()?;
+        Some(Self {
+            path: self.path,
+            size: self.size,
+            blob_id: self.blob_id.filter(|value| is_hexadecimal_object_id(value)),
+            lfs_sha256: self
+                .lfs_sha256
+                .filter(|value| is_hexadecimal_object_id(value)),
+        })
+    }
+}
+
+/// A plausible upstream object id: hexadecimal, and no longer than a sha512.
+fn is_hexadecimal_object_id(value: &str) -> bool {
+    (1..=128).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// The recorded upstream file list of one commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct UpstreamFileList {
+    version: u32,
+    repo_type: RepositoryType,
+    repo_id: String,
+    commit: String,
+    files: Vec<UpstreamFile>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchiveFile {
     pub path: String,
@@ -826,6 +886,102 @@ impl Archive {
             self.revision_path_for_type(repo_type, repo_id, commit)?
                 .join(".modelkeep-manifest.json"),
         )?)
+    }
+
+    /// Records the upstream file list of a published commit.
+    ///
+    /// The record is written outside the revision directory and renamed into
+    /// place, so a crash leaves either no record or a whole one. It adds no
+    /// manifest entry and changes no published byte: a revision that already
+    /// has a record keeps it, because the list of an immutable commit cannot
+    /// legitimately change.
+    pub fn record_upstream_files_for_type(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        commit: &str,
+        files: &[UpstreamFile],
+    ) -> ArchiveResult<bool> {
+        let revision = self.revision_path_for_type(repo_type, repo_id, commit)?;
+        if !revision.is_dir() {
+            return Err(ArchiveError::Io(io::Error::from(io::ErrorKind::NotFound)));
+        }
+        if revision.join(UPSTREAM_FILES_FILE).exists() {
+            return Ok(false);
+        }
+        let record = UpstreamFileList {
+            version: 1,
+            repo_type,
+            repo_id: repo_id.to_string(),
+            commit: commit.to_string(),
+            files: files
+                .iter()
+                .cloned()
+                .filter_map(UpstreamFile::sanitized)
+                .collect(),
+        };
+        let serialized = serde_json::to_vec(&record)
+            .map_err(|error| ArchiveError::IntegrityMismatch(error.to_string()))?;
+        let revisions = revision
+            .parent()
+            .ok_or_else(|| ArchiveError::InvalidPath(revision.display().to_string()))?
+            .to_path_buf();
+        let temporary = revisions.join(format!(
+            ".modelkeep-upstream-files-{commit}-{}.part",
+            operation_id()
+        ));
+        let result = (|| -> io::Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            file.write_all(&serialized)?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            fs::rename(&temporary, revision.join(UPSTREAM_FILES_FILE))?;
+            sync_directory(&revision)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result.map_err(ArchiveError::from)?;
+        Ok(true)
+    }
+
+    /// The upstream file list recorded for a commit, if the archive has one.
+    ///
+    /// `Ok(None)` means this revision does not know its upstream file list: it
+    /// was published before the list was recorded, or imported from a client
+    /// cache. Nothing is migrated on its behalf, and the absence is never
+    /// reported as an empty repository.
+    pub fn upstream_files_for_type(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        commit: &str,
+    ) -> ArchiveResult<Option<Vec<UpstreamFile>>> {
+        let path = self
+            .revision_path_for_type(repo_type, repo_id, commit)?
+            .join(UPSTREAM_FILES_FILE);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let record: UpstreamFileList = serde_json::from_slice(&bytes)
+            .map_err(|error| ArchiveError::IntegrityMismatch(error.to_string()))?;
+        if record.repo_type != repo_type || record.commit != commit {
+            return Err(ArchiveError::IntegrityMismatch(
+                "recorded upstream file list does not match its location".into(),
+            ));
+        }
+        Ok(Some(
+            record
+                .files
+                .into_iter()
+                .filter_map(UpstreamFile::sanitized)
+                .collect(),
+        ))
     }
 
     pub fn resolve_ref(&self, repo_id: &str, reference: &str) -> ArchiveResult<String> {
@@ -2309,6 +2465,85 @@ pub(crate) fn record_fetch_resolved_commit(
     )
 }
 
+/// Records a commit's upstream file list inside the acquisition's staging
+/// directory.
+///
+/// The fetch helper learns the list while resolving the revision, long before
+/// the revision can be published, so it is parked here and installed beside the
+/// revision once one exists. The name carries the `.modelkeep-` prefix, so it is
+/// never a manifest entry, never served, and never mistaken for payload.
+pub(crate) fn write_staged_upstream_files(
+    staging: &Path,
+    repo_type: RepositoryType,
+    repo_id: &str,
+    commit: &str,
+    files: &[UpstreamFile],
+) -> ArchiveResult<()> {
+    validate_revision(commit)?;
+    validate_repo_id(repo_id)?;
+    if files.is_empty() {
+        return Ok(());
+    }
+    let record = UpstreamFileList {
+        version: 1,
+        repo_type,
+        repo_id: repo_id.to_string(),
+        commit: commit.to_string(),
+        files: files
+            .iter()
+            .cloned()
+            .filter_map(UpstreamFile::sanitized)
+            .collect(),
+    };
+    let temporary = staging.join(format!(".modelkeep-upstream-files-{}.part", operation_id()));
+    let result = (|| -> io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(
+            &serde_json::to_vec(&record)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        )?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        fs::rename(&temporary, staging.join(UPSTREAM_FILES_FILE))?;
+        sync_directory(staging)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map_err(ArchiveError::from)
+}
+
+/// The upstream file list an acquisition parked in its staging directory.
+///
+/// Empty covers every way the list can be unavailable — no record, an
+/// unreadable one, or one describing a different commit or repository type —
+/// because the caller's only use for it is recording what it knows. A revision
+/// whose list is unknown is served from what the archive holds, which is what
+/// ModelKeep did before any list was recorded.
+pub(crate) fn staged_upstream_files(
+    staging: &Path,
+    repo_type: RepositoryType,
+    commit: &str,
+) -> Vec<UpstreamFile> {
+    let Ok(bytes) = fs::read(staging.join(UPSTREAM_FILES_FILE)) else {
+        return Vec::new();
+    };
+    let Ok(record) = serde_json::from_slice::<UpstreamFileList>(&bytes) else {
+        return Vec::new();
+    };
+    if record.version != 1 || record.repo_type != repo_type || record.commit != commit {
+        return Vec::new();
+    }
+    record
+        .files
+        .into_iter()
+        .filter_map(UpstreamFile::sanitized)
+        .collect()
+}
+
 pub(crate) fn record_fetch_resolved_commit_for_type(
     staging: &Path,
     repo_type: RepositoryType,
@@ -2725,7 +2960,14 @@ fn collect_revision_files(
         let relative = path
             .strip_prefix(root)
             .map_err(|_| ArchiveError::InvalidPath(path.display().to_string()))?;
-        if relative == Path::new(".modelkeep-manifest.json") {
+        // ModelKeep's own internal state inside a revision directory — the
+        // manifest and the recorded upstream file list — is not archive
+        // content: it carries no manifest entry, is never served, and so is
+        // never part of the file set a manifest is compared against.
+        if relative
+            .to_str()
+            .is_some_and(crate::is_internal_archive_path)
+        {
             continue;
         }
         let kind = entry.file_type()?;
@@ -3717,6 +3959,103 @@ mod tests {
                 .iter()
                 .any(|failure| failure.repo_id == repo));
         }
+    }
+
+    #[test]
+    fn a_recorded_upstream_file_list_is_treated_as_untrusted_input() {
+        let (archive, _directory) = archive();
+        let commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        archive
+            .publish_revision(PublishRequest {
+                repo_id: "org/model".into(),
+                requested_revision: "main".into(),
+                commit: commit.into(),
+                files: vec![ArchiveFile {
+                    path: "config.json".into(),
+                    bytes: b"valid".to_vec(),
+                }],
+            })
+            .unwrap();
+        let entry = |path: &str, blob_id: Option<&str>| UpstreamFile {
+            path: path.into(),
+            size: Some(1),
+            blob_id: blob_id.map(str::to_string),
+            lfs_sha256: None,
+        };
+        assert!(archive
+            .record_upstream_files_for_type(
+                RepositoryType::Model,
+                "org/model",
+                commit,
+                &[
+                    // Upstream metadata reaches ModelKeep through a helper's
+                    // stdout and is served back to clients, so a path that
+                    // escapes the revision, names ModelKeep's own internal
+                    // state, or is absolute is dropped rather than recorded.
+                    entry("../escape", None),
+                    entry("/absolute", None),
+                    entry(".modelkeep-manifest.json", None),
+                    entry(".cache/huggingface/download.json", None),
+                    // An object id that is not a plain hexadecimal digest is
+                    // never echoed back into a response.
+                    entry("weights/a.bin", Some("../../etc/passwd")),
+                    entry("config.json", Some(&"b".repeat(40))),
+                ],
+            )
+            .unwrap());
+
+        let recorded = archive
+            .upstream_files_for_type(RepositoryType::Model, "org/model", commit)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recorded,
+            vec![
+                UpstreamFile {
+                    path: "weights/a.bin".into(),
+                    size: Some(1),
+                    blob_id: None,
+                    lfs_sha256: None,
+                },
+                UpstreamFile {
+                    path: "config.json".into(),
+                    size: Some(1),
+                    blob_id: Some("b".repeat(40)),
+                    lfs_sha256: None,
+                },
+            ]
+        );
+
+        // The record is ModelKeep's own state: it is never resolvable as a file,
+        // whatever a client asks for.
+        assert!(archive
+            .resolve_file("org/model", commit, UPSTREAM_FILES_FILE)
+            .is_err());
+        // Recording is not a way to rewrite a published revision.
+        assert!(!archive
+            .record_upstream_files_for_type(
+                RepositoryType::Model,
+                "org/model",
+                commit,
+                &[entry("other.json", None)],
+            )
+            .unwrap());
+        assert_eq!(
+            archive
+                .upstream_files_for_type(RepositoryType::Model, "org/model", commit)
+                .unwrap()
+                .unwrap(),
+            recorded
+        );
+        // An absent revision cannot be given a file list at all.
+        assert!(archive
+            .record_upstream_files_for_type(
+                RepositoryType::Model,
+                "org/model",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                &[entry("config.json", None)],
+            )
+            .is_err());
     }
 
     #[test]

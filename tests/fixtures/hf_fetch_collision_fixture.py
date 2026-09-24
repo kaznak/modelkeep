@@ -70,11 +70,30 @@ def main():
     parser.add_argument("--revision", required=True)
     parser.add_argument("--output")
     parser.add_argument("--file", action="append")
+    parser.add_argument("--exclude", action="append")
     parser.add_argument("--resolve-only", action="store_true", dest="resolve_only")
     args = parser.parse_args()
 
     if args.resolve_only:
-        print(json.dumps({"type": "result", "commit": COMMIT}), flush=True)
+        # The commit's whole file list with upstream's per-file metadata, which is
+        # what ModelKeep answers repository metadata from before it has archived
+        # anything (Issue 0074).
+        files = payloads()
+        print(
+            json.dumps(
+                {
+                    "type": "result",
+                    "commit": COMMIT,
+                    "files": sorted(files),
+                    "repository_files": [
+                        {"path": path, "size": len(files[path])}
+                        for path in sorted(files)
+                    ],
+                },
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
         return
     if not args.output:
         parser.error("--output is required unless --resolve-only is given")

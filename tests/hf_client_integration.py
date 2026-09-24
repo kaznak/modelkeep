@@ -27,6 +27,18 @@ COLD_MISS_REPO_ID = "org/cold-miss"
 METADATA_REPO_ID = "org/metadata-wait"
 ADMIN_TOKEN = "modelkeep-hf-client-integration-admin-token"
 
+# What the model fixture holds at COMMIT. The mirror must report all of it for a
+# revision it has never seen, and archive only what the client asks for.
+UPSTREAM_FILES = [
+    "README.md",
+    "config.json",
+    "model-00001-of-00002.safetensors",
+    "model-00002-of-00002.safetensors",
+    "model.safetensors",
+    "model.safetensors.index.json",
+    "tokenizer.json",
+]
+
 # An upstream helper that records every invocation and delays the transfer, so a
 # real client meets ModelKeep's cold-miss deadline (Issue 0069) instead of the
 # stub used by the Rust unit tests. The payload itself is delegated to the same
@@ -189,8 +201,9 @@ def assert_cold_miss_deadline_is_retried_by_the_client(binary, fixture, root):
     pins what the client actually does with it: a cold-miss `resolve` whose
     acquisition outlasts `MODELKEEP_COLD_MISS_DEADLINE_SECONDS` is retried by
     the client itself and completes, and the retry joins the running flight
-    instead of starting a second upstream transfer. The metadata route waits by
-    default, so the same slow acquisition must not fail a client there.
+    instead of starting a second upstream transfer. The metadata route is answered
+    from upstream's file list without acquiring anything (Issue 0074), so the same
+    slow acquisition must neither delay nor fail a client there.
     """
     journal = root / "cold-miss-helper-journal.jsonl"
     journal.write_text("")
@@ -220,8 +233,13 @@ def assert_cold_miss_deadline_is_retried_by_the_client(binary, fixture, root):
         )
         assert downloaded.read_bytes() == b'{"model_type":"modelkeep-fixture"}'
 
+        # The metadata route answers from upstream's file list without waiting
+        # for any acquisition (Issue 0074), so the slow helper never delays it.
         metadata = HfApi(endpoint=endpoint).repo_info(METADATA_REPO_ID, revision="main")
         assert metadata.sha == COMMIT
+        assert sorted(
+            sibling.rfilename for sibling in metadata.siblings
+        ) == UPSTREAM_FILES, metadata.siblings
 
     # The deadline really was reached, so the client saw the bounded answer
     # rather than one uninterrupted wait.
@@ -249,10 +267,16 @@ def assert_selected_subset_is_acquired_and_served(binary, root, actual_helper, p
     """Issue 0070, black-box against a real supported client.
 
     A filtered prefetch archives a subset of a revision; a real client then
-    downloads that subset with `allow_patterns` while upstream is unavailable,
-    and repository metadata reports exactly what the archive holds rather than
-    what upstream has. The already populated archive acts as the local upstream,
-    and the production helper performs the filtered acquisition.
+    downloads that subset with `allow_patterns` while upstream is unavailable.
+    The already populated archive acts as the local upstream, and the production
+    helper performs the filtered acquisition.
+
+    Repository metadata reports the commit's whole upstream file list, because the
+    prefetch recorded it (Issue 0074). A partially archived revision therefore no
+    longer presents its subset as the whole repository: an unfiltered download of
+    it needs the paths the archive does not hold, and with upstream unavailable
+    that fails rather than handing back an incomplete model and calling it a
+    successful download.
     """
     selected_archive = root / "selection-archive"
     admin_endpoints = []
@@ -286,10 +310,9 @@ def assert_selected_subset_is_acquired_and_served(binary, root, actual_helper, p
     # Upstream is unavailable from here on: no helper and no HF_ENDPOINT.
     with server(binary, selected_archive) as endpoint:
         info = HfApi(endpoint=endpoint).repo_info(REPO_ID, revision=COMMIT)
-        assert sorted(sibling.rfilename for sibling in info.siblings) == [
-            "config.json",
-            "tokenizer.json",
-        ]
+        assert sorted(
+            sibling.rfilename for sibling in info.siblings
+        ) == UPSTREAM_FILES, info.siblings
         subset = Path(
             snapshot_download(
                 repo_id=REPO_ID,
@@ -303,11 +326,132 @@ def assert_selected_subset_is_acquired_and_served(binary, root, actual_helper, p
             b'{"model_type":"modelkeep-fixture"}'
         )
         assert not (subset / "tokenizer.json").exists()
-        whole = Path(download(endpoint, root / "selected-whole-client", COMMIT))
-        assert sorted(
-            entry.name for entry in whole.iterdir() if not entry.name.startswith(".")
-        ) == ["config.json", "tokenizer.json"]
-        assert (whole / "tokenizer.json").read_bytes() == b'{"version":"1.0"}'
+        pair = Path(
+            snapshot_download(
+                repo_id=REPO_ID,
+                revision=COMMIT,
+                endpoint=endpoint,
+                local_dir=str(root / "selected-pair-client"),
+                allow_patterns=["config.json", "tokenizer.json"],
+            )
+        )
+        assert (pair / "tokenizer.json").read_bytes() == b'{"version":"1.0"}'
+        # An unfiltered download asks for the shards the archive does not hold,
+        # which needs upstream. It must fail rather than succeed with a model that
+        # is missing shards.
+        try:
+            download(endpoint, root / "selected-whole-client", COMMIT)
+        except Exception:
+            pass
+        else:
+            raise AssertionError(
+                "an unfiltered download of a partially archived revision reported "
+                "success without the files the archive does not hold"
+            )
+    # Nothing was acquired by any of that: upstream was unavailable throughout.
+    assert sorted(archived_digests(selected_archive, REPO_ID, COMMIT)) == [
+        "config.json",
+        "tokenizer.json",
+    ]
+
+
+def revision_directory(archive, repo_id, commit):
+    namespace, repo = repo_id.split("/")
+    return archive / "models" / namespace / repo / "revisions" / commit
+
+
+def assert_a_client_filter_narrows_the_first_acquisition(
+    binary, root, actual_helper, populated
+):
+    """Issue 0074 acceptance, black-box against a real supported client.
+
+    A client's own `allow_patterns` narrows the **first** acquisition of a
+    repository the mirror has never seen: repository metadata is answered from
+    upstream without acquiring anything, so only the matching files are ever
+    transferred and archived. Measured before this change, the same command
+    archived the full snapshot, because the metadata request acquired the whole
+    repository and the filter was applied to a file list ModelKeep had already
+    paid for in full.
+
+    The already populated archive acts as the local upstream and the production
+    helper performs both the metadata resolve and the acquisition, so this
+    exercises the real helper contract rather than a synthetic fixture.
+    """
+    mirror = root / "unseen-filtered-archive"
+    logs = []
+    with server(binary, populated) as upstream_endpoint:
+        with server(
+            binary,
+            mirror,
+            actual_helper,
+            logs,
+            upstream_endpoint=upstream_endpoint,
+        ) as endpoint:
+            # Metadata for a revision the mirror has never seen reports the whole
+            # repository, and archives nothing at all.
+            info = HfApi(endpoint=endpoint).repo_info(REPO_ID, revision="main")
+            assert info.sha == COMMIT
+            assert sorted(
+                sibling.rfilename for sibling in info.siblings
+            ) == UPSTREAM_FILES, info.siblings
+            assert not revision_directory(mirror, REPO_ID, COMMIT).exists()
+
+            client = Path(
+                snapshot_download(
+                    repo_id=REPO_ID,
+                    revision="main",
+                    endpoint=endpoint,
+                    local_dir=str(root / "unseen-filtered-client"),
+                    allow_patterns=["config.json"],
+                )
+            )
+            assert (client / "config.json").read_bytes() == (
+                b'{"model_type":"modelkeep-fixture"}'
+            )
+            assert not (client / "model.safetensors").exists()
+
+    # The acceptance criterion: the archived set is the filtered set.
+    archived = archived_digests(mirror, REPO_ID, COMMIT)
+    assert sorted(archived) == ["config.json"], archived
+    materialized = sorted(
+        path.name
+        for path in revision_directory(mirror, REPO_ID, COMMIT).iterdir()
+        if not path.name.startswith(".modelkeep-")
+    )
+    assert materialized == ["config.json"], materialized
+
+    # The commit's upstream file list was recorded as internal archive state, so
+    # the partially archived revision knows what it does not hold.
+    recorded = json.loads(
+        (
+            revision_directory(mirror, REPO_ID, COMMIT)
+            / ".modelkeep-upstream-files.json"
+        ).read_text()
+    )
+    assert recorded["commit"] == COMMIT
+    assert [entry["path"] for entry in recorded["files"]] == UPSTREAM_FILES, recorded
+    assert '"event":"upstream_metadata_answered"' in logs[0], logs[0]
+
+    # Warm and offline: no helper and no HF_ENDPOINT, so upstream is
+    # unavailable. The revision still answers metadata, and still reports the
+    # files it does not hold (core invariant 8).
+    with server(binary, mirror) as endpoint:
+        with urllib.request.urlopen(
+            f"{endpoint}/api/models/{REPO_ID}/tree/{COMMIT}"
+        ) as response:
+            tree = json.loads(response.read())
+        assert sorted(entry["path"] for entry in tree) == UPSTREAM_FILES, tree
+        held = [entry for entry in tree if entry["path"] == "config.json"][0]
+        absent = [entry for entry in tree if entry["path"] == "model.safetensors"][0]
+        assert held["size"] == 34, held
+        # The mirror holds it, so its object id is the digest it serves and
+        # validates against; it never claims one for bytes it does not hold.
+        assert held["oid"] == archived["config.json"], held
+        status, headers, _ = resolve_headers(
+            endpoint, REPO_ID, COMMIT, "config.json", method="HEAD"
+        )
+        assert headers["ETag"] == f'"{held["oid"]}"', headers
+        assert absent["oid"] is None, absent
 
 
 def load_module(path):
@@ -653,6 +797,9 @@ def main():
             )
             assert_cold_miss_deadline_is_retried_by_the_client(binary, helper, root)
             assert_selected_subset_is_acquired_and_served(
+                binary, root, actual_helper, archive
+            )
+            assert_a_client_filter_narrows_the_first_acquisition(
                 binary, root, actual_helper, archive
             )
 

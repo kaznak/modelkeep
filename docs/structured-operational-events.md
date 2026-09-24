@@ -15,6 +15,8 @@ headers, bearer tokens, signed URLs, or upstream error payloads.
 | `upstream_fetch_started` | INFO | `repo_id`, `requested_revision`, `operation`, `resumed`, `selected` |
 | `upstream_fetch_finished` | INFO | fetch fields plus immutable `commit` |
 | `upstream_fetch_failed` | WARN | fetch fields plus credential-safe `error_class` |
+| `upstream_metadata_answered` | INFO | `repo_id`, `requested_revision`, immutable `commit`, `files` |
+| `upstream_file_list_recorded` | INFO | `repo_id`, immutable `commit`, `files` |
 | `archive_verification_failed` | WARN | `repo_id` and immutable `commit`, or `requested_revision` and `operation`; credential-safe `error_class` |
 | `archive_published` | INFO | `repo_id`, `requested_revision`, immutable `commit`, `operation` |
 | `archive_extended` | INFO | `repo_id`, `requested_revision`, immutable `commit`, `added`, `skipped`, `operation` |
@@ -75,6 +77,30 @@ manifest entries added and the ones the revision already held.
 `archive_selection_satisfied` reports the opposite outcome, that the requested
 selection needed no transfer, and `covered` counts the paths the selection resolved
 to.
+
+`upstream_metadata_answered` says a repository metadata answer was **not** derived
+from archived state: the revision was not archived, and its file list came from
+upstream without acquiring anything (Issue 0074). It is the operator's marker that
+the answer describes upstream rather than the archive, and it is never followed by
+a publication of its own — no payload was transferred and nothing was written to
+the archive. An archived revision is answered from the archive and emits
+`archive_hit` instead, never this event. A metadata request that could not be
+answered this way, because the fetch helper reported no per-file metadata, falls
+back to acquiring the revision and is reported by the ordinary cold-miss
+sequence below.
+
+`upstream_file_list_recorded` says a published revision now knows the upstream
+file list of its immutable commit. It follows `archive_published` or
+`archive_extended` for the acquisition that learned it, at most once per
+revision, and `files` counts the paths upstream reported for the whole commit —
+not the archived subset, which `archive_extended.added` counts. The record is
+internal archive state: it adds no manifest entry, is never served, and is never
+re-recorded, because the file list of an immutable commit cannot change. A
+revision published before the list was recorded, or imported from a client cache,
+simply never emits this event and keeps reporting the archived set. A failure to
+write it is reported by `archive_storage_failed` with
+`operation=record_upstream_files` and leaves the published revision untouched and
+serving.
 
 `upstream_fetch_failed.error_class` is one of `unavailable`, `not_found`,
 `unauthorized`, `invalid_output`, `storage`, `failed`, or `io`. The upstream diagnostic itself

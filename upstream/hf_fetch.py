@@ -171,7 +171,20 @@ def selected(path, include=None, exclude=None):
     return True
 
 
-def expected_files(info, patterns=None, exclude=None):
+def repository_file_metadata(info):
+    """Every file upstream reports at this commit, with its per-file metadata.
+
+    Deliberately unfiltered by the selection: the selection narrows what this
+    acquisition transfers, while this list is a property of the commit, which is
+    immutable. ModelKeep records it so that it can answer repository metadata
+    without acquiring the repository (Issue 0074) and so that a partially
+    archived revision stops presenting its subset as the whole repository.
+
+    `size` is the byte length, `blob_id` the git object id upstream serves as
+    the `ETag` of a non-LFS file, and `lfs_sha256` the LFS object digest it
+    serves as `x-linked-etag`. A field upstream did not report is omitted rather
+    than guessed.
+    """
     result = []
     for sibling in getattr(info, "siblings", None) or []:
         path = getattr(sibling, "rfilename", None)
@@ -179,11 +192,27 @@ def expected_files(info, patterns=None, exclude=None):
             continue
         if Path(path).parts[0].startswith(".modelkeep-"):
             continue
-        if not selected(path, patterns, exclude):
-            continue
+        entry = {"path": path}
         size = getattr(sibling, "size", None)
-        result.append((path, size if isinstance(size, int) and size >= 0 else None))
-    return sorted(result)
+        if isinstance(size, int) and not isinstance(size, bool) and size >= 0:
+            entry["size"] = size
+        blob_id = getattr(sibling, "blob_id", None)
+        if isinstance(blob_id, str) and blob_id:
+            entry["blob_id"] = blob_id
+        lfs = getattr(sibling, "lfs", None)
+        lfs_sha256 = getattr(lfs, "sha256", None) if lfs is not None else None
+        if isinstance(lfs_sha256, str) and lfs_sha256:
+            entry["lfs_sha256"] = lfs_sha256
+        result.append(entry)
+    return sorted(result, key=lambda entry: entry["path"])
+
+
+def expected_files(info, patterns=None, exclude=None):
+    return [
+        (entry["path"], entry.get("size"))
+        for entry in repository_file_metadata(info)
+        if selected(entry["path"], patterns, exclude)
+    ]
 
 
 def resolve(
@@ -195,11 +224,13 @@ def resolve(
     api=None,
     progress=None,
 ):
-    """Resolves the commit and the upstream files the selection covers.
+    """Resolves the commit, the files the selection covers, and the commit's
+    whole upstream file list.
 
     Transfers nothing. The `resolved` event is emitted here so that both the
     acquisition and the resolve-only mode announce the immutable commit the same
-    way.
+    way. One `repo_info` call answers all three, so recording the file list
+    costs no extra upstream round trip.
     """
     api = api or HfApi()
     if progress is not None:
@@ -222,7 +253,7 @@ def resolve(
         json.dumps({"type": "resolved", "version": 1, "commit": commit}, separators=(",", ":")),
         flush=True,
     )
-    return commit, expected_files(info, files, exclude)
+    return commit, expected_files(info, files, exclude), repository_file_metadata(info)
 
 
 def inventory(
@@ -240,8 +271,12 @@ def inventory(
     of path strings — and adds `sizes` for the paths whose size upstream
     reported. An empty `files` list is a legitimate answer here: it means
     upstream holds nothing matching the selection.
+
+    `repository_files` is the commit's whole upstream file list, which the
+    selection does not narrow: it is what ModelKeep records for the commit and
+    answers metadata from.
     """
-    commit, expected = resolve(
+    commit, expected, repository = resolve(
         repo_id,
         requested_revision,
         files=files,
@@ -254,6 +289,7 @@ def inventory(
         "commit": commit,
         "files": [path for path, _ in expected],
         "sizes": {path: size for path, size in expected},
+        "repository_files": repository,
     }
 
 
@@ -273,7 +309,7 @@ def acquire(
     api = api or HfApi()
     download = download or snapshot_download
 
-    commit, expected = resolve(
+    commit, expected, repository = resolve(
         repo_id,
         requested_revision,
         files=files,
@@ -307,7 +343,13 @@ def acquire(
             progress.set_expected(output, [(path, None) for path in archived_files])
         progress._report_files(force=True, finalized=True)
         progress.phase("inventorying_snapshot")
-    return {"commit": commit, "files": archived_files}
+    # `files` is what this acquisition archived; `repository_files` is what
+    # upstream holds at the commit, which the selection does not narrow.
+    return {
+        "commit": commit,
+        "files": archived_files,
+        "repository_files": repository,
+    }
 
 
 def main():

@@ -67,7 +67,12 @@ class HfFetchTests(unittest.TestCase):
         self.assertNotIn("transport", protocol.getvalue())
         self.assertIn('"transport":"diagnostic"', diagnostics.getvalue())
         self.assertEqual(
-            result, {"commit": COMMIT_A, "files": ["config.json", "model.bin"]}
+            result,
+            {
+                "commit": COMMIT_A,
+                "files": ["config.json", "model.bin"],
+                "repository_files": [{"path": "config.json", "size": 8}, {"path": "model.bin", "size": 10}],
+            },
         )
 
     def test_progress_reporter_emits_machine_readable_bounded_progress(self):
@@ -167,7 +172,14 @@ class HfFetchTests(unittest.TestCase):
         self.assertEqual(api.request, ("org/model", "main", "model", True))
         self.assertEqual(len(download_calls), 1)
         self.assertEqual(download_calls[0]["repo_type"], "model")
-        self.assertEqual(result, {"commit": COMMIT_A, "files": ["config.json", "model.bin"]})
+        self.assertEqual(
+            result,
+            {
+                "commit": COMMIT_A,
+                "files": ["config.json", "model.bin"],
+                "repository_files": [{"path": "config.json", "size": 8}, {"path": "model.bin", "size": 10}],
+            },
+        )
 
     def test_dataset_type_is_used_for_metadata_and_download(self):
         api = MovingRefApi()
@@ -196,7 +208,14 @@ class HfFetchTests(unittest.TestCase):
 
         self.assertEqual(api.request, ("org/shared", "main", "dataset", True))
         self.assertEqual(download_calls[0]["repo_type"], "dataset")
-        self.assertEqual(result, {"commit": COMMIT_A, "files": ["data.jsonl"]})
+        self.assertEqual(
+            result,
+            {
+                "commit": COMMIT_A,
+                "files": ["data.jsonl"],
+                "repository_files": [{"path": "data.jsonl", "size": 12}],
+            },
+        )
 
     def subset_api(self):
         return SimpleNamespace(
@@ -237,7 +256,21 @@ class HfFetchTests(unittest.TestCase):
 
         self.assertEqual(download_calls[0]["allow_patterns"], ["q4/"])
         self.assertEqual(download_calls[0]["ignore_patterns"], ["q4/b.gguf"])
-        self.assertEqual(result, {"commit": COMMIT_A, "files": ["q4/a.gguf"]})
+        self.assertEqual(
+            result,
+            {
+                "commit": COMMIT_A,
+                "files": ["q4/a.gguf"],
+                # Recorded whole, not narrowed by the selection: the file list is
+                # a property of the commit, which is immutable.
+                "repository_files": [
+                    {"path": "config.json", "size": 6},
+                    {"path": "q4/a.gguf", "size": 3},
+                    {"path": "q4/b.gguf", "size": 3},
+                    {"path": "q8/a.gguf", "size": 3},
+                ],
+            },
+        )
 
     def test_whole_repository_acquisition_passes_no_patterns(self):
         api = self.subset_api()
@@ -326,6 +359,69 @@ class HfFetchTests(unittest.TestCase):
         self.assertEqual(result["files"], [])
         self.assertEqual(result["sizes"], {})
         self.assertEqual(result["commit"], COMMIT_A)
+
+    def test_per_file_upstream_metadata_is_recorded_for_the_whole_commit(self):
+        """Issue 0074/0078: one `repo_info` call already carries both validators.
+
+        `blob_id` is what upstream serves as the `ETag` of a non-LFS file and
+        `lfs.sha256` what it serves as `x-linked-etag`, so both are recorded as
+        upstream reported them. A field upstream did not report is omitted, never
+        guessed.
+        """
+        info = SimpleNamespace(
+            siblings=[
+                SimpleNamespace(
+                    rfilename="model.safetensors",
+                    size=520212,
+                    blob_id="b" * 40,
+                    lfs=SimpleNamespace(sha256="c" * 64, size=520212),
+                ),
+                SimpleNamespace(rfilename="config.json", size=6, blob_id="d" * 40),
+                SimpleNamespace(rfilename="unknown.bin", size=None, blob_id=None),
+            ]
+        )
+
+        self.assertEqual(
+            hf_fetch.repository_file_metadata(info),
+            [
+                {"path": "config.json", "size": 6, "blob_id": "d" * 40},
+                {
+                    "path": "model.safetensors",
+                    "size": 520212,
+                    "blob_id": "b" * 40,
+                    "lfs_sha256": "c" * 64,
+                },
+                {"path": "unknown.bin"},
+            ],
+        )
+
+    def test_recorded_file_list_is_not_narrowed_by_the_selection(self):
+        api = self.subset_api()
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = hf_fetch.inventory(
+                "org/model", "main", files=["q4/"], api=api
+            )
+
+        self.assertEqual(result["files"], ["q4/a.gguf", "q4/b.gguf"])
+        self.assertEqual(
+            [entry["path"] for entry in result["repository_files"]],
+            ["config.json", "q4/a.gguf", "q4/b.gguf", "q8/a.gguf"],
+        )
+
+    def test_internal_archive_paths_never_enter_the_recorded_file_list(self):
+        info = SimpleNamespace(
+            siblings=[
+                SimpleNamespace(rfilename=".modelkeep-manifest.json", size=1),
+                SimpleNamespace(rfilename=".cache/huggingface/x", size=1),
+                SimpleNamespace(rfilename="config.json", size=6),
+            ]
+        )
+
+        self.assertEqual(
+            hf_fetch.repository_file_metadata(info),
+            [{"path": "config.json", "size": 6}],
+        )
 
     def test_internal_archive_paths_never_enter_the_expected_set(self):
         info = SimpleNamespace(

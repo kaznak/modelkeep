@@ -7,9 +7,9 @@ use serde::Serialize;
 use crate::singleflight::{Joined, SingleFlight};
 use crate::upstream::{
     CancelOutcome, Cancellation, FetchProgress, FetchRequest, FileSelection, InvalidOutputReason,
-    InventoryRequest, UpstreamError, UpstreamFetcher,
+    InventoryRequest, UpstreamError, UpstreamFetcher, UpstreamRepositoryFiles,
 };
-use crate::{is_hf_commit, Archive, ArchiveError, RepositoryType, SourceFile};
+use crate::{is_hf_commit, Archive, ArchiveError, RepositoryType, SourceFile, UpstreamFile};
 
 /// Identity of one in-flight acquisition.
 ///
@@ -482,7 +482,20 @@ pub struct PullThrough {
     refresh_flights: Arc<RefreshFlights>,
     acquisitions: Arc<AcquisitionRegistry>,
     gate: Arc<TransferGate>,
+    resolved_refs: Arc<Mutex<ResolvedRefs>>,
 }
+
+/// What upstream said each mutable ref resolves to, keyed by repository type,
+/// repository, and ref name.
+type ResolvedRefs = BTreeMap<(RepositoryType, String, String), String>;
+
+/// How many observed ref resolutions are remembered at once.
+///
+/// The map exists to learn the handful of refs real traffic asks about, so it is
+/// bounded: a client asking about unbounded ref names must not grow it without
+/// limit. Beyond the bound a new observation is dropped, which costs a ref the
+/// archive learns later rather than any correctness.
+const MAX_RESOLVED_REFS: usize = 1024;
 
 /// What one acquisition did to the archive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -585,6 +598,7 @@ impl PullThrough {
             refresh_flights: Arc::new(SingleFlight::new()),
             acquisitions: Arc::new(AcquisitionRegistry::default()),
             gate: Arc::new(TransferGate::new(transfer_limit)),
+            resolved_refs: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -933,14 +947,20 @@ impl PullThrough {
     ) -> Result<Reconciliation, PullThroughError> {
         // A revision that is not published yet needs no reconciliation, and must
         // not pay for an extra upstream round trip.
-        if self
-            .published_commit(repo_type, repo_id, requested_revision)
-            .is_none()
-        {
+        let Some(published) = self.published_commit(repo_type, repo_id, requested_revision) else {
             return Ok(Reconciliation::NotPublished);
-        }
+        };
         if handle.cancellation().is_cancelled() {
             return Err(PullThroughError::Cancelled);
+        }
+        if let Some(reconciliation) = self.reconcile_from_record(
+            repo_type,
+            repo_id,
+            requested_revision,
+            &published,
+            selection,
+        )? {
+            return Ok(reconciliation);
         }
         handle.set_state(AcquisitionState::Resolving);
         progress(FetchProgress::phase(RESOLVE_PHASE));
@@ -983,6 +1003,222 @@ impl PullThrough {
         Ok(Reconciliation::Missing(
             FileSelection::from_paths(&missing).map_err(|_| PullThroughError::UnsafePath)?,
         ))
+    }
+
+    /// Reconciles a selection against the revision's own recorded upstream file
+    /// list, with no upstream round trip (Issue 0074).
+    ///
+    /// The list of an immutable commit cannot go stale, so where a record exists
+    /// the resolve-only call buys nothing the archive does not already know.
+    /// `None` means this cannot be answered locally and the upstream round trip
+    /// stands. Three conditions must hold, and each is about answering the same
+    /// question upstream would rather than a cheaper one:
+    ///
+    /// * the request names the commit itself, so no mutable ref can have moved
+    ///   upstream since. A `main` upstream has advanced must still be resolved
+    ///   upstream, or a prefetch would report a stale revision as satisfied;
+    /// * the selection excludes nothing and its includes are concrete paths, so
+    ///   no pattern has to be matched by anything but the official client
+    ///   (ADR-0020 decision 1). An unrestricted selection qualifies as well,
+    ///   because it covers exactly the recorded list;
+    /// * the revision actually has a record. One published before this existed,
+    ///   or imported from a client cache, keeps the upstream path.
+    fn reconcile_from_record(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        requested_revision: &str,
+        published: &str,
+        selection: &FileSelection,
+    ) -> Result<Option<Reconciliation>, PullThroughError> {
+        if !is_hf_commit(requested_revision) || requested_revision != published {
+            return Ok(None);
+        }
+        if !selection.exclude().is_empty()
+            || selection.required_paths().len() != selection.include().len()
+        {
+            return Ok(None);
+        }
+        let recorded = self
+            .archive
+            .upstream_files_for_type(repo_type, repo_id, published)
+            .map_err(|error| {
+                log_archive_failure(repo_type, repo_id, requested_revision, "reconcile", error)
+            })?;
+        let Some(recorded) = recorded else {
+            return Ok(None);
+        };
+        let upstream = recorded
+            .into_iter()
+            .map(|file| file.path)
+            .collect::<BTreeSet<_>>();
+        let covered = if selection.is_unrestricted() {
+            upstream.iter().cloned().collect::<Vec<_>>()
+        } else {
+            selection
+                .include()
+                .iter()
+                .filter(|path| upstream.contains(*path))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let archived = self.archived_paths(repo_type, repo_id, published)?;
+        let missing = covered
+            .iter()
+            .filter(|path| !archived.contains(*path))
+            .cloned()
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            tracing::info!(event = "archive_selection_satisfied", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %requested_revision, commit = %published, covered = covered.len(), "selection is already archived");
+            return Ok(Some(Reconciliation::Satisfied(AcquisitionResult {
+                commit: published.to_string(),
+                outcome: AcquisitionOutcome::AlreadyArchived,
+            })));
+        }
+        Ok(Some(Reconciliation::Missing(
+            FileSelection::from_paths(&missing).map_err(|_| PullThroughError::UnsafePath)?,
+        )))
+    }
+
+    /// Asks upstream what a revision contains, without acquiring it.
+    ///
+    /// This is what lets a client's own file filter narrow a first acquisition
+    /// (Issue 0074): the metadata routes answer from upstream's file list, and
+    /// the per-file requests that follow acquire only what the client asks for.
+    /// Nothing is transferred, nothing is published, and nothing is cached in the
+    /// archive, so a metadata answer never becomes archived state on its own.
+    ///
+    /// `Ok(None)` means this fetcher cannot report upstream's per-file metadata,
+    /// so the caller keeps the older behavior of acquiring and answering from the
+    /// archive. It is deliberately not an empty answer: ModelKeep must not report
+    /// a repository as empty because it could not enumerate it.
+    pub fn upstream_metadata_for_type(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        requested_revision: &str,
+    ) -> Result<Option<UpstreamRepositoryFiles>, PullThroughError> {
+        let reported = self
+            .fetcher
+            .repository_files(&InventoryRequest {
+                repo_type,
+                repo_id: repo_id.to_string(),
+                revision: requested_revision.to_string(),
+                files: Vec::new(),
+                exclude: Vec::new(),
+            })
+            .map_err(|error| {
+                log_fetch_failure(repo_type, repo_id, requested_revision, "metadata", &error);
+                PullThroughError::from(error)
+            })?;
+        let Some(reported) = reported else {
+            return Ok(None);
+        };
+        tracing::info!(event = "upstream_metadata_answered", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %requested_revision, commit = %reported.commit, files = reported.files.len(), "answered repository metadata from upstream without acquiring");
+        if !is_hf_commit(requested_revision) {
+            self.remember_resolved_ref(repo_type, repo_id, requested_revision, &reported.commit);
+            // An archive that already holds the revision — an imported cache, or
+            // one acquired by commit — can adopt the name immediately.
+            self.adopt_resolved_refs(repo_type, repo_id, &reported.commit);
+        }
+        Ok(Some(reported))
+    }
+
+    /// Remembers what upstream said a mutable ref resolves to.
+    ///
+    /// A supported client resolves a ref through the metadata routes and then
+    /// requests every file by commit, so nothing in the requests that follow
+    /// names the ref. Answering metadata without acquiring would therefore stop
+    /// the archive from ever learning what `main` resolved to, and a revision
+    /// mirrored by an ordinary `hf download` would be downloadable only by
+    /// commit — not by the name it was mirrored under, which is the offline
+    /// guarantee of core invariant 8.
+    ///
+    /// This is in-memory only: a metadata answer writes nothing to the archive,
+    /// and the observation is applied only once a revision for that commit
+    /// exists.
+    fn remember_resolved_ref(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        reference: &str,
+        commit: &str,
+    ) {
+        let mut resolved = self.resolved_refs.lock().expect("resolved refs poisoned");
+        let key = (repo_type, repo_id.to_string(), reference.to_string());
+        if resolved.len() >= MAX_RESOLVED_REFS && !resolved.contains_key(&key) {
+            return;
+        }
+        resolved.insert(key, commit.to_string());
+    }
+
+    /// Records the names upstream gave this commit, for names the archive lacks.
+    ///
+    /// Only ever creates a ref the archive does not have. It never moves one, so
+    /// a stale observation cannot walk a ref backwards and an explicit refresh
+    /// (ADR-0012) stays the only thing that advances one. A published revision is
+    /// never touched either way.
+    fn adopt_resolved_refs(&self, repo_type: RepositoryType, repo_id: &str, commit: &str) {
+        let candidates = {
+            let resolved = self.resolved_refs.lock().expect("resolved refs poisoned");
+            resolved
+                .iter()
+                .filter(|((entry_type, entry_repo, _), resolved_commit)| {
+                    *entry_type == repo_type
+                        && entry_repo == repo_id
+                        && resolved_commit.as_str() == commit
+                })
+                .map(|((_, _, reference), _)| reference.clone())
+                .collect::<Vec<_>>()
+        };
+        for reference in candidates {
+            if self
+                .archive
+                .resolve_ref_for_type(repo_type, repo_id, &reference)
+                .is_ok()
+            {
+                continue;
+            }
+            if let Err(error) = self
+                .archive
+                .update_ref_for_type(repo_type, repo_id, &reference, commit)
+            {
+                let _ = log_archive_failure(repo_type, repo_id, &reference, "update_ref", error);
+            }
+        }
+    }
+
+    /// Records the commit's upstream file list beside the revision it describes.
+    ///
+    /// Deliberately not fatal to an acquisition that already published: the
+    /// revision is serving, the record adds no manifest entry and no published
+    /// byte, and it is reconstructible from upstream. A failure leaves the
+    /// revision in the "does not know its upstream file list" state, which is
+    /// the state every revision published before this change is in.
+    fn record_upstream_files(
+        &self,
+        repo_type: RepositoryType,
+        repo_id: &str,
+        commit: &str,
+        files: &[UpstreamFile],
+    ) {
+        if files.is_empty() {
+            return;
+        }
+        match self
+            .archive
+            .record_upstream_files_for_type(repo_type, repo_id, commit, files)
+        {
+            Ok(true) => {
+                tracing::info!(event = "upstream_file_list_recorded", repo_type = %repo_type, repo_id = %repo_id, commit = %commit, files = files.len(), "recorded the upstream file list of an immutable commit");
+            }
+            // Already recorded: the list of an immutable commit cannot change.
+            Ok(false) => {}
+            Err(error) => {
+                let _ =
+                    log_archive_failure(repo_type, repo_id, commit, "record_upstream_files", error);
+            }
+        }
     }
 
     /// The published, complete commit this request already resolves to, if any.
@@ -1182,6 +1418,9 @@ impl PullThrough {
                 PullThroughError::from(error)
             })?;
         tracing::info!(event = "upstream_fetch_finished", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %reference, commit = %fetched.commit, operation = "refresh", "upstream fetch finished");
+        // Read while staging still exists: publication consumes it.
+        let recorded_files =
+            crate::staged_upstream_files(&staging.path, repo_type, &fetched.commit);
         if !cancel.commit() {
             if self
                 .archive
@@ -1239,6 +1478,7 @@ impl PullThrough {
                 tracing::info!(event = "archive_published", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %reference, commit = %fetched.commit, operation = "refresh", "archive revision published");
             }
         }
+        self.record_upstream_files(repo_type, repo_id, &fetched.commit, &recorded_files);
         let _ = std::fs::remove_dir_all(&staging.path);
         self.archive
             .update_ref_for_type(repo_type, repo_id, reference, &fetched.commit)
@@ -1459,6 +1699,9 @@ impl PullThrough {
             }
         };
         tracing::info!(event = "upstream_fetch_finished", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %requested_revision, commit = %fetched.commit, operation = "pull_through", "upstream fetch finished");
+        // Read while staging still exists: publication consumes it.
+        let recorded_files =
+            crate::staged_upstream_files(&staging.path, repo_type, &fetched.commit);
         // The one place cancellation and completion are decided against each
         // other: after this claim succeeds the acquisition publishes and a later
         // cancel is answered "already finished", and if it fails a cancel won and
@@ -1534,6 +1777,12 @@ impl PullThrough {
         };
         let _ = std::fs::remove_dir_all(&staging.path);
         let outcome = outcome?;
+        // The revision exists from here on, so the commit's upstream file list
+        // has somewhere to live. It is recorded after publication rather than
+        // staged with the payload, so no published revision is ever rewritten
+        // and an interrupted acquisition cannot leave a list describing a
+        // revision that was never published.
+        self.record_upstream_files(repo_type, repo_id, &fetched.commit, &recorded_files);
         if outcome == AcquisitionOutcome::Published {
             tracing::info!(event = "archive_published", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %requested_revision, commit = %fetched.commit, operation = "pull_through", "archive revision published");
         }
@@ -1544,6 +1793,10 @@ impl PullThrough {
                     log_archive_failure(repo_type, repo_id, requested_revision, "update_ref", error)
                 })?;
         }
+        // A client that resolved a ref on the metadata route asks for every file
+        // by commit, so this is where the archive learns the name it was asked
+        // about.
+        self.adopt_resolved_refs(repo_type, repo_id, &fetched.commit);
         Ok(AcquisitionResult {
             commit: fetched.commit,
             outcome,
@@ -2576,6 +2829,10 @@ mod tests {
         requests: Arc<Mutex<Vec<RecordedFetch>>>,
         inventories: Arc<AtomicUsize>,
         delay: Duration,
+        /// Whether this helper reports upstream's per-file metadata, as the
+        /// production helper does. Off by default, which is how a helper from
+        /// before Issue 0074 behaves.
+        reporting: bool,
     }
 
     impl SelectiveFetcher {
@@ -2589,7 +2846,29 @@ mod tests {
                 requests: Arc::new(Mutex::new(Vec::new())),
                 inventories: Arc::new(AtomicUsize::new(0)),
                 delay: Duration::from_millis(0),
+                reporting: false,
             }
+        }
+
+        /// The same upstream, reported by a helper that carries the commit's
+        /// per-file metadata.
+        fn reporting(mut self) -> Self {
+            self.reporting = true;
+            self
+        }
+
+        /// Upstream's own per-file values for the whole commit.
+        fn reported(&self) -> Vec<UpstreamFile> {
+            self.upstream
+                .iter()
+                .enumerate()
+                .map(|(index, (path, bytes))| UpstreamFile {
+                    path: path.clone(),
+                    size: Some(bytes.len() as u64),
+                    blob_id: Some(format!("{:040x}", 0xb10b0000u64 + index as u64)),
+                    lfs_sha256: None,
+                })
+                .collect()
         }
 
         fn matches(path: &str, include: &[String], exclude: &[String]) -> bool {
@@ -2621,6 +2900,16 @@ mod tests {
                 fs::write(destination, bytes).unwrap();
                 files.push(path.clone());
             }
+            if self.reporting {
+                crate::write_staged_upstream_files(
+                    &request.staging,
+                    request.repo_type,
+                    &request.repo_id,
+                    &self.commit,
+                    &self.reported(),
+                )
+                .unwrap();
+            }
             Ok(FetchedRevision {
                 commit: self.commit.clone(),
                 files,
@@ -2643,6 +2932,20 @@ mod tests {
                     .collect(),
             }))
         }
+
+        fn repository_files(
+            &self,
+            _request: &InventoryRequest,
+        ) -> Result<Option<crate::upstream::UpstreamRepositoryFiles>, UpstreamError> {
+            if !self.reporting {
+                return Ok(None);
+            }
+            self.inventories.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(crate::upstream::UpstreamRepositoryFiles {
+                commit: self.commit.clone(),
+                files: self.reported(),
+            }))
+        }
     }
 
     fn selection(include: &[&str], exclude: &[&str]) -> FileSelection {
@@ -2657,6 +2960,170 @@ mod tests {
                 .collect::<Vec<_>>(),
         )
         .unwrap()
+    }
+
+    const RECORDED_COMMIT: &str = "cccccccccccccccccccccccccccccccccccccccc";
+
+    fn recorded_upstream(archive: &Archive, commit: &str) -> Option<Vec<UpstreamFile>> {
+        archive
+            .upstream_files_for_type(RepositoryType::Model, "org/model", commit)
+            .unwrap()
+    }
+
+    /// Issue 0074: reconciling a selection against a revision that knows its
+    /// upstream file list is a local set operation, so it costs no upstream
+    /// round trip. The control half of the test is the same sequence against a
+    /// helper that reports no list, which still pays for one call per
+    /// reconciliation.
+    #[test]
+    fn reconciliation_uses_the_recorded_file_list_instead_of_an_upstream_round_trip() {
+        let upstream: [(&str, &[u8]); 3] = [
+            ("config.json", b"config"),
+            ("weights/a.bin", b"a"),
+            ("weights/b.bin", b"b"),
+        ];
+        let requested = selection(&["config.json", "weights/a.bin"], &[]);
+
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let fetcher = Arc::new(SelectiveFetcher::new(RECORDED_COMMIT, &upstream).reporting());
+        let inventories = fetcher.inventories.clone();
+        let pull = PullThrough::new(archive.clone(), fetcher);
+
+        // A single-file cold miss publishes the revision and records the list.
+        pull.ensure("org/model", RECORDED_COMMIT, &["config.json".to_string()])
+            .unwrap();
+        assert!(recorded_upstream(&archive, RECORDED_COMMIT).is_some());
+        let after_publication = inventories.load(Ordering::SeqCst);
+
+        // The paths the revision lacks are found locally and acquired.
+        let extended = pull
+            .ensure_selected_for_type(
+                RepositoryType::Model,
+                "org/model",
+                RECORDED_COMMIT,
+                &requested,
+            )
+            .unwrap();
+        assert_eq!(extended.outcome, AcquisitionOutcome::Extended);
+        // Repeating it is answered locally as well.
+        let again = pull
+            .ensure_selected_for_type(
+                RepositoryType::Model,
+                "org/model",
+                RECORDED_COMMIT,
+                &requested,
+            )
+            .unwrap();
+        assert_eq!(again.outcome, AcquisitionOutcome::AlreadyArchived);
+        assert_eq!(inventories.load(Ordering::SeqCst), after_publication);
+        assert!(archive
+            .resolve_file("org/model", RECORDED_COMMIT, "weights/a.bin")
+            .is_ok());
+        assert!(archive
+            .resolve_file("org/model", RECORDED_COMMIT, "weights/b.bin")
+            .is_err());
+
+        // Control: no recorded list, so each reconciliation asks upstream.
+        let control_root = tempfile::tempdir().unwrap();
+        let control_archive = Archive::new(control_root.path()).unwrap();
+        let control_fetcher = Arc::new(SelectiveFetcher::new(RECORDED_COMMIT, &upstream));
+        let control_inventories = control_fetcher.inventories.clone();
+        let control = PullThrough::new(control_archive.clone(), control_fetcher);
+        control
+            .ensure("org/model", RECORDED_COMMIT, &["config.json".to_string()])
+            .unwrap();
+        assert!(recorded_upstream(&control_archive, RECORDED_COMMIT).is_none());
+        for _ in 0..2 {
+            control
+                .ensure_selected_for_type(
+                    RepositoryType::Model,
+                    "org/model",
+                    RECORDED_COMMIT,
+                    &requested,
+                )
+                .unwrap();
+        }
+        assert_eq!(control_inventories.load(Ordering::SeqCst), 2);
+    }
+
+    /// The record is internal archive state: it carries no manifest entry, and
+    /// every consistency check treats it as ModelKeep's own state rather than as
+    /// an unexpected file in the revision.
+    #[test]
+    fn the_recorded_file_list_is_internal_state_and_not_a_manifest_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let fetcher = Arc::new(
+            SelectiveFetcher::new(
+                RECORDED_COMMIT,
+                &[("config.json", b"config"), ("weights/a.bin", b"a")],
+            )
+            .reporting(),
+        );
+        let pull = PullThrough::new(archive.clone(), fetcher);
+        pull.ensure("org/model", RECORDED_COMMIT, &["config.json".to_string()])
+            .unwrap();
+
+        let revision = archive.revision_path("org/model", RECORDED_COMMIT).unwrap();
+        assert!(revision.join(crate::UPSTREAM_FILES_FILE).is_file());
+        let manifest: serde_json::Value =
+            serde_json::from_str(&archive.manifest("org/model", RECORDED_COMMIT).unwrap()).unwrap();
+        assert_eq!(
+            manifest["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|file| file["path"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>(),
+            ["config.json"]
+        );
+        // The revision still verifies: the record is not an unexpected file.
+        assert_eq!(
+            archive
+                .verify_revision("org/model", RECORDED_COMMIT)
+                .unwrap(),
+            1
+        );
+        assert!(archive.audit().unwrap().failures.is_empty());
+        let report = archive.self_check();
+        assert_eq!(report.status(), "clean", "{report:?}");
+        // The recorded list covers the whole commit, not the archived subset.
+        assert_eq!(
+            recorded_upstream(&archive, RECORDED_COMMIT)
+                .unwrap()
+                .into_iter()
+                .map(|file| file.path)
+                .collect::<Vec<_>>(),
+            ["config.json", "weights/a.bin"]
+        );
+    }
+
+    /// A mutable ref must still be resolved upstream even where a record exists:
+    /// the record says what a commit contains, never which commit a ref names.
+    #[test]
+    fn a_mutable_ref_is_still_resolved_upstream_when_a_record_exists() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = Archive::new(root.path()).unwrap();
+        let fetcher = Arc::new(
+            SelectiveFetcher::new(RECORDED_COMMIT, &[("config.json", b"config")]).reporting(),
+        );
+        let inventories = fetcher.inventories.clone();
+        let pull = PullThrough::new(archive.clone(), fetcher);
+        pull.ensure("org/model", "main", &["config.json".to_string()])
+            .unwrap();
+        assert!(recorded_upstream(&archive, RECORDED_COMMIT).is_some());
+        let before = inventories.load(Ordering::SeqCst);
+
+        pull.ensure_selected_for_type(
+            RepositoryType::Model,
+            "org/model",
+            "main",
+            &selection(&["config.json"], &[]),
+        )
+        .unwrap();
+
+        assert_eq!(inventories.load(Ordering::SeqCst), before + 1);
     }
 
     #[test]

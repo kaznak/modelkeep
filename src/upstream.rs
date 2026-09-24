@@ -5,7 +5,7 @@ use std::sync::Mutex;
 
 use serde::Deserialize;
 
-use crate::{is_hf_commit, record_fetch_resolved_commit_for_type, RepositoryType};
+use crate::{is_hf_commit, record_fetch_resolved_commit_for_type, RepositoryType, UpstreamFile};
 
 /// What a cancellation request found (Issue 0076).
 ///
@@ -331,6 +331,18 @@ pub struct RevisionInventory {
     pub files: Vec<String>,
 }
 
+/// Every file upstream holds at one immutable commit, with its per-file
+/// metadata, obtained without transferring anything.
+///
+/// Unlike [`RevisionInventory::files`], no selection narrows this: the contents
+/// of a commit are a fact about the commit, which is why ModelKeep can record
+/// the list and answer from it later (Issue 0074).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamRepositoryFiles {
+    pub commit: String,
+    pub files: Vec<UpstreamFile>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct FetchProgress {
     #[serde(default)]
@@ -494,6 +506,22 @@ pub trait UpstreamFetcher: Send + Sync {
     ) -> Result<Option<RevisionInventory>, UpstreamError> {
         Ok(None)
     }
+
+    /// Resolves the commit and upstream's per-file metadata for every file it
+    /// holds there, without transferring anything (Issue 0074).
+    ///
+    /// This is what answers repository metadata for a revision the archive has
+    /// never seen, so that a client's own file filter can narrow the first
+    /// acquisition. `Ok(None)` means this fetcher cannot report upstream's
+    /// per-file metadata; the caller then acquires the revision and answers from
+    /// the archive, because reporting a repository as empty because it could not
+    /// be enumerated would be worse.
+    fn repository_files(
+        &self,
+        _request: &InventoryRequest,
+    ) -> Result<Option<UpstreamRepositoryFiles>, UpstreamError> {
+        Ok(None)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -528,7 +556,29 @@ impl UpstreamFetcher for OfficialHfFetcher {
         &self,
         request: &InventoryRequest,
     ) -> Result<Option<RevisionInventory>, UpstreamError> {
-        self.run_inventory(request)
+        let resolved = self.run_inventory(request)?;
+        // An empty list is a legitimate answer here: it means upstream holds
+        // nothing matching this selection, not that a transfer produced nothing.
+        Ok(Some(RevisionInventory {
+            commit: resolved.commit,
+            files: resolved.files,
+        }))
+    }
+
+    fn repository_files(
+        &self,
+        request: &InventoryRequest,
+    ) -> Result<Option<UpstreamRepositoryFiles>, UpstreamError> {
+        let resolved = self.run_inventory(request)?;
+        // A helper that reported no per-file metadata cannot answer metadata;
+        // saying so is not the same as saying the repository is empty.
+        if resolved.repository_files.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(UpstreamRepositoryFiles {
+            commit: resolved.commit,
+            files: resolved.repository_files,
+        }))
     }
 }
 
@@ -684,6 +734,19 @@ impl OfficialHfFetcher {
                 InvalidOutputReason::EmptySnapshot,
             ));
         }
+        // The commit's upstream file list is recorded into staging, from where
+        // the acquisition installs it beside the revision it describes. Failing
+        // to write it leaves the revision without a recorded file list, which is
+        // the state of every revision published before this existed; it is not a
+        // reason to fail an acquisition whose payload is complete.
+        let response = response.sanitized();
+        let _ = crate::write_staged_upstream_files(
+            &request.staging,
+            request.repo_type,
+            &request.repo_id,
+            &response.commit,
+            &response.repository_files,
+        );
         Ok(FetchedRevision {
             commit: response.commit,
             files: response.files,
@@ -694,10 +757,7 @@ impl OfficialHfFetcher {
     /// A resolve-only invocation. It transfers nothing, is never gated
     /// (ADR-0021 decision 3), and owns no staging, so it needs no cancellation
     /// token: it is the call a running acquisition may make about itself.
-    fn run_inventory(
-        &self,
-        request: &InventoryRequest,
-    ) -> Result<Option<RevisionInventory>, UpstreamError> {
+    fn run_inventory(&self, request: &InventoryRequest) -> Result<HelperOutput, UpstreamError> {
         let mut command = Command::new(&self.python);
         command
             .arg(&self.helper)
@@ -774,12 +834,7 @@ impl OfficialHfFetcher {
                 InvalidOutputReason::MalformedResultCommit,
             ));
         }
-        // An empty list is a legitimate answer here: it means upstream holds
-        // nothing matching this selection, not that a transfer produced nothing.
-        Ok(Some(RevisionInventory {
-            commit: response.commit,
-            files: response.files,
-        }))
+        Ok(response.sanitized())
     }
 }
 
@@ -794,6 +849,25 @@ struct HelperOutput {
     _kind: Option<String>,
     commit: String,
     files: Vec<String>,
+    /// The commit's whole upstream file list. A helper that does not report one
+    /// leaves this empty, and ModelKeep records nothing rather than recording an
+    /// empty repository.
+    #[serde(default)]
+    repository_files: Vec<UpstreamFile>,
+}
+
+impl HelperOutput {
+    /// This output with every reported file validated as untrusted input.
+    fn sanitized(self) -> Self {
+        Self {
+            repository_files: self
+                .repository_files
+                .into_iter()
+                .filter_map(UpstreamFile::sanitized)
+                .collect(),
+            ..self
+        }
+    }
 }
 
 #[cfg(test)]

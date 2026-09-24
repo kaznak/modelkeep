@@ -25,6 +25,8 @@ use crate::{
     is_hf_commit, parse_range, Archive, ArchiveError, ByteRange, RangeError, RepositoryType,
 };
 
+use std::collections::BTreeMap;
+
 /// Default bound on a cold-miss `resolve` response (Issue 0069).
 ///
 /// Both supported clients abandon a `resolve` metadata request after ten
@@ -315,6 +317,52 @@ async fn dataset_info(
     repository_info(state, namespace, repo, revision, RepositoryType::Dataset).await
 }
 
+/// One file in a repository metadata answer.
+///
+/// `size` and `oid` are `None` when neither the archive nor the recorded
+/// upstream file list states one; ModelKeep reports the absence rather than
+/// inventing a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetadataFile {
+    path: String,
+    size: Option<u64>,
+    oid: Option<String>,
+}
+
+/// What the metadata routes answer for one revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepositoryMetadata {
+    commit: String,
+    files: Vec<MetadataFile>,
+}
+
+impl RepositoryMetadata {
+    /// Upstream's answer for a revision the archive does not hold (Issue 0074).
+    ///
+    /// The response is assembled from upstream's file list rather than relayed:
+    /// nothing upstream said about where its payload lives reaches the client,
+    /// so no answer can point a client around the mirror (core invariant 10).
+    /// `oid` is upstream's git object id for the commit, which is what the Hub
+    /// itself reports there, and never a digest ModelKeep claims to have
+    /// verified.
+    fn from_upstream(metadata: crate::upstream::UpstreamRepositoryFiles) -> Self {
+        let mut files = metadata
+            .files
+            .into_iter()
+            .map(|file| MetadataFile {
+                path: file.path,
+                size: file.size,
+                oid: file.blob_id,
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        Self {
+            commit: metadata.commit,
+            files,
+        }
+    }
+}
+
 async fn repository_info(
     state: HttpState,
     namespace: String,
@@ -323,75 +371,18 @@ async fn repository_info(
     repo_type: RepositoryType,
 ) -> Result<Response, StatusCode> {
     let repo_id = format!("{namespace}/{repo}");
-    tracing::info!(
-        event = "archive_request",
-        repo_type = %repo_type,
-        request_kind = "model_info",
-        repo_id = %repo_id,
-        requested_revision = %revision,
-        "archive request received"
-    );
-    let commit = match if is_hf_commit(&revision) {
-        state
-            .archive
-            .revision_path_for_type(repo_type, &repo_id, &revision)
-            .and_then(|path| {
-                if path.is_dir() {
-                    Ok(revision.clone())
-                } else {
-                    Err(ArchiveError::Io(std::io::Error::from(
-                        std::io::ErrorKind::NotFound,
-                    )))
-                }
-            })
-    } else {
-        state
-            .archive
-            .resolve_ref_for_type(repo_type, &repo_id, &revision)
-    } {
-        Ok(commit) => {
-            tracing::info!(event = "archive_hit", request_kind = "model_info", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %revision, commit = %commit, "archive request served locally");
-            commit
-        }
-        Err(ArchiveError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            tracing::info!(event = "archive_miss", request_kind = "model_info", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %revision, "archive request requires upstream acquisition");
-            let Some(pullthrough) = state.pullthrough.clone() else {
-                return Err(StatusCode::NOT_FOUND);
-            };
-            // Unbounded by default: a metadata cold miss waits for the
-            // acquisition, because no supported client retries a bounded
-            // answer on this route.
-            let acquired = await_cold_miss_acquisition(
-                state.cold_miss.metadata_deadline,
-                pullthrough,
-                repo_type,
-                &repo_id,
-                &revision,
-                "model_info",
-                None,
-            )
-            .await?;
-            let Some(commit) = acquired else {
-                return cold_miss_pending_response(
-                    false,
-                    state.cold_miss.metadata_retry_after_seconds(),
-                );
-            };
-            commit
-        }
-        Err(error) => return Err(status_for_archive_error(error)),
+    let Some(answer) =
+        repository_metadata(&state, repo_type, &repo_id, &revision, "model_info").await?
+    else {
+        return cold_miss_pending_response(false, state.cold_miss.metadata_retry_after_seconds());
     };
-    let manifest = validated_manifest(&state.archive, repo_type, &repo_id, &commit)?;
-    let siblings = manifest["files"]
-        .as_array()
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?
+    let siblings = answer
+        .files
         .iter()
-        .filter_map(|file| file["path"].as_str())
-        .filter(|path| !crate::is_internal_archive_path(path))
-        .map(|path| serde_json::json!({ "rfilename": path }))
+        .map(|file| serde_json::json!({ "rfilename": file.path }))
         .collect::<Vec<_>>();
     Ok(Json(serde_json::json!({
-        "id": repo_id, "sha": commit, "private": false, "downloads": 0,
+        "id": repo_id, "sha": answer.commit, "private": false, "downloads": 0,
         "likes": 0, "tags": [], "siblings": siblings,
     }))
     .into_response())
@@ -419,41 +410,72 @@ async fn repository_tree(
     repo_type: RepositoryType,
 ) -> Result<Response, StatusCode> {
     let repo_id = format!("{namespace}/{repo}");
+    let Some(answer) =
+        repository_metadata(&state, repo_type, &repo_id, &revision, "model_tree").await?
+    else {
+        return cold_miss_pending_response(false, state.cold_miss.metadata_retry_after_seconds());
+    };
+    let files = answer
+        .files
+        .iter()
+        .map(|file| {
+            serde_json::json!({
+                "type": "file",
+                "path": file.path,
+                "size": file.size,
+                "oid": file.oid,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(files).into_response())
+}
+
+/// Answers a repository metadata request, from the archive or from upstream.
+///
+/// Both metadata routes share this, so they cannot drift apart in which
+/// revision they report or where the answer came from. `Ok(None)` means a
+/// configured metadata deadline elapsed with an acquisition still running, and
+/// the caller answers [`cold_miss_pending_response`].
+///
+/// An archived revision is answered from the archive and never contacts upstream
+/// (core invariant 8). A revision the archive does not hold is answered from
+/// upstream's file list **without acquiring it** (Issue 0074), which is what
+/// lets the client's own file filter narrow the first acquisition: the per-file
+/// requests that follow acquire only what the client asks for. Nothing is
+/// written to the archive for such an answer. Only a fetcher that cannot report
+/// upstream's per-file metadata falls back to acquiring the revision and
+/// answering from the archive, because reporting a repository as empty because
+/// it could not be enumerated would be worse than waiting.
+async fn repository_metadata(
+    state: &HttpState,
+    repo_type: RepositoryType,
+    repo_id: &str,
+    revision: &str,
+    request_kind: &'static str,
+) -> Result<Option<RepositoryMetadata>, StatusCode> {
     tracing::info!(
         event = "archive_request",
         repo_type = %repo_type,
-        request_kind = "model_tree",
+        request_kind,
         repo_id = %repo_id,
         requested_revision = %revision,
         "archive request received"
     );
-    let commit = match if is_hf_commit(&revision) {
-        state
-            .archive
-            .revision_path_for_type(repo_type, &repo_id, &revision)
-            .and_then(|path| {
-                if path.is_dir() {
-                    Ok(revision.clone())
-                } else {
-                    Err(ArchiveError::Io(std::io::Error::from(
-                        std::io::ErrorKind::NotFound,
-                    )))
-                }
-            })
-    } else {
-        state
-            .archive
-            .resolve_ref_for_type(repo_type, &repo_id, &revision)
-    } {
+    let commit = match archived_commit(&state.archive, repo_type, repo_id, revision) {
         Ok(commit) => {
-            tracing::info!(event = "archive_hit", request_kind = "model_tree", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %revision, commit = %commit, "archive request served locally");
+            tracing::info!(event = "archive_hit", request_kind, repo_type = %repo_type, repo_id = %repo_id, requested_revision = %revision, commit = %commit, "archive request served locally");
             commit
         }
         Err(ArchiveError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            tracing::info!(event = "archive_miss", request_kind = "model_tree", repo_type = %repo_type, repo_id = %repo_id, requested_revision = %revision, "archive request requires upstream acquisition");
+            tracing::info!(event = "archive_miss", request_kind, repo_type = %repo_type, repo_id = %repo_id, requested_revision = %revision, "archive request requires upstream acquisition");
             let Some(pullthrough) = state.pullthrough.clone() else {
                 return Err(StatusCode::NOT_FOUND);
             };
+            if let Some(metadata) =
+                upstream_metadata(Arc::clone(&pullthrough), repo_type, repo_id, revision).await?
+            {
+                return Ok(Some(RepositoryMetadata::from_upstream(metadata)));
+            }
             // Unbounded by default: a metadata cold miss waits for the
             // acquisition, because no supported client retries a bounded
             // answer on this route.
@@ -461,42 +483,127 @@ async fn repository_tree(
                 state.cold_miss.metadata_deadline,
                 pullthrough,
                 repo_type,
-                &repo_id,
-                &revision,
-                "model_tree",
+                repo_id,
+                revision,
+                request_kind,
                 None,
             )
             .await?;
             let Some(commit) = acquired else {
-                return cold_miss_pending_response(
-                    false,
-                    state.cold_miss.metadata_retry_after_seconds(),
-                );
+                return Ok(None);
             };
             commit
         }
         Err(error) => return Err(status_for_archive_error(error)),
     };
-    let manifest = validated_manifest(&state.archive, repo_type, &repo_id, &commit)?;
-    let files = manifest["files"]
+    archived_metadata(&state.archive, repo_type, repo_id, &commit).map(Some)
+}
+
+/// The commit an archived metadata request resolves to, or a not-found error.
+fn archived_commit(
+    archive: &Archive,
+    repo_type: RepositoryType,
+    repo_id: &str,
+    revision: &str,
+) -> Result<String, ArchiveError> {
+    if is_hf_commit(revision) {
+        let path = archive.revision_path_for_type(repo_type, repo_id, revision)?;
+        if path.is_dir() {
+            Ok(revision.to_string())
+        } else {
+            Err(ArchiveError::Io(std::io::Error::from(
+                std::io::ErrorKind::NotFound,
+            )))
+        }
+    } else {
+        archive.resolve_ref_for_type(repo_type, repo_id, revision)
+    }
+}
+
+/// Upstream's file list for a revision the archive does not hold.
+///
+/// The helper invocation is blocking and owns no staging, so it runs on the
+/// blocking pool and is never gated behind a transfer (ADR-0021 decision 3).
+async fn upstream_metadata(
+    pullthrough: Arc<PullThrough>,
+    repo_type: RepositoryType,
+    repo_id: &str,
+    revision: &str,
+) -> Result<Option<crate::upstream::UpstreamRepositoryFiles>, StatusCode> {
+    let owned_repo_id = repo_id.to_string();
+    let owned_revision = revision.to_string();
+    task::spawn_blocking(move || {
+        pullthrough.upstream_metadata_for_type(repo_type, &owned_repo_id, &owned_revision)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(status_for_pullthrough_error)
+}
+
+/// What the archive reports for a revision it holds.
+///
+/// The answer is the manifest's file set together with the commit's recorded
+/// upstream file list where the revision has one, so a partially archived
+/// revision reports the whole repository instead of presenting its subset as
+/// all there is — which for a sharded model means handing back a model with
+/// shards missing and calling it a successful download. A revision without a
+/// record reports exactly the archived set, as before.
+///
+/// `oid` is, per file and in order: the git object id upstream recorded for that
+/// path, then ModelKeep's own content digest of the bytes it holds — the value
+/// the `resolve` route returns as `ETag` — then nothing. ModelKeep never reports
+/// a digest for bytes it does not hold, and never presents an upstream value as
+/// one it verified. `size` is what ModelKeep will serve when it holds the file.
+fn archived_metadata(
+    archive: &Archive,
+    repo_type: RepositoryType,
+    repo_id: &str,
+    commit: &str,
+) -> Result<RepositoryMetadata, StatusCode> {
+    let manifest = validated_manifest(archive, repo_type, repo_id, commit)?;
+    // An unreadable record is an integrity failure, never a miss and never an
+    // empty repository.
+    let recorded = archive
+        .upstream_files_for_type(repo_type, repo_id, commit)
+        .map_err(status_for_archive_error)?
+        .unwrap_or_default()
+        .into_iter()
+        .map(|file| (file.path.clone(), file))
+        .collect::<BTreeMap<_, _>>();
+    let mut files = BTreeMap::new();
+    for file in manifest["files"]
         .as_array()
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?
-        .iter()
-        .filter(|file| {
-            file["path"]
-                .as_str()
-                .is_some_and(|path| !crate::is_internal_archive_path(path))
-        })
-        .map(|file| {
-            serde_json::json!({
-                "type": "file",
-                "path": file["path"],
-                "size": file["size"],
-                "oid": file["sha256"],
-            })
-        })
-        .collect::<Vec<_>>();
-    Ok(Json(files).into_response())
+    {
+        let path = file["path"]
+            .as_str()
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+        if crate::is_internal_archive_path(path) {
+            continue;
+        }
+        files.insert(
+            path.to_string(),
+            MetadataFile {
+                path: path.to_string(),
+                size: file["size"].as_u64(),
+                oid: recorded
+                    .get(path)
+                    .and_then(|recorded| recorded.blob_id.clone())
+                    .or_else(|| file["sha256"].as_str().map(str::to_string)),
+            },
+        );
+    }
+    for (path, recorded) in &recorded {
+        files.entry(path.clone()).or_insert_with(|| MetadataFile {
+            path: path.clone(),
+            size: recorded.size,
+            oid: recorded.blob_id.clone(),
+        });
+    }
+    Ok(RepositoryMetadata {
+        commit: commit.to_string(),
+        files: files.into_values().collect(),
+    })
 }
 
 fn validated_manifest(
@@ -1691,6 +1798,444 @@ mod tests {
         }
     }
 
+    /// A fetcher that reports upstream's per-file metadata, like the production
+    /// helper, and records everything it was asked to do.
+    struct MetadataFetcher {
+        commit: String,
+        upstream: Vec<(String, Vec<u8>)>,
+        transfers: Arc<Mutex<Vec<Vec<String>>>>,
+        metadata_calls: Arc<std::sync::atomic::AtomicUsize>,
+        metadata_error: Option<UpstreamErrorKind>,
+    }
+
+    impl MetadataFetcher {
+        fn new(commit: &str, upstream: &[(&str, &[u8])]) -> Self {
+            Self {
+                commit: commit.into(),
+                upstream: upstream
+                    .iter()
+                    .map(|(path, bytes)| ((*path).to_string(), bytes.to_vec()))
+                    .collect(),
+                transfers: Arc::new(Mutex::new(Vec::new())),
+                metadata_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                metadata_error: None,
+            }
+        }
+
+        fn failing(commit: &str, kind: UpstreamErrorKind) -> Self {
+            let mut fetcher = Self::new(commit, &[]);
+            fetcher.metadata_error = Some(kind);
+            fetcher
+        }
+
+        /// Upstream's own values: a byte length and a git object id that is
+        /// deliberately not any digest of the content, which is what a real
+        /// non-LFS `blob_id` is.
+        fn reported(&self) -> Vec<crate::UpstreamFile> {
+            self.upstream
+                .iter()
+                .enumerate()
+                .map(|(index, (path, bytes))| crate::UpstreamFile {
+                    path: path.clone(),
+                    size: Some(bytes.len() as u64),
+                    blob_id: Some(format!("{:040x}", 0xb10b0000u64 + index as u64)),
+                    lfs_sha256: None,
+                })
+                .collect()
+        }
+
+        fn error(&self) -> crate::upstream::UpstreamError {
+            match self.metadata_error {
+                Some(UpstreamErrorKind::NotFound) => crate::upstream::UpstreamError::NotFound,
+                Some(UpstreamErrorKind::Unauthorized) => {
+                    crate::upstream::UpstreamError::Unauthorized
+                }
+                _ => crate::upstream::UpstreamError::Unavailable,
+            }
+        }
+    }
+
+    impl crate::upstream::UpstreamFetcher for MetadataFetcher {
+        fn fetch(
+            &self,
+            request: &crate::upstream::FetchRequest,
+        ) -> Result<crate::upstream::FetchedRevision, crate::upstream::UpstreamError> {
+            self.transfers.lock().unwrap().push(request.files.clone());
+            if self.metadata_error.is_some() {
+                return Err(self.error());
+            }
+            let mut files = Vec::new();
+            for (path, bytes) in &self.upstream {
+                if !request.files.is_empty() && !request.files.iter().any(|file| file == path) {
+                    continue;
+                }
+                std::fs::write(request.staging.join(path), bytes).unwrap();
+                files.push(path.clone());
+            }
+            crate::write_staged_upstream_files(
+                &request.staging,
+                request.repo_type,
+                &request.repo_id,
+                &self.commit,
+                &self.reported(),
+            )
+            .unwrap();
+            Ok(crate::upstream::FetchedRevision {
+                commit: self.commit.clone(),
+                files,
+                staging: request.staging.clone(),
+            })
+        }
+
+        fn repository_files(
+            &self,
+            _request: &crate::upstream::InventoryRequest,
+        ) -> Result<Option<crate::upstream::UpstreamRepositoryFiles>, crate::upstream::UpstreamError>
+        {
+            self.metadata_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.metadata_error.is_some() {
+                return Err(self.error());
+            }
+            Ok(Some(crate::upstream::UpstreamRepositoryFiles {
+                commit: self.commit.clone(),
+                files: self.reported(),
+            }))
+        }
+    }
+
+    async fn json_body(response: Response) -> serde_json::Value {
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
+    }
+
+    async fn get(app: &Router, uri: &str) -> Response {
+        app.clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    const METADATA_COMMIT: &str = "cccccccccccccccccccccccccccccccccccccccc";
+
+    /// Issue 0074: the whole point. A metadata request for a revision the archive
+    /// has never seen is answered from upstream's file list, and starts no
+    /// acquisition, so the client's own filter decides what is transferred next.
+    #[tokio::test]
+    async fn metadata_for_an_unarchived_revision_answers_without_acquiring() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        let fetcher = Arc::new(MetadataFetcher::new(
+            METADATA_COMMIT,
+            &[
+                ("config.json", b"cold-http"),
+                ("model-00001-of-00002.safetensors", b"shard-one"),
+            ],
+        ));
+        let transfers = Arc::clone(&fetcher.transfers);
+        let pullthrough = Arc::new(PullThrough::new(archive.clone(), fetcher));
+        let app = router_with_pullthrough(archive.clone(), pullthrough);
+
+        let info = get(&app, "/api/models/org/model/revision/main").await;
+        assert_eq!(info.status(), StatusCode::OK);
+        let info = json_body(info).await;
+        assert_eq!(info["sha"], METADATA_COMMIT);
+        assert_eq!(
+            info["siblings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|sibling| sibling["rfilename"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>(),
+            ["config.json", "model-00001-of-00002.safetensors"]
+        );
+
+        let tree = json_body(get(&app, "/api/models/org/model/tree/main").await).await;
+        assert_eq!(tree[0]["path"], "config.json");
+        assert_eq!(tree[0]["size"], 9);
+        // Upstream's own git object id, which is what the Hub reports here.
+        assert_eq!(tree[0]["oid"], format!("{:040x}", 0xb10b0000u64));
+
+        // No acquisition was started, and nothing was written to the archive:
+        // a metadata answer from upstream never becomes archived state.
+        assert!(transfers.lock().unwrap().is_empty());
+        assert!(!archive
+            .revision_path("org/model", METADATA_COMMIT)
+            .unwrap()
+            .exists());
+        assert!(archive.resolve_ref("org/model", "main").is_err());
+    }
+
+    /// A mutable ref resolved on the metadata route is still learned.
+    ///
+    /// A supported client resolves `main` through metadata and then requests every
+    /// file by commit, so nothing after the metadata request names the ref. The
+    /// archive has to learn the name anyway, or a revision mirrored by an ordinary
+    /// `hf download` would be downloadable only by commit while upstream is
+    /// unavailable (core invariant 8).
+    #[tokio::test]
+    async fn a_ref_resolved_on_the_metadata_route_is_learned_once_a_revision_exists() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        let fetcher = Arc::new(MetadataFetcher::new(
+            METADATA_COMMIT,
+            &[("config.json", b"cold-http")],
+        ));
+        let calls = Arc::clone(&fetcher.metadata_calls);
+        let pullthrough = Arc::new(PullThrough::new(archive.clone(), fetcher));
+        let app = router_with_pullthrough(archive.clone(), pullthrough);
+
+        assert_eq!(
+            get(&app, "/api/models/org/model/revision/main")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        // Answering metadata wrote nothing, so the ref cannot exist yet: it would
+        // name a revision the archive does not have.
+        assert!(archive.resolve_ref("org/model", "main").is_err());
+
+        // The client now asks for the file by commit, as both supported clients do.
+        let file = get(
+            &app,
+            "/org/model/resolve/cccccccccccccccccccccccccccccccccccccccc/config.json",
+        )
+        .await;
+        assert_eq!(file.status(), StatusCode::OK);
+
+        assert_eq!(
+            archive.resolve_ref("org/model", "main").unwrap(),
+            METADATA_COMMIT
+        );
+        // And the name now answers from the archive, without upstream.
+        let observed = calls.load(std::sync::atomic::Ordering::SeqCst);
+        let info = json_body(get(&app, "/api/models/org/model/revision/main").await).await;
+        assert_eq!(info["sha"], METADATA_COMMIT);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), observed);
+    }
+
+    /// Issue 0074 acceptance: an unarchived revision whose upstream cannot be
+    /// reached fails in a way an operator can classify, and publishes nothing.
+    #[tokio::test]
+    async fn an_unarchived_metadata_request_reports_an_unreachable_upstream() {
+        for (kind, expected) in [
+            (UpstreamErrorKind::Unavailable, StatusCode::BAD_GATEWAY),
+            (UpstreamErrorKind::NotFound, StatusCode::NOT_FOUND),
+            (UpstreamErrorKind::Unauthorized, StatusCode::UNAUTHORIZED),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let archive = Archive::new(directory.path()).unwrap();
+            let fetcher = Arc::new(MetadataFetcher::failing(METADATA_COMMIT, kind));
+            let pullthrough = Arc::new(PullThrough::new(archive.clone(), fetcher));
+            let app = router_with_pullthrough(archive.clone(), pullthrough);
+
+            for uri in [
+                "/api/models/org/model/revision/main",
+                "/api/models/org/model/tree/main",
+            ] {
+                let response = get(&app, uri).await;
+                assert_eq!(response.status(), expected, "{uri}");
+                // No fabricated metadata: the body is not a file list.
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let body = String::from_utf8_lossy(&body).into_owned();
+                assert!(!body.contains("rfilename"), "{uri}: {body}");
+                assert!(!body.contains("config.json"), "{uri}: {body}");
+            }
+            assert!(!archive
+                .revision_path("org/model", METADATA_COMMIT)
+                .unwrap()
+                .exists());
+        }
+    }
+
+    /// Core invariant 8, with a recorded file list in place: an archived revision
+    /// answers metadata from the archive and never consults upstream.
+    #[tokio::test]
+    async fn an_archived_revision_answers_metadata_without_contacting_upstream() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        archive
+            .publish_revision(crate::PublishRequest {
+                repo_id: "org/model".into(),
+                requested_revision: "main".into(),
+                commit: METADATA_COMMIT.into(),
+                files: vec![crate::ArchiveFile {
+                    path: "config.json".into(),
+                    bytes: b"archived".to_vec(),
+                }],
+            })
+            .unwrap();
+        archive
+            .update_ref("org/model", "main", METADATA_COMMIT)
+            .unwrap();
+        archive
+            .record_upstream_files_for_type(
+                RepositoryType::Model,
+                "org/model",
+                METADATA_COMMIT,
+                &[crate::UpstreamFile {
+                    path: "config.json".into(),
+                    size: Some(8),
+                    blob_id: Some("d".repeat(40)),
+                    lfs_sha256: None,
+                }],
+            )
+            .unwrap();
+        let fetcher = Arc::new(MetadataFetcher::failing(
+            METADATA_COMMIT,
+            UpstreamErrorKind::Unavailable,
+        ));
+        let calls = Arc::clone(&fetcher.metadata_calls);
+        let transfers = Arc::clone(&fetcher.transfers);
+        let pullthrough = Arc::new(PullThrough::new(archive.clone(), fetcher));
+        let app = router_with_pullthrough(archive, pullthrough);
+
+        for uri in [
+            "/api/models/org/model/revision/main",
+            "/api/models/org/model/tree/main",
+            "/api/models/org/model/revision/cccccccccccccccccccccccccccccccccccccccc",
+        ] {
+            assert_eq!(get(&app, uri).await.status(), StatusCode::OK, "{uri}");
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(transfers.lock().unwrap().is_empty());
+    }
+
+    /// Issue 0074: a partially archived revision stops presenting its subset as
+    /// the whole repository, which for a sharded model means handing back a model
+    /// with shards missing and calling it a successful download. The path it does
+    /// not hold is reported, and requesting it extends the same revision.
+    #[tokio::test]
+    async fn a_partially_archived_revision_reports_the_files_it_does_not_hold() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        let fetcher = Arc::new(MetadataFetcher::new(
+            METADATA_COMMIT,
+            &[
+                ("config.json", b"cold-http"),
+                ("model-00001-of-00002.safetensors", b"shard-one"),
+            ],
+        ));
+        let reported = fetcher.reported();
+        let transfers = Arc::clone(&fetcher.transfers);
+        let pullthrough = Arc::new(PullThrough::new(archive.clone(), fetcher));
+        let app = router_with_pullthrough(archive.clone(), pullthrough);
+
+        // One file is requested, so one file is archived (Issue 0070).
+        let file = get(&app, "/org/model/resolve/main/config.json").await;
+        assert_eq!(file.status(), StatusCode::OK);
+        assert_eq!(transfers.lock().unwrap().clone(), vec![vec!["config.json"]]);
+
+        let tree = json_body(get(&app, "/api/models/org/model/tree/main").await).await;
+        let entries = tree.as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1]["path"], "model-00001-of-00002.safetensors");
+        // The size and object id upstream recorded, for a file the archive does
+        // not hold. No digest is claimed for bytes ModelKeep does not have.
+        assert_eq!(entries[1]["size"], 9);
+        assert_eq!(entries[1]["oid"], reported[1].blob_id.clone().unwrap());
+
+        // Requesting the reported path extends the same revision.
+        let shard = get(
+            &app,
+            "/org/model/resolve/main/model-00001-of-00002.safetensors",
+        )
+        .await;
+        assert_eq!(shard.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(shard.into_body(), usize::MAX).await.unwrap(),
+            "shard-one"
+        );
+        assert_eq!(
+            archive.list_revisions("org/model").unwrap(),
+            vec![METADATA_COMMIT.to_string()]
+        );
+        assert_eq!(
+            transfers.lock().unwrap().clone(),
+            vec![
+                vec!["config.json"],
+                vec!["model-00001-of-00002.safetensors"]
+            ]
+        );
+    }
+
+    /// A revision published before the upstream file list was recorded, or
+    /// imported from a client cache, keeps answering exactly the archived set.
+    /// Nothing migrates it, and nothing about it fails.
+    #[tokio::test]
+    async fn a_revision_without_a_recorded_file_list_reports_the_archived_set() {
+        let (app, directory) = test_router();
+        let archive = Archive::open_read_only(directory.path()).unwrap();
+        let commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assert!(archive
+            .upstream_files_for_type(RepositoryType::Model, "org/model", commit)
+            .unwrap()
+            .is_none());
+
+        let info = json_body(get(&app, "/api/models/org/model/revision/main").await).await;
+        assert_eq!(
+            info["siblings"].as_array().unwrap().len(),
+            1,
+            "only the archived set"
+        );
+        let tree = json_body(get(&app, "/api/models/org/model/tree/main").await).await;
+        assert_eq!(tree.as_array().unwrap().len(), 1);
+        assert_eq!(tree[0]["path"], "config.json");
+        assert_eq!(tree[0]["size"], 10);
+        // Without a recorded upstream value, `oid` is ModelKeep's own content
+        // digest: the value the `resolve` route returns as `ETag`.
+        let digest = tree[0]["oid"].as_str().unwrap().to_string();
+        let file = get(&app, "/org/model/resolve/main/config.json").await;
+        assert_eq!(file.headers()[header::ETAG], format!("\"{digest}\""));
+    }
+
+    /// The documented meaning of a tree `oid`, pinned against `resolve`.
+    ///
+    /// Where the revision has a recorded upstream file list, `oid` is upstream's
+    /// git object id for the commit — a fact about the commit, not a digest
+    /// ModelKeep verified — and is unrelated to the `ETag`. Where it has none,
+    /// `oid` is ModelKeep's content digest and equals the `ETag` exactly.
+    #[tokio::test]
+    async fn the_tree_object_id_is_upstreams_where_recorded_and_ours_otherwise() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        let fetcher = Arc::new(MetadataFetcher::new(
+            METADATA_COMMIT,
+            &[("config.json", b"cold-http")],
+        ));
+        let blob_id = fetcher.reported()[0].blob_id.clone().unwrap();
+        let pullthrough = Arc::new(PullThrough::new(archive.clone(), fetcher));
+        let app = router_with_pullthrough(archive.clone(), pullthrough);
+
+        assert_eq!(
+            get(&app, "/org/model/resolve/main/config.json")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let tree = json_body(get(&app, "/api/models/org/model/tree/main").await).await;
+        assert_eq!(tree[0]["oid"], blob_id);
+        let file = get(&app, "/org/model/resolve/main/config.json").await;
+        let etag = file.headers()[header::ETAG].to_str().unwrap().to_string();
+        assert_eq!(etag, format!("\"{}\"", crate::sha256(b"cold-http")));
+        assert_ne!(etag.trim_matches('"'), blob_id);
+
+        // The same revision without its record answers the older way.
+        std::fs::remove_file(
+            archive
+                .revision_path("org/model", METADATA_COMMIT)
+                .unwrap()
+                .join(crate::UPSTREAM_FILES_FILE),
+        )
+        .unwrap();
+        let tree = json_body(get(&app, "/api/models/org/model/tree/main").await).await;
+        assert_eq!(tree[0]["oid"], etag.trim_matches('"'));
+    }
+
     #[tokio::test]
     async fn cold_miss_fetches_then_serves_mutable_revision() {
         let directory = tempfile::tempdir().unwrap();
@@ -2341,10 +2886,6 @@ mod tests {
         "/api/models/org/model/revision/main",
         "/api/models/org/model/tree/main",
     ];
-
-    async fn json_body(response: Response) -> serde_json::Value {
-        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
-    }
 
     /// The shipped default: a metadata cold miss waits for the acquisition.
     ///

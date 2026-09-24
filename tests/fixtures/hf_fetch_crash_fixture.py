@@ -11,9 +11,28 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--repo-id", required=True)
 parser.add_argument("--repo-type", choices=("model", "dataset"), default="model")
 parser.add_argument("--revision", required=True)
-parser.add_argument("--output", required=True)
+parser.add_argument("--output")
 parser.add_argument("--file", action="append")
+parser.add_argument("--exclude", action="append")
+parser.add_argument("--resolve-only", action="store_true", dest="resolve_only")
 args = parser.parse_args()
+
+if args.resolve_only:
+    # Deliberately reports no `repository_files`: this is a helper that cannot
+    # report upstream's per-file metadata, so a metadata request falls back to
+    # acquiring the revision and answering from the archive. That fallback is what
+    # this fixture's crash harness drives through the metadata route.
+    print(
+        json.dumps(
+            {"type": "result", "commit": "c" * 40, "files": ["partial.bin"]},
+            separators=(",", ":"),
+        ),
+        flush=True,
+    )
+    raise SystemExit(0)
+
+if not args.output:
+    parser.error("--output is required unless --resolve-only is given")
 
 output = Path(args.output)
 output.mkdir(parents=True, exist_ok=True)
