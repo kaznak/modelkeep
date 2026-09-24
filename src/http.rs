@@ -661,19 +661,32 @@ async fn file_response(
         None => (StatusCode::OK, 0, size.saturating_sub(1)),
     };
     let content_length = if size == 0 { 0 } else { end - start + 1 };
+    // The validator is the file's recorded content digest, not a value derived
+    // from its identity plus its length (Issue 0078). `huggingface_hub` names
+    // each blob in its cache after this value, so two files of equal size and
+    // different bytes sharing one validator makes the client store one file's
+    // bytes under both paths. A digest cannot collide unless the bytes are the
+    // same, in which case sharing the blob is correct and is what the Hub does
+    // with an LFS `oid`. Both pinned clients accept the digest in `ETag` alone
+    // and need no `x-linked-etag`; see
+    // `docs/observations/hugging-face-content-validator-2026-09-24.md`.
+    let etag = format!("\"{}\"", resolved.sha256);
     let mut response = Response::builder()
         .status(status)
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::CONTENT_LENGTH, content_length)
-        .header(header::ETAG, format!("\"{resolved_commit}-{size}\""))
+        .header(header::ETAG, &etag)
         .header("x-repo-commit", &resolved_commit);
     if let Some(ByteRange { start, end }) = range {
         response = response.header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{size}"));
     }
+    // Compared against the same content-derived value, so a `304` states that
+    // the client holds these bytes rather than merely a file of this length in
+    // this revision.
     if headers
         .get(header::IF_NONE_MATCH)
         .and_then(|value| value.to_str().ok())
-        == Some(format!("\"{resolved_commit}-{size}\"").as_str())
+        == Some(etag.as_str())
     {
         return response
             .status(StatusCode::NOT_MODIFIED)
@@ -1350,6 +1363,50 @@ mod tests {
         assert!(output.contains("config.json"));
     }
 
+    /// The validator a response must carry for `bytes`: its content digest,
+    /// quoted as a strong ETag.
+    fn content_validator(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        format!("\"{:x}\"", sha2::Sha256::digest(bytes))
+    }
+
+    async fn validator_of(app: &Router, uri: &str) -> String {
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response.headers()[header::ETAG].to_str().unwrap().into()
+    }
+
+    /// A router over one revision holding `files`, so a test can choose the
+    /// lengths and the bytes independently of each other.
+    fn router_over(files: &[(&str, &[u8])]) -> (Router, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        archive
+            .publish_revision(crate::PublishRequest {
+                repo_id: "org/shards".into(),
+                requested_revision: "main".into(),
+                commit: "dddddddddddddddddddddddddddddddddddddddd".into(),
+                files: files
+                    .iter()
+                    .map(|(path, bytes)| crate::ArchiveFile {
+                        path: (*path).into(),
+                        bytes: bytes.to_vec(),
+                    })
+                    .collect(),
+            })
+            .unwrap();
+        (router(archive), directory)
+    }
+
     #[tokio::test]
     async fn returns_not_modified_for_matching_etag() {
         let (app, _directory) = test_router();
@@ -1357,10 +1414,7 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .uri("/org/model/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/config.json")
-                    .header(
-                        header::IF_NONE_MATCH,
-                        "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-10\"",
-                    )
+                    .header(header::IF_NONE_MATCH, content_validator(b"0123456789"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1369,7 +1423,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
         assert_eq!(
             response.headers()[header::ETAG],
-            "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-10\""
+            content_validator(b"0123456789")
         );
         assert_eq!(
             to_bytes(response.into_body(), usize::MAX)
@@ -1377,6 +1431,162 @@ mod tests {
                 .unwrap()
                 .len(),
             0
+        );
+    }
+
+    /// Issue 0078. Two files of one length and different bytes must not share a
+    /// validator, because `huggingface_hub` names a cached blob after it and
+    /// would then hold one file's bytes under both paths.
+    #[tokio::test]
+    async fn equal_length_files_are_served_with_distinct_validators() {
+        let first = b"MODELKEEP-COLLISION-SHARD-1";
+        let second = b"MODELKEEP-COLLISION-SHARD-2";
+        assert_eq!(first.len(), second.len());
+        let (app, _directory) = router_over(&[
+            ("model-00001-of-00002.safetensors", first),
+            ("model-00002-of-00002.safetensors", second),
+        ]);
+        let base = "/org/shards/resolve/dddddddddddddddddddddddddddddddddddddddd";
+        let first_validator =
+            validator_of(&app, &format!("{base}/model-00001-of-00002.safetensors")).await;
+        let second_validator =
+            validator_of(&app, &format!("{base}/model-00002-of-00002.safetensors")).await;
+        assert_ne!(first_validator, second_validator);
+        // Distinctness alone would also be satisfied by a value derived from
+        // the path, which would break deduplication; the validator has to *be*
+        // the content digest.
+        assert_eq!(first_validator, content_validator(first));
+        assert_eq!(second_validator, content_validator(second));
+    }
+
+    /// Issue 0078, the other half of the contract. Byte-identical files share a
+    /// validator on purpose: a client that stores one blob for both is correct,
+    /// and is doing what the Hub does with an LFS `oid`. Do not "fix" this into
+    /// per-path validators to make collisions impossible by construction.
+    #[tokio::test]
+    async fn byte_identical_files_share_one_validator() {
+        let payload = b"MODELKEEP-IDENTICAL-PAYLOAD";
+        let (app, _directory) = router_over(&[
+            ("duplicate-one.json", payload),
+            ("duplicate-two.json", payload),
+        ]);
+        let base = "/org/shards/resolve/dddddddddddddddddddddddddddddddddddddddd";
+        let first = validator_of(&app, &format!("{base}/duplicate-one.json")).await;
+        let second = validator_of(&app, &format!("{base}/duplicate-two.json")).await;
+        assert_eq!(first, second);
+        assert_eq!(first, content_validator(payload));
+    }
+
+    /// Issue 0078. Every manifest this implementation can read records a digest
+    /// for every file, because the field is required to deserialize at all. A
+    /// manifest without one therefore fails closed: the file is not served, and
+    /// in particular is not served with a validator synthesised from something
+    /// other than its content.
+    #[tokio::test]
+    async fn a_manifest_without_a_recorded_digest_is_not_served() {
+        let (app, directory) = test_router();
+        let manifest_path = directory
+            .path()
+            .join("models/org/model/revisions")
+            .join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .join(".modelkeep-manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["files"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("sha256");
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/org/model/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/config.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(response.headers().get(header::ETAG).is_none());
+    }
+
+    /// Issue 0078. A `304` must mean "you hold these bytes", so another file's
+    /// validator cannot satisfy the condition even at the same length in the
+    /// same revision.
+    #[tokio::test]
+    async fn if_none_match_from_another_file_is_not_a_match() {
+        let first = b"MODELKEEP-COLLISION-SHARD-1";
+        let second = b"MODELKEEP-COLLISION-SHARD-2";
+        let (app, _directory) = router_over(&[
+            ("model-00001-of-00002.safetensors", first),
+            ("model-00002-of-00002.safetensors", second),
+        ]);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(concat!(
+                        "/org/shards/resolve/",
+                        "dddddddddddddddddddddddddddddddddddddddd",
+                        "/model-00002-of-00002.safetensors"
+                    ))
+                    .header(header::IF_NONE_MATCH, content_validator(first))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::ETAG], content_validator(second));
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+            second.as_slice()
+        );
+    }
+
+    /// Issue 0078. A client validates and ranges over the same identity, so a
+    /// `HEAD` and a partial response must advertise the whole file's validator.
+    #[tokio::test]
+    async fn head_and_range_carry_the_full_response_validator() {
+        let payload = b"MODELKEEP-COLLISION-SHARD-1";
+        let (app, _directory) = router_over(&[("model-00001-of-00002.safetensors", payload)]);
+        let uri = concat!(
+            "/org/shards/resolve/",
+            "dddddddddddddddddddddddddddddddddddddddd",
+            "/model-00001-of-00002.safetensors"
+        );
+        let whole = validator_of(&app, uri).await;
+        assert_eq!(whole, content_validator(payload));
+
+        let head = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("HEAD")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_eq!(head.headers()[header::ETAG], whole);
+
+        let partial = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(uri)
+                    .header(header::RANGE, "bytes=0-4")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(partial.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(partial.headers()[header::ETAG], whole);
+        assert_eq!(
+            to_bytes(partial.into_body(), usize::MAX).await.unwrap(),
+            b"MODEL".as_slice()
         );
     }
 
@@ -1393,9 +1603,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        // The resolved commit stays the revision identity in `x-repo-commit`;
+        // the validator is the content digest and so does not carry it
+        // (Issue 0078).
         assert_eq!(
             response.headers()[header::ETAG],
-            "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-10\""
+            content_validator(b"0123456789")
         );
         assert_eq!(
             response.headers()["x-repo-commit"],

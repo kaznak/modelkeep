@@ -120,6 +120,14 @@ pub type ArchiveResult<T> = Result<T, ArchiveError>;
 pub struct ResolvedFile {
     pub path: PathBuf,
     pub size: u64,
+    /// The content digest the manifest recorded for this file when the revision
+    /// was published.
+    ///
+    /// Carried here so a serving route can advertise a validator that *is* the
+    /// fingerprint of the bytes (Issue 0078). The manifest requires the digest
+    /// for every entry, so a revision that lacks one cannot be read at all and
+    /// can never reach a response with a synthesised validator instead.
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1635,13 +1643,13 @@ impl Archive {
                 "revision is not complete".into(),
             ));
         }
-        if !manifest
+        let Some(entry) = manifest
             .files
             .iter()
-            .any(|entry| entry.path == relative_path)
-        {
+            .find(|entry| entry.path == relative_path)
+        else {
             return Err(io::Error::new(io::ErrorKind::NotFound, "archive file not found").into());
-        }
+        };
         let revision_root = fs::canonicalize(&revision)?;
         let candidate = fs::canonicalize(revision.join(relative))?;
         if !candidate.starts_with(&revision_root) || !candidate.is_file() {
@@ -1650,6 +1658,7 @@ impl Archive {
         Ok(ResolvedFile {
             size: fs::metadata(&candidate)?.len(),
             path: candidate,
+            sha256: entry.sha256.clone(),
         })
     }
 

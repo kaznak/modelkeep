@@ -169,7 +169,8 @@
                 ${self.packages.${pkgs.stdenv.hostPlatform.system}.modelkeep}/bin/modelkeep \
                 ${./tests/fixtures/hf_fetch_fixture.py} \
                 ${hfClient.version} \
-                ${./upstream/hf_fetch.py}
+                ${./upstream/hf_fetch.py} \
+                ${./tests/fixtures/hf_fetch_collision_fixture.py}
               touch $out
             '';
         in {

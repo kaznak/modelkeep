@@ -216,6 +216,57 @@ waits for that transfer before its own begins, and the `resolve` deadline above 
 bounds how long it waits before answering `503`. Nothing about the archived path changes:
 an already archived file is served immediately regardless of what is transferring.
 
+## File validators are content digests
+
+A file response on the `resolve` routes carries an `ETag` that is the sha256 of the
+file's bytes, quoted, and nothing else:
+
+```http
+ETag: "73ce509c5365f1acd906cce8d6e9339aa2b7b055507cf84fcde50bc97c8a2798"
+```
+
+It is the same digest the `tree` route reports as that file's `oid`. The whole
+response, a `HEAD`, and a `206` for a byte range all carry the digest of the **whole
+file**, and `If-None-Match` is compared against that same value, so a `304` means the
+caller holds these bytes rather than merely a file of this length in this revision. No
+`x-linked-etag` is sent; the supported clients accept the digest in `ETag` alone. The
+measurement behind this shape, for both pinned client versions, is
+[`docs/observations/hugging-face-content-validator-2026-09-24.md`](observations/hugging-face-content-validator-2026-09-24.md).
+
+Two consequences follow, and both are intended:
+
+- **Files with identical bytes carry the same validator and are allowed to share it.**
+  `huggingface_hub` names each blob in its cache after the validator, so it stores one
+  blob and links both paths to it. That is correct — it is how the Hub deduplicates LFS
+  objects by `oid` — and it is not a collision to be removed.
+- **Files with different bytes can never share a validator**, whatever their lengths.
+  This is the point of the change: a validator that mixed the commit with the file's
+  length was shared by every file of one length in a revision, which is the normal case
+  for sharded weights, and a client then stored one shard's bytes under several shards'
+  paths while reporting success.
+
+### Upgrading from a deployment that advertised `"{commit}-{size}"`
+
+Releases up to and including v0.4.8 advertised a validator derived from the commit and
+the file length. Two things follow for clients, both measured against both supported
+versions:
+
+- A client that needs a file again re-downloads it even though it believes it already
+  has it, because the blob it holds is named after the old validator. **This is the
+  correct outcome**: what it holds may be another file's bytes. It costs one transfer
+  per file from ModelKeep's archive, not from upstream.
+- A client that already holds a **complete** snapshot of that commit does not
+  revalidate at all — no `HEAD`, no `GET` — so a cache that is already corrupt stays
+  corrupt and stays silent. **A server-side fix does not repair client caches.** Any
+  cache that downloaded a sharded repository from an older deployment has to be deleted
+  and re-downloaded. Compare the number of symlinks under `snapshots/` with the number
+  of distinct files under `blobs/` — or run `du` on `blobs/` — to detect it; `ls -lL`
+  and `find -L -type l` both pass on a corrupt tree, because they resolve the shared
+  blob repeatedly.
+
+The archive itself is unaffected: ModelKeep reads the digest each revision's manifest
+already records, so no revision is re-acquired.
+
 ## Health and compatibility routes
 
 The download origin provides unauthenticated service probes:

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import contextlib
+import hashlib
+import importlib.util
 import json
 import os
 import socket
@@ -8,6 +10,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -19,6 +22,7 @@ from huggingface_hub.errors import HfHubHTTPError
 
 COMMIT = "a" * 40
 REPO_ID = "org/model"
+COLLISION_REPO_ID = "org/shards"
 COLD_MISS_REPO_ID = "org/cold-miss"
 METADATA_REPO_ID = "org/metadata-wait"
 ADMIN_TOKEN = "modelkeep-hf-client-integration-admin-token"
@@ -306,11 +310,208 @@ def assert_selected_subset_is_acquired_and_served(binary, root, actual_helper, p
         assert (whole / "tokenizer.json").read_bytes() == b'{"version":"1.0"}'
 
 
+def load_module(path):
+    specification = importlib.util.spec_from_file_location(path.stem, path)
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
+def archived_digests(archive, repo_id, commit):
+    """The digests the archive itself recorded, as the comparison of record.
+
+    Comparing a download against the fixture's own bytes would only prove the
+    client and the fixture agree. The archive is the durable state a client is
+    entitled to receive, so its manifest is what a downloaded file is checked
+    against.
+    """
+    namespace, repo = repo_id.split("/")
+    manifest = json.loads(
+        (
+            archive
+            / "models"
+            / namespace
+            / repo
+            / "revisions"
+            / commit
+            / ".modelkeep-manifest.json"
+        ).read_text()
+    )
+    return {entry["path"]: entry["sha256"] for entry in manifest["files"]}
+
+
+def resolve_headers(endpoint, repo_id, commit, path, method="HEAD", headers=None):
+    request = urllib.request.Request(
+        f"{endpoint}/{repo_id}/resolve/{commit}/{path}",
+        method=method,
+        headers=headers or {},
+    )
+    try:
+        with urllib.request.urlopen(request) as response:
+            return response.status, response.headers, response.read()
+    except urllib.error.HTTPError as error:
+        # A `304` reaches the caller as an error object; its headers are the
+        # ones under test, so it is an observation rather than a failure.
+        return error.status, error.headers, error.read()
+
+
+def assert_content_derived_validators_keep_shards_distinct(
+    binary, collision_fixture, root
+):
+    """Issue 0078, black-box against a real supported client.
+
+    `huggingface_hub` names every blob in its cache after the validator the
+    server advertised, so a validator two different files can share makes the
+    client store one file's bytes under both paths, report success, and get the
+    file count and the byte total right. The fixture revision holds four equally
+    sized shards with different bytes, which is what sharded weights look like,
+    plus two byte-identical files.
+
+    Both halves of the contract are asserted, because they pull in opposite
+    directions:
+
+    * different bytes must never share a validator, and every downloaded file
+      must match the digest **the archive recorded**, compared as a digest and
+      not as a length;
+    * identical bytes are *expected* to share one validator and one blob. That
+      is correct, and matches how the Hub deduplicates LFS objects by `oid`. A
+      later change must not "fix" the collision by making validators unique per
+      path, which would break this.
+    """
+    fixture = load_module(collision_fixture)
+    commit = fixture.COMMIT
+    archive = root / "collision-archive"
+    cache = root / "collision-cache"
+    with server(binary, archive, collision_fixture) as endpoint:
+        snapshot_download(
+            repo_id=COLLISION_REPO_ID,
+            revision="main",
+            endpoint=endpoint,
+            cache_dir=str(cache),
+        )
+        recorded = archived_digests(archive, COLLISION_REPO_ID, commit)
+        assert sorted(recorded) == sorted(fixture.payloads()), recorded
+
+        snapshot = (
+            cache
+            / f"models--{COLLISION_REPO_ID.replace('/', '--')}"
+            / "snapshots"
+            / commit
+        )
+        # Verified by digest, not by size: a client that stored one shard's
+        # bytes under another shard's path has the right file count and the
+        # right byte total, which is exactly why this defect was silent.
+        corrupt = sorted(
+            path
+            for path, digest in recorded.items()
+            if hashlib.sha256((snapshot / path).read_bytes()).hexdigest() != digest
+        )
+        assert not corrupt, f"downloaded bytes differ from the archive: {corrupt}"
+
+        blobs = {}
+        for path, digest in sorted(recorded.items()):
+            blobs[path] = os.path.realpath(snapshot / path)
+            # The client named the blob after the advertised validator, which is
+            # why the validator has to be the content fingerprint.
+            assert Path(blobs[path]).name == digest, (path, blobs[path])
+
+        shards = [
+            fixture.shard_name(index) for index in range(1, fixture.SHARD_COUNT + 1)
+        ]
+        assert len({recorded[shard] for shard in shards}) == len(shards), recorded
+        assert len({blobs[shard] for shard in shards}) == len(shards), blobs
+        # Equal size, different bytes: the collision this fixture exists for.
+        assert len({len(fixture.payloads()[shard]) for shard in shards}) == 1
+
+        # Byte-identical files share one validator and therefore one blob. This
+        # is the correct outcome, not a collision to be removed.
+        assert blobs["duplicate-one.json"] == blobs["duplicate-two.json"], blobs
+        assert recorded["duplicate-one.json"] == recorded["duplicate-two.json"]
+        assert len(set(blobs.values())) == len(recorded) - 1, blobs
+
+        # The advertised validator is the recorded digest, on the whole
+        # response, on `HEAD`, and on a partial response.
+        first, second = shards[0], shards[1]
+        expected = f'"{recorded[first]}"'
+        status, headers, _ = resolve_headers(
+            endpoint, COLLISION_REPO_ID, commit, first, method="HEAD"
+        )
+        assert status == 200
+        assert headers["ETag"] == expected, headers
+        assert headers.get("x-linked-etag") is None, headers
+        status, headers, body = resolve_headers(
+            endpoint, COLLISION_REPO_ID, commit, first, method="GET"
+        )
+        assert status == 200
+        assert headers["ETag"] == expected, headers
+        assert hashlib.sha256(body).hexdigest() == recorded[first]
+        status, headers, body = resolve_headers(
+            endpoint,
+            COLLISION_REPO_ID,
+            commit,
+            first,
+            method="GET",
+            headers={"Range": "bytes=0-31"},
+        )
+        assert status == 206
+        assert headers["ETag"] == expected, headers
+        assert len(body) == 32
+
+        # One file's validator must not validate another file, however equal
+        # their lengths.
+        status, headers, body = resolve_headers(
+            endpoint,
+            COLLISION_REPO_ID,
+            commit,
+            second,
+            method="GET",
+            headers={"If-None-Match": expected},
+        )
+        assert status == 200, (status, headers)
+        assert headers["ETag"] == f'"{recorded[second]}"', headers
+        assert hashlib.sha256(body).hexdigest() == recorded[second]
+        status, headers, _ = resolve_headers(
+            endpoint,
+            COLLISION_REPO_ID,
+            commit,
+            second,
+            method="GET",
+            headers={"If-None-Match": f'"{recorded[second]}"'},
+        )
+        assert status == 304, (status, headers)
+
+    # The archived revision is served from what the manifest already records, so
+    # a revision published before this change needs no re-acquisition: upstream
+    # is unavailable here (no helper, no HF_ENDPOINT) and the download still
+    # reproduces every recorded digest.
+    offline_logs = []
+    with server(binary, archive, captured_logs=offline_logs) as endpoint:
+        offline_cache = root / "collision-offline-cache"
+        snapshot_download(
+            repo_id=COLLISION_REPO_ID,
+            revision=commit,
+            endpoint=endpoint,
+            cache_dir=str(offline_cache),
+        )
+        snapshot = (
+            offline_cache
+            / f"models--{COLLISION_REPO_ID.replace('/', '--')}"
+            / "snapshots"
+            / commit
+        )
+        for path, digest in sorted(recorded.items()):
+            actual = hashlib.sha256((snapshot / path).read_bytes()).hexdigest()
+            assert actual == digest, (path, actual, digest)
+    assert '"event":"archive_miss"' not in offline_logs[0], offline_logs[0]
+    assert '"event":"acquisition' not in offline_logs[0], offline_logs[0]
+
+
 def main():
     binary = Path(sys.argv[1])
     helper = Path(sys.argv[2])
     expected_version = sys.argv[3]
     actual_helper = Path(sys.argv[4])
+    collision_fixture = Path(sys.argv[5])
     assert huggingface_hub_version == expected_version, (
         f"expected huggingface_hub {expected_version}, got {huggingface_hub_version}"
     )
@@ -447,6 +648,9 @@ def main():
                     for relative, expected in expected_payloads.items():
                         assert (actual / relative).read_bytes() == expected
 
+            assert_content_derived_validators_keep_shards_distinct(
+                binary, collision_fixture, root
+            )
             assert_cold_miss_deadline_is_retried_by_the_client(binary, helper, root)
             assert_selected_subset_is_acquired_and_served(
                 binary, root, actual_helper, archive
