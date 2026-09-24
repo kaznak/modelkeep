@@ -1,6 +1,6 @@
 ---
 status: open
-priority: P2
+priority: P1
 related_adrs:
   - ADR-0020
   - ADR-0005
@@ -11,7 +11,7 @@ updated: 2026-09-24
 # Issue 0074: Answer repository metadata without acquiring the repository
 
 - Status: Open
-- Priority: P2
+- Priority: P1
 - Related ADR: ADR-0020, ADR-0005
 
 ## Objective
@@ -53,6 +53,34 @@ every file the archive does not hold. That is acceptable only because Issue 0076
 running acquisition cancellable, which turns a forgotten `--include` from days of
 saturated uplink into the minutes before someone notices. **This issue depends on Issue
 0076.**
+
+### What upstream already gives us
+
+Verified against the pinned `huggingface_hub` 1.27.0 on 2026-09-24. A single
+`repo_info(..., files_metadata=True)` returns, per file:
+
+| field | meaning |
+| --- | --- |
+| `rfilename` | the path |
+| `size` | the byte length |
+| `blob_id` | the git blob hash — **what upstream serves as `ETag` for a non-LFS file** |
+| `lfs.sha256` | the LFS object digest — **what upstream serves as `x-linked-etag`** |
+
+`hf_fetch.py` already makes exactly that call while resolving a revision, and discards
+everything but the commit. So the upstream file list and both kinds of upstream validator
+are available from a call ModelKeep already pays for.
+
+That makes this issue and Issue 0078 one mechanism rather than two. Recording this
+per-file metadata gives Issue 0074 the file list it needs to answer metadata without
+acquiring, and gives Issue 0078 the faithful validator to serve — the same value the real
+Hub would return for that file, chosen by the same rule. It also removes the upstream
+round trip from Issue 0070's reconciliation, which becomes a local set operation, and it
+is the prerequisite for letting the official client skip already-archived files by its own
+bookkeeping instead of ModelKeep subtracting sets at all.
+
+Note that `snapshot_download(dry_run=True)` is **not** a substitute: its `DryRunFileInfo`
+carries `commit_hash`, `file_size`, `filename`, `is_cached` and `will_download`, and no
+validator of any kind.
 
 Points to settle before implementing:
 
