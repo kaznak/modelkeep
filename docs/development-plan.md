@@ -556,7 +556,9 @@ services:
       - /share/Services/modelkeep:/data
 
     tmpfs:
-      - /tmp
+      # mode を明示しないと root 所有の 0755 で mount され、10001 で走る本 container は
+      # HF_HOME を作れず Xet 転送が全て EACCES で落ちる（Issue 0086）。
+      - /tmp:mode=1777
 
     cap_drop:
       - ALL
@@ -568,6 +570,9 @@ services:
 新規archive shareでは初期化用Applicationの終了コード`0`を確認して削除した後、
 通常運用Applicationを作成する。同じarchiveを使う通常のimage更新では初期化を
 再実行しない。
+
+上は抜粋であり、`environment` を含む正典は repository の `compose.yaml` である
+（`HF_HOME` と `HF_XET_CACHE` の設定理由はそちらの comment に書いてある）。
 
 要件:
 

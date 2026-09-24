@@ -327,6 +327,17 @@
             test "$(yq -r '.services.modelkeep.read_only' ${./compose.yaml})" = "true"
             test "$(yq -r '.services.modelkeep.cap_drop[0]' ${./compose.yaml})" = "ALL"
             test "$(yq -r '.services.modelkeep.cap_add // "none"' ${./compose.yaml})" = "none"
+            # The delegated Hugging Face client needs somewhere to write. Docker mounts a
+            # tmpfs root-owned 0755, and this container runs as 10001, so without an
+            # explicit mode HF_HOME cannot be created and every Xet-backed transfer fails
+            # with EACCES (Issue 0086). The Xet chunk cache belongs on the mounted volume
+            # so a resumed transfer does not re-fetch it after a restart.
+            test "$(yq -r '.services.modelkeep.tmpfs[0]' ${./compose.yaml})" = "/tmp:mode=1777"
+            test "$(yq -r '.services.modelkeep.environment.HF_XET_CACHE' ${./compose.yaml})" = "/data/cache/xet"
+            case "$(yq -r '.services.modelkeep.environment.HF_XET_CACHE' ${./compose.yaml})" in
+              /data/*) ;;
+              *) echo "HF_XET_CACHE must live under the mounted archive volume" >&2; exit 1 ;;
+            esac
             if rg --fixed-strings '$' ${./compose.yaml} ${./compose.init.yaml}; then
               echo "Compose files must not require variable interpolation" >&2
               exit 1

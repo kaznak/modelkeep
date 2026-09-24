@@ -24,7 +24,11 @@ services:
       # Change the host path to the QNAP share reserved for ModelKeep.
       - /share/Services/modelkeep:/data
     tmpfs:
-      - /tmp
+      # mode=1777 is required, not cosmetic: Docker mounts a tmpfs root-owned 0755 by
+      # default, and this container runs as 10001, so without it the official Hugging
+      # Face client cannot create HF_HOME and every Xet-backed transfer fails with
+      # EACCES (Issue 0086).
+      - /tmp:mode=1777
     cap_drop:
       - ALL
     healthcheck:
@@ -39,7 +43,13 @@ services:
       RUST_LOG: info
       MODELKEEP_ADMIN_ADDRESS: "0.0.0.0:8091"
       MODELKEEP_TRUST_TAILSCALE_HEADERS: "true"
+      # Ephemeral client state. Writable because of the tmpfs mode above.
       HF_HOME: /tmp/huggingface
+      # The Xet chunk cache belongs on the mounted volume, not the tmpfs: it is what
+      # makes a resumed Xet transfer cheap, and losing it on restart would defeat the
+      # resumable acquisition ADR-0017 exists for. The client creates it on demand;
+      # /data is owned by the runtime user.
+      HF_XET_CACHE: /data/cache/xet
       # For private or gated upstream repositories, replace the empty value with a
       # token supplied through QNAP's protected deployment configuration.
       HF_TOKEN: ""
