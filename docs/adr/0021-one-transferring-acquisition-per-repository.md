@@ -132,3 +132,19 @@ rather than conveniences.
 - The configured limit is reported at startup alongside the other effective settings.
 - A queued management job waiting on the gate is visible and cancellable.
 - Identical requests are still collapsed by single-flight rather than serialized.
+
+## Measured throughput, and what it does to the estimates above
+
+An acquisition on the deployment on 2026-09-24 moved 6,183,464,935 bytes in 818 seconds: an
+average of **7.56 MB/s, about 60 Mbps**. The ~6 Mbps figure this record reasons from was
+measured separately at 02:00 JST the same day, so the link is either variable or the two
+measurements took different paths.
+
+The wall-clock estimates derived from ~6 Mbps are therefore wrong for that acquisition by
+roughly an order of magnitude: 469.92 GB is about 17 hours at 7.56 MB/s, not about seven days.
+
+**The decisions here do not depend on those absolute figures.** What they rest on is the ratio
+— 469.92 GB against 48.41 GB, 9.7x — and the ratio is a property of the repository, not of the
+link. A filtered acquisition is worth the same multiple whatever the throughput. The absolute
+numbers are corrected here rather than in place, so the reasoning as it was written stays
+legible.
