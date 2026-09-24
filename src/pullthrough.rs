@@ -1999,9 +1999,79 @@ fn log_archive_failure(
             io_kind = if io_error.kind() == std::io::ErrorKind::StorageFull { "out_of_space" } else { "other" },
             "archive storage operation failed"
         ),
-        _ => {}
+        ArchiveError::AlreadyPublished(published) => tracing::warn!(
+            event = "archive_already_published",
+            repo_type = %repo_type,
+            repo_id = %repo_id,
+            requested_revision = %requested_revision,
+            operation,
+            error_class = "conflict",
+            // The directory's name is the commit that already exists, which is
+            // the one thing `requested_revision` cannot tell an operator when a
+            // mutable ref resolved onto an archived revision. The archive root
+            // is left out, as `fetch_staging_conflict` leaves it out.
+            published = %bounded_archive_detail(
+                published
+                    .file_name()
+                    .map(|name| name.to_string_lossy())
+                    .unwrap_or_default()
+                    .as_ref()
+            ),
+            "archive revision is already published"
+        ),
+        ArchiveError::InvalidPath(offending) => tracing::warn!(
+            event = "archive_unsafe_path",
+            repo_type = %repo_type,
+            repo_id = %repo_id,
+            requested_revision = %requested_revision,
+            operation,
+            error_class = "unsafe_path",
+            // Naming the path is the whole diagnosis, and it is also the one
+            // field here built from text a request chose.
+            unsafe_path = %bounded_archive_detail(offending),
+            "archive path is not safe"
+        ),
+        ArchiveError::ReferencedRevision(references) => tracing::warn!(
+            event = "archive_revision_referenced",
+            repo_type = %repo_type,
+            repo_id = %repo_id,
+            requested_revision = %requested_revision,
+            operation,
+            error_class = "referenced",
+            reference_count = references.len(),
+            references = %bounded_archive_detail(&references.join(",")),
+            "archive revision is still referenced"
+        ),
     }
     error.into()
+}
+
+/// One bounded, single-line rendering of archive-derived detail (Issue 0085).
+///
+/// A repository id, a revision and a file name all arrive in a request, so a
+/// path or a ref name built from them is untrusted text. Replacing anything
+/// unprintable stops a crafted name from forging a second log record, and the
+/// bound stops it from flooding one. This is the treatment Issue 0084 gives a
+/// helper's message; the difference is only that here the text is ours to build.
+fn bounded_archive_detail(value: &str) -> String {
+    const LIMIT: usize = 200;
+    let collapsed: String = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let single_line = collapsed.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single_line.chars().count() > LIMIT {
+        let kept: String = single_line.chars().take(LIMIT).collect();
+        format!("{}...[truncated]", kept.trim_end())
+    } else {
+        single_line
+    }
 }
 
 /// Answers a failed staging acquisition (Issue 0083).
@@ -2915,6 +2985,128 @@ mod tests {
                 staging: request.staging.clone(),
             })
         }
+    }
+
+    /// Every `ArchiveError` variant leaves a trace (Issue 0085).
+    ///
+    /// Driven through `log_archive_failure` directly rather than through a
+    /// scenario per variant, because what is under test is that no variant
+    /// reaches the function without being logged - and the `match` is now
+    /// exhaustive, so a new variant cannot compile into silence.
+    #[test]
+    fn every_archive_failure_variant_is_logged_with_its_class() {
+        let cases: Vec<(ArchiveError, &str, &str)> = vec![
+            (
+                ArchiveError::IntegrityMismatch("digest mismatch".into()),
+                "archive_verification_failed",
+                "integrity",
+            ),
+            (
+                ArchiveError::Io(std::io::Error::other("disk gone")),
+                "archive_storage_failed",
+                "storage",
+            ),
+            (
+                ArchiveError::AlreadyPublished(std::path::PathBuf::from(
+                    "/archive/models/org/model/revisions/abc123",
+                )),
+                "archive_already_published",
+                "conflict",
+            ),
+            (
+                ArchiveError::InvalidPath("../escape".into()),
+                "archive_unsafe_path",
+                "unsafe_path",
+            ),
+            (
+                ArchiveError::ReferencedRevision(vec!["main".into(), "dev".into()]),
+                "archive_revision_referenced",
+                "referenced",
+            ),
+        ];
+
+        for (error, event, class) in cases {
+            let (writer, _guard) = capture_logs();
+            log_archive_failure(RepositoryType::Model, "org/model", "main", "publish", error);
+            let output = writer.output();
+            assert!(output.contains(event), "{event} missing from {output}");
+            assert!(
+                output.contains(&format!("\"error_class\":\"{class}\"")),
+                "{class} missing from {output}"
+            );
+            assert!(
+                output.contains("\"operation\":\"publish\""),
+                "operation missing from {output}"
+            );
+            assert!(
+                output.contains("org/model"),
+                "repo_id missing from {output}"
+            );
+        }
+    }
+
+    /// The detail each new arm adds is what makes the log answer the question,
+    /// so it is asserted rather than left to the event name.
+    #[test]
+    fn an_archive_failure_names_what_it_failed_on() {
+        let (writer, _guard) = capture_logs();
+        log_archive_failure(
+            RepositoryType::Model,
+            "org/model",
+            "main",
+            "publish",
+            ArchiveError::AlreadyPublished(std::path::PathBuf::from(
+                "/archive/models/org/model/revisions/abc123",
+            )),
+        );
+        let output = writer.output();
+        assert!(output.contains("\"published\":\"abc123\""), "{output}");
+        // The archive root is not what an operator needs and is not reported.
+        assert!(!output.contains("/archive/models"), "{output}");
+
+        let (writer, _guard) = capture_logs();
+        log_archive_failure(
+            RepositoryType::Model,
+            "org/model",
+            "main",
+            "publish",
+            ArchiveError::InvalidPath("../escape".into()),
+        );
+        assert!(
+            writer.output().contains("\"unsafe_path\":\"../escape\""),
+            "{}",
+            writer.output()
+        );
+
+        let (writer, _guard) = capture_logs();
+        log_archive_failure(
+            RepositoryType::Model,
+            "org/model",
+            "main",
+            "delete",
+            ArchiveError::ReferencedRevision(vec!["main".into(), "dev".into()]),
+        );
+        let output = writer.output();
+        assert!(output.contains("\"references\":\"main,dev\""), "{output}");
+        assert!(output.contains("\"reference_count\":2"), "{output}");
+    }
+
+    /// A crafted name cannot forge a log record or flood one (Issue 0085).
+    #[test]
+    fn archive_detail_is_bounded_and_single_line() {
+        let (writer, _guard) = capture_logs();
+        log_archive_failure(
+            RepositoryType::Model,
+            "org/model",
+            "main",
+            "publish",
+            ArchiveError::InvalidPath(format!("a\nb\t{}", "x".repeat(400))),
+        );
+        let output = writer.output();
+        assert!(output.contains("...[truncated]"), "{output}");
+        // One record, and the injected newline did not start a second one.
+        assert_eq!(output.lines().count(), 1, "{output}");
+        assert!(!output.contains("a\\nb"), "{output}");
     }
 
     #[test]

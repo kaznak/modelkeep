@@ -22,6 +22,9 @@ headers, bearer tokens, signed URLs, or upstream error payloads.
 | `archive_extended` | INFO | `repo_id`, `requested_revision`, immutable `commit`, `added`, `skipped`, `operation` |
 | `archive_selection_satisfied` | INFO | `repo_id`, `requested_revision`, immutable `commit`, `covered` |
 | `archive_storage_failed` | ERROR | `repo_id`, `requested_revision`, `operation`, `error_class=storage`, `io_kind` |
+| `archive_already_published` | WARN | `repo_type`, `repo_id`, `requested_revision`, `operation`, `error_class=conflict`, `published` (commit directory name only) |
+| `archive_unsafe_path` | WARN | `repo_type`, `repo_id`, `requested_revision`, `operation`, `error_class=unsafe_path`, bounded `unsafe_path` |
+| `archive_revision_referenced` | WARN | `repo_type`, `repo_id`, `requested_revision`, `operation`, `error_class=referenced`, `reference_count`, bounded `references` |
 | `admin_job_failed` | WARN | `job_id`, `job_kind`, job target (`repo_id`, `revision`), `error_class`, credential-safe `safe_reason` |
 | `admin_job_cancelled` | INFO | `job_id`, `job_kind`, job target (`repo_id`, `revision`), `previous_state` |
 | `admin_server_ready` | INFO | `listen_address` |
@@ -216,6 +219,24 @@ acquisition already past the publication point, emits nothing, because nothing
 changed.
 
 ## Fetch staging collisions and recovery
+
+Every `ArchiveError` an archive operation can fail with now leaves one record
+(Issue 0085). `archive_verification_failed` and `archive_storage_failed` were the
+only two; `AlreadyPublished`, `InvalidPath` and `ReferencedRevision` reached a
+`_ => {}` arm and converted silently, so a prefetch could fail with
+`error_class: "conflict"` and leave nothing in the log saying where the conflict
+came from. The match is exhaustive, so a new variant cannot be added into
+silence.
+
+Each of the three names what it failed on, because that is the detail the
+absence of which sent an operator to read the source: the commit directory that
+already exists, the path that was rejected, and the refs still pointing at a
+revision. A repository id, a revision and a file name all arrive in a request,
+so those fields are rendered through the same bounding Issue 0084 applies to a
+helper's message - unprintable characters replaced, whitespace collapsed,
+truncated at 200 characters - which is what stops a crafted name from forging a
+second log record. The archive root is not reported, as it is not reported by
+`fetch_staging_conflict`.
 
 `fetch_staging_conflict` (WARN) is emitted when an acquisition is refused because
 fetch staging for the same repository, revision and selection is held by a lease
