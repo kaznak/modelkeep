@@ -65,6 +65,31 @@ key yielded `RepoSibling(rfilename=..., size=10, blob_id=None, lfs=None)` withou
 an unknown per-file key is ignored. **0.36.0 is not yet checked** — it is not in the
 development shell — and must be before this is treated as settled.
 
+## The constraint that decides this issue
+
+Issue 0074 measured something that changes what "faithful" can mean here. **With `lfs`
+present in a tree entry, `huggingface_hub` 1.27.0 skips its `HEAD` and takes `lfs.oid` as
+the file's validator.** So emitting `lfs` does not merely add information: it moves the
+validator off the `ETag` ModelKeep computes and serves, onto a value the client read from a
+listing.
+
+Today that substitution happens to be harmless, because `lfs.oid` is the sha256 and
+ModelKeep's `ETag` is the same sha256. It is harmless by coincidence of the two values, not
+by construction, and issue 0078 exists because exactly that kind of coincidence was relied
+on before.
+
+ADR-0022 decision 7 therefore currently forbids emitting `lfs` at all, and the tree route
+reports the recorded upstream git object id, else ModelKeep's content digest, else nothing.
+
+This issue has to resolve that, not work around it:
+
+- if `lfs` is emitted, it must be shown that the validator the client ends up using is the
+  one ModelKeep would have served, and a test must fail if those two ever diverge;
+- if that cannot be shown, ADR-0022 decision 7 stands and this issue becomes documenting the
+  deviation plus adding ModelKeep's own property, without `lfs`;
+- either way ADR-0022 must be updated or superseded to match what is built, not left
+  contradicting the code.
+
 ## Dependency
 
 Issue 0074 records upstream per-file metadata from the
@@ -74,9 +99,11 @@ cannot populate `oid` faithfully. **This issue depends on Issue 0074.**
 
 ## Acceptance criteria
 
-- For an LFS-managed file, `oid` is the git blob hash and `lfs.oid` is the sha256, matching
-  what the Hub returns for the same file. For a non-LFS file, `oid` is the git blob hash and
-  no `lfs` object is present.
+- For a non-LFS file, `oid` is the git blob hash and no `lfs` object is present.
+- For an LFS-managed file, either `oid` is the git blob hash and `lfs.oid` is the sha256 as
+  the Hub returns them — with a test that fails if the validator the client uses diverges
+  from the one ModelKeep serves — or `lfs` is omitted under ADR-0022 decision 7 and the
+  deviation is documented. Which one is chosen must follow from measurement.
 - Every file the archive holds carries the ModelKeep property with a digest equal to the
   `ETag` the resolve route serves for it, and `docs/modelkeep-api.md` names that property as
   the one to verify against.

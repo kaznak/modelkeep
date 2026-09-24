@@ -1,5 +1,5 @@
 ---
-status: open
+status: done
 priority: P1
 related_adrs:
   - ADR-0020
@@ -10,7 +10,7 @@ updated: 2026-09-24
 ---
 # Issue 0074: Answer repository metadata without acquiring the repository
 
-- Status: Open
+- Status: Done
 - Priority: P1
 - Related ADR: ADR-0020, ADR-0005
 
@@ -120,3 +120,38 @@ Serving metadata that is not backed by archived state is a change to what a meta
 answer means, and it must not become a path by which ModelKeep reports files it cannot
 deliver. If that cannot be made safe, the alternative is to keep the current behavior
 and document the filtered prefetch as the only supported way to archive a subset.
+
+## Implementation status
+
+Implemented on 2026-09-24 and recorded as ADR-0022. Verified on x86_64-linux with
+`cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
+`cargo test --all-features`, and `nix flake check`, each with its exit status taken
+directly.
+
+Both pinned clients filtering a download of an unseen repository now archive only the
+matching file, where before they archived all seven. Reconciliation's upstream round trips
+went from two to zero where the record applies, measured by call count.
+
+The upstream per-file metadata is recorded in a `.modelkeep-` prefixed file inside the
+revision, so it reaches no manifest, listing or response, and an older binary does not see
+it. The manifest format is unchanged and nothing is migrated: a revision with no record
+reports what the archive holds.
+
+Two findings from the implementation are worth keeping:
+
+Answering metadata without acquiring stopped ModelKeep learning a ref, so `main` returned
+`404` when ModelKeep was itself used as an upstream — caught by the 1.27 client check, not by
+a unit test. An upstream-answered ref is now memoised in memory and used only to create a ref
+that does not exist, so ADR-0012 stands.
+
+With `lfs` present in a tree entry, 1.27.0 skips its `HEAD` and takes `lfs.oid` as the
+validator, moving it off the value ModelKeep computes and serves. ADR-0022 decision 7
+therefore omits `lfs` for now, and Issue 0079 has to resolve that rather than work around it.
+
+Two existing assertions changed. They pinned a partially archived revision reporting only its
+subset and an unfiltered offline download succeeding, which is the behaviour this issue
+deliberately ends. The byte-level assertion moved to the filtered download and the unfiltered
+case now asserts failure, so the replacement is stronger rather than weaker.
+
+**Remaining**: `repository_info` siblings still carry only `rfilename`, so a chain of
+ModelKeep instances does not propagate the record. Issue 0079 covers the reporting surface.
