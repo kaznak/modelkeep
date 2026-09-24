@@ -42,10 +42,55 @@ of the three identified directories had recorded commits that still matched upst
 current `main`, so their 29 GB was directly recoverable by submitting a prefetch — and
 deciding that needed information no supported command exposes.
 
+## What v0.4.10 changed, measured on the deployment
+
+Re-measured on 2026-09-24 after the v0.4.10 container recreation, because Issues 0083 and 0087
+changed what startup reclaims and so changed what is left for an operator.
+
+| | v0.4.9 | v0.4.10 |
+|---|---|---|
+| staging directories | 4 | 3 |
+| orphaned staging | 4 | 3 |
+| oldest orphan, age | 8,753 s | 25,007 s |
+
+One directory went. **The oldest did not: it is the same directory in both reports** — 8,753 s
+before the v0.4.9 check at `1790233158` and 25,007 s before the v0.4.10 check at `1790249413`
+both place its creation at `1790224405`, within rounding. It survived the restart.
+
+That is most likely correct. `self_check_staging` counts every staging directory whose lease is
+expired or absent, and after Issues 0083 and 0087 that set contains things whose right action
+differs:
+
+- `fetch-abandoned-*` holding a resolved commit, which recovery skips **on purpose** because
+  ADR-0017 keeps it resumable. It is an asset, not garbage.
+- staging whose lease is unreadable, which ADR-0009 keeps for inspection.
+- an entry recovery could not reclaim, which Issue 0087 now names separately with
+  `staging_recovery_skipped`.
+- genuinely stale junk.
+
+**So "3 orphaned staging" is not three of the same thing, and the count cannot say which.**
+
+Two further facts the measurement pinned down.
+
+**The detail exists and is not exposed.** `SelfCheckFinding` already carries `repo_type`,
+`repo_id`, `commit`, `path`, `reference`, `age_seconds` and a `detail` string, and
+`modelkeep self-check` prints the whole report including `findings`. The `/status` route serves
+only the counts and `findings_by_kind`. So the operator's path to "which directories" today is
+`docker exec` into the container, and there is no API route that returns a finding at all —
+`/api/admin/v1/self-check` is a 404.
+
+**There are now two partial views that do not line up.** `staging_recovery_skipped` names what
+startup could not reclaim; the self-check counts what has no live lease. Neither is a subset of
+the other, and an operator reconciling them has to read logs and run a CLI inside the container.
+
 ## Scope
 
 - List retained fetch staging through the Admin API: repository, requested revision, resolved
   commit, selection, size, age, and whether it is identified and therefore adoptable.
+- **Say why each one is retained**, because after Issues 0083 and 0087 the reasons are distinct
+  in the code and carry different actions: resumable and deliberately kept, unreadable and kept
+  for inspection, or not reclaimable. A listing that does not distinguish them reproduces the
+  count's problem at greater length.
 - Remove a named retained staging directory through the Admin API, one at a time, with the
   same authorization and CSRF requirements as any other state-changing management request.
 - Trigger the self-check through the Admin API and report the fresh result.
@@ -61,7 +106,11 @@ deciding that needed information no supported command exposes.
 ## Acceptance criteria
 
 - Retained staging is listable with enough identity for an operator to decide between
-  resuming and discarding, including whether a resume is possible at all.
+  resuming and discarding, including whether a resume is possible at all, **and each entry
+  says which kind of retention it is** rather than leaving that to be inferred from a
+  directory name.
+- What `staging_recovery_skipped` reported and what the self-check counts can be reconciled
+  from the API alone, without reading container logs or running a CLI inside the container.
 - A named staging directory can be removed through the API, and an active or unexpired one
   cannot.
 - The self-check can be triggered and its fresh result read, and a status poll still does not
