@@ -122,3 +122,30 @@ Issue 0084 is why this took an afternoon to find: the helper exits 1 without pri
 exception and the parent discards its stderr, so the deployment reported
 `error_class: "failed"` and nothing else. The chain above was reconstructed by running the
 client by hand inside the container.
+
+## Field verification of the fix (2026-09-24, v0.4.9)
+
+Setting `HF_XET_CACHE` to a path under the mounted archive volume, owned by the runtime
+user, and recreating the container was sufficient. The same filtered prefetch that had
+failed four times in a row then ran:
+
+```text
+transferring: 1   transferred_bytes: 9,051,739,286
+job: running / downloading / resumed = true
+progress: 9,051,739,286 / 73,025,919,893
+```
+
+The retained staging was adopted — `resumed: true` at the recorded 8,943,738,646 bytes —
+and the transfer moved past it, which is what distinguishes a working Xet path from the
+earlier failures that stopped at the first Xet-backed file.
+
+So the diagnosis holds and the scope above is right: the client needs a writable cache, and
+a mounted path is where it belongs. `HF_XET_CACHE` alone was enough for this transport;
+whether anything else under `HF_HOME` needs to be writable is still unverified, and `/tmp`
+is still mounted root-owned `0755` in the shipped compose, so the acceptance criteria stand
+as written.
+
+**What remains for this issue is the repository side, not the deployment**: the shipped
+`compose.yaml` still sets `HF_HOME` to an unwritable path and declares `/tmp` without a
+mode, so a deployment built from this repository still cannot acquire a Xet-backed file
+until that is changed and a check pins it.
