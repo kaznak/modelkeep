@@ -6,7 +6,7 @@ related_adrs:
 created: 2026-09-24
 updated: 2026-09-24
 ---
-# Issue 0079: Make the tree response faithful to the Hub schema
+# Issue 0079: Report Hub fields faithfully, and add ModelKeep's own
 
 - Status: Open
 - Priority: P2
@@ -14,56 +14,74 @@ updated: 2026-09-24
 
 ## Objective
 
-Report repository contents in the shape the Hub reports them, so a client or tool that
-reads the response according to Hub semantics is not misled.
+Report repository contents in the shape the Hub reports them, so a tool reading the response
+by Hub semantics is not misled, and carry ModelKeep's verification digest as an additional
+property rather than by redefining one of the Hub's.
 
 ## Problem
 
+Two metadata routes report contents, and neither matches the Hub.
+
 `GET /api/{models|datasets}/{ns}/{repo}/tree/{revision}` returns a flat array of
-`{type, path, size, oid}` built from the manifest (`src/http.rs:490`), with `oid` set to
-the recorded sha256 for every file.
+`{type, path, size, oid}` from the manifest (`src/http.rs:490`), with `oid` set to the
+recorded sha256 for every file. The Hub means something else by `oid`: there it is the
+file's git blob hash, and an LFS-managed file additionally carries
+`lfs: {oid, size, pointerSize}` where `oid` is the sha256. The Hub also emits directory
+entries and paginates. So a tool comparing our `oid` against a git blob hash it computed
+finds every file mismatched.
 
-The Hub does not mean that by `oid`. There, a file's `oid` is its git blob hash, and an
-LFS-managed file additionally carries `lfs: {oid, size, pointerSize}` where `oid` is the
-sha256. The Hub also emits directory entries and paginates.
+`GET /api/{models|datasets}/{ns}/{repo}/revision/{revision}` is thinner still: its
+`siblings` carry `rfilename` and nothing else (`src/http.rs:391`), where the Hub's
+`files_metadata` form carries `size`, `blob_id` and `lfs` per sibling.
 
-So ModelKeep's response is Hub-shaped but not Hub-semantics: a tool that compares `oid`
-against a git blob hash it computed itself finds a mismatch on every file. The supported
-clients tolerate it for downloading — the integration checks pass — but the field does not
-mean what its name says.
+Neither is breakage — the supported clients download correctly and the integration checks
+pass — but the fields do not mean what their names say, and the digest a client needs in
+order to verify what it holds is reachable only by reading a field that means something
+else.
 
-Since Issue 0078 the value is at least coherent within ModelKeep: `oid` is the same sha256
-the resolve route now advertises as `ETag`, which makes the route directly usable for
-verifying a local copy. Any change here must keep that property, because it is the only way
-a client can check what it holds.
+## Approach
+
+Keep the Hub's field names with the Hub's meanings, and add ModelKeep's own information as
+an additional property rather than by overloading theirs.
+
+- `oid` becomes the git blob hash, and an LFS-managed file carries `lfs: {oid, size,
+  pointerSize}`, as the Hub does.
+- A namespaced ModelKeep property carries the digest ModelKeep serves as the file's `ETag`,
+  present for **every** file the archive holds, whether or not the file is LFS-managed. A
+  nested object rather than a bare key, so later additions do not each need a new name.
+- The `revision` route's siblings gain the Hub's per-file fields and the same ModelKeep
+  property.
+
+This is what makes the two goals independent. Fidelity stops being a trade against
+verifiability: a Hub-semantics tool reads the Hub fields, and a client verifying its own
+copy reads one ModelKeep field that is always there and always equals the `ETag` it was
+served.
+
+**An unknown property must be shown not to disturb the supported clients** — measured
+against both pinned versions, not assumed from how their parsers appear to be written.
 
 ## Dependency
 
-Issue 0074 records upstream per-file metadata from the `repo_info(files_metadata=True)`
-call the helper already makes, and that response carries both `blob_id` — the git blob hash
-— and `lfs.sha256`. Without that recording, ModelKeep has no git blob hash for any file and
+Issue 0074 records upstream per-file metadata from the
+`repo_info(files_metadata=True)` call the helper already makes, and that response carries
+`blob_id` and `lfs.sha256`. Without it ModelKeep has no git blob hash for any file and
 cannot populate `oid` faithfully. **This issue depends on Issue 0074.**
-
-## Scope
-
-- Populate `oid` and `lfs` as the Hub does, from the recorded upstream metadata.
-- Keep a verifiable content digest reachable for every file, and keep it equal to what the
-  resolve route advertises.
-- Decide whether to emit directory entries and whether to paginate, from what the supported
-  clients and the documented API actually require — measured, not assumed. A large
-  repository's tree is currently returned in one response.
-- State in `docs/modelkeep-api.md` which field a client should use to verify a local file.
 
 ## Acceptance criteria
 
 - For an LFS-managed file, `oid` is the git blob hash and `lfs.oid` is the sha256, matching
-  what the Hub returns for the same file.
-- The value a client needs in order to verify bytes it holds is documented, present for
-  every file ModelKeep holds, and equal to the `ETag` the resolve route serves.
-- A revision with no recorded upstream metadata still answers, and what it reports is
-  documented rather than silently different.
-- Both pinned clients continue to download and to list correctly, verified by the existing
-  integration checks plus a case that reads the tree and verifies bytes against it.
+  what the Hub returns for the same file. For a non-LFS file, `oid` is the git blob hash and
+  no `lfs` object is present.
+- Every file the archive holds carries the ModelKeep property with a digest equal to the
+  `ETag` the resolve route serves for it, and `docs/modelkeep-api.md` names that property as
+  the one to verify against.
+- Both pinned clients download and list correctly with the added property present, and a
+  check reads the tree and verifies bytes against the ModelKeep property.
+- A revision with no recorded upstream metadata still answers. What it omits — a git blob
+  hash it never recorded — is documented rather than filled with a substitute.
+- Whether directory entries and pagination are added is decided from what the clients and
+  the documented API require, measured rather than assumed. A large repository's tree is
+  currently returned in a single response.
 
 ## Verification
 
@@ -74,15 +92,14 @@ nix develop -c cargo test --all-features
 nix flake check
 ```
 
-Compare a fixture's tree response field by field against a recorded observation of the
-Hub's response for a repository of each shape — LFS and non-LFS — and keep that observation
-under `docs/observations/`.
+Compare a fixture's responses field by field against a recorded observation of the Hub's
+responses for a repository of each shape, LFS and non-LFS, and keep that observation under
+`docs/observations/`.
 
 ## Risks and assumptions
 
-Changing `oid` from a sha256 to a git blob hash removes the digest from where a verification
-recipe currently reads it. Anything already relying on today's shape breaks unless the
-digest remains reachable and documented, which the acceptance criteria require. The
-fidelity gained has to be weighed against that: if no supported client or tool actually
-reads `oid` as a git hash, the honest alternative is to document the deviation instead of
-changing the field.
+The digest moves out of `oid`. The only thing known to read it there is a verification
+recipe written on 2026-09-24, so the cost is documenting the new location — which the
+acceptance criteria require anyway. The remaining assumption is that an unknown property is
+tolerated by the supported clients; if it is not, the fallback is to keep the Hub fields
+faithful and publish the digest on a separate route rather than to overload `oid` again.
