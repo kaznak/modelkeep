@@ -24,16 +24,21 @@ File responses advertise `ETag: "{commit}-{size}"` (`src/http.rs:668`). Within o
 revision the commit is constant, so **any two files of the same byte length share an
 ETag**. Sharded weights are where this bites, because shard sizes are usually uniform.
 
-That produces silent corruption by two independent routes.
+HTTP does not require an ETag to be unique across URLs, so this is not a bare protocol
+violation. It is a compatibility defect against the service ModelKeep presents itself as.
+The Hub returns content hashes as validators — the `x-linked-etag` below is a file's
+sha256 — and `huggingface_hub` builds a content-addressed blob store on that property:
+each blob is named after the validator, and `snapshots/<commit>/<path>` is a symlink to it.
+Against the real Hub that assumption holds. Against ModelKeep it does not, so two paths
+with one ETag become two symlinks to one blob and whichever file is fetched second
+overwrites the first.
 
-**The client's blob store.** `huggingface_hub` names each cache blob after the ETag and
-symlinks `snapshots/<commit>/<path>` at it. Two paths with one ETag become two symlinks to
-one blob, and whichever file is fetched second overwrites the first.
-
-**Conditional requests.** `If-None-Match` is compared against the same synthesised value
-(`src/http.rs:674`). A client holding file A's ETag and requesting file B is told `304 Not
-Modified`, so it keeps A's bytes as B. This route does not depend on the client's cache
-layout at all, so it can affect clients the blob-store route would not.
+`If-None-Match` is compared against the same synthesised value (`src/http.rs:674`), so a
+client holding one file's validator and requesting another is told `304 Not Modified`. For
+a cache keyed by URL that is harmless, because validation is per URL; it matters here
+because the same collision has already merged the two files in a validator-keyed blob
+store. The fix has to make this comparison content-derived too, for the same reason the
+header must be.
 
 Nothing signals the problem. The client reports success, the file count and byte total are
 right, and the job record looks clean.
@@ -78,6 +83,12 @@ is not.
   what form: whether the `ETag` itself carries the digest, whether `x-linked-etag` is also
   required, and what shape each client accepts as a blob name. Do not infer this from the
   upstream examples above; observe it.
+- Note that the Hub does not use one kind of validator for everything: an LFS-managed file
+  carries its sha256, while a small non-LFS file carries a git blob hash. The manifest
+  records a sha256 for every file and nothing records what upstream advertised, so the two
+  candidate fixes are to record the upstream validator during acquisition and pass it
+  through, or to serve the recorded sha256 for every file. The second needs no new
+  acquisition state but has to be shown to satisfy both clients for non-LFS files as well.
 - Make `If-None-Match` compare the same content-derived value, so a match means the same
   bytes.
 - Consider exposing per-file digests in the job record so a corrupt fetch is detectable
