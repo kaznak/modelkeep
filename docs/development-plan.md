@@ -910,6 +910,7 @@ MVP 後の候補:
 - ~~Hubのfieldをそのmeaningで報告し、ModelKeepのdigestは独自propertyへ — [Issue 0079](https://github.com/kaznak/modelkeep/commit/3e95df9)~~
 - ~~起動時のarchive自己検査（上流非依存・自動修復なし） — [Issue 0073](https://github.com/kaznak/modelkeep/commit/c6f5120)~~。運用手段は[Issue 0081](issues/0081-give-the-operator-actions-for-what-the-self-check-reports.md)
 - ~~構造化eventリファレンスの完成とずれを防ぐcheck — [Issue 0075](https://github.com/kaznak/modelkeep/commit/628a079)~~
+- ~~acquisition失敗の理由を残す（helperがsanitizeしたtyped failure eventと、class別のupstream error） — [Issue 0084](https://github.com/kaznak/modelkeep/commit/0722668)、[job recordへの到達](https://github.com/kaznak/modelkeep/commit/178c228)~~。`error_class: "failed"`一語への収束をやめ、`SanitizedReason`型でcredential-safeを構成として保証
 - ~~委譲先clientに書けるcacheを与える（tmpfsのmode明示とXet chunk cacheのmounted volume配置） — [Issue 0086](https://github.com/kaznak/modelkeep/commit/ed4ed73)~~。root所有0755のtmpfsに`HF_HOME`を置いていたため、10001で走るcontainerではXet転送が全て`EACCES`で失敗していた
 
 ModelKeep という名称は Hugging Face 専用に限定しないため、将来的に model artifact 全般の persistent pull-through mirror へ拡張できる。
