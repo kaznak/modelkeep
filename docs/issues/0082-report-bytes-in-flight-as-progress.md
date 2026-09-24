@@ -117,7 +117,16 @@ figure did not count them.
    directory's actual size** rather than the archive filesystem's free space — measuring the
    shared volume's free space is what made the original report wrong. This needs the
    deployment.
-2. Count the bytes of files in flight on both paths.
+2. Count the bytes of files in flight on both paths. **Done** for the local-folder staging
+   layout both transports share; see the commit that made the glob recursive.
+
+   Note the ordering item 1 turned out to have. Measuring where Measurement A's bytes were
+   needs the **staging directory's own size**, and no management route reports it: `/status`
+   reports `archive_filesystem_available_bytes` for the whole volume, which is the comparison
+   that made the original report wrong, and `SelfCheckFinding` carries repository, commit,
+   path, reference and age but no size. So item 1 is blocked on [Issue
+   0081](0081-give-the-operator-actions-for-what-the-self-check-reports.md) exposing staging
+   sizes, or on running commands inside the container by hand.
 3. Fix the non-recursive glob regardless of whether it explains Measurement A. A repository
    whose large files live in subdirectories is under-reported today, and that is a defect
    reachable by inspection.
