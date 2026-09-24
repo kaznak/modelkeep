@@ -124,6 +124,13 @@ reports what it holds, and a metadata answer that could not be obtained is a
 classified failure (`502` when upstream is unreachable), never an empty or partial file
 list presented as complete.
 
+Cancelling an acquisition releases the requests waiting on it with `502`, and a request that
+arrives afterwards starts new work. That is deliberate, and it has a consequence worth
+knowing before relying on cancellation: measured against both supported client versions, a
+client does not stop at that `502` — it retries within seconds and the transfer restarts.
+Cancelling stops the transfer in flight, not the client driving it. Stop the client too, and
+use the in-flight acquisition view to confirm the work has not come back.
+
 ModelKeep serves payloads itself and does not redirect a client to Hugging Face or
 Xet. Do not add fallback logic that silently changes `HF_ENDPOINT` or follows a
 payload path around ModelKeep. A warm archived revision is expected to remain

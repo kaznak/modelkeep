@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: done
 priority: P1
 related_adrs:
   - ADR-0015
@@ -10,7 +10,7 @@ updated: 2026-09-24
 ---
 # Issue 0076: Cancel a running acquisition
 
-- Status: In Progress
+- Status: Done
 - Priority: P1
 - Related ADR: ADR-0015, ADR-0017, ADR-0009
 

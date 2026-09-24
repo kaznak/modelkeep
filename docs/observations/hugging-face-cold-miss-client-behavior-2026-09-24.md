@@ -50,6 +50,28 @@ client waits and the download eventually succeeds. Answering "not ready" there w
 convert a slow success into an immediate failure, with no status available that buys a
 retry.
 
+### A cancelled acquisition
+
+Measured against the deployment on 2026-09-24 with v0.4.9, by starting a request for a file
+the archive did not hold and cancelling the acquisition it triggered from the admin plane.
+
+A waiting request is released with `502` the moment the cancellation lands, not at the
+deadline. Measured at 3.10 s against a 8 s deadline, for a `GET` on a ref-addressed URL and
+for a `HEAD` on a commit-addressed URL alike, so neither the method nor the URL form changes
+it.
+
+`huggingface_hub` 1.27.0 does **not** stop there. Driving the same request through the real
+client, the cancellation released its `HEAD` and the client retried on its own, hit the
+deadline on a later attempt — reporting `HTTP Error 503 ... Rate limited. Waiting 9.0s
+before retry [Retry 1/5]` — and then completed the download, 35.5 s in total.
+
+That is the documented behaviour rather than a defect: a re-request legitimately starts new
+work. What it means operationally is worth stating plainly, because it is easy to assume the
+opposite. **Cancelling a client-driven acquisition does not stop the client.** It stops the
+transfer that was in flight; a supported client will ask again within seconds and the work
+restarts. Stopping the client is a separate action, and the in-flight view is how an operator
+sees that an acquisition they cancelled has come back.
+
 ## Consequence for ModelKeep
 
 The two routes need opposite defaults, which is not something to infer from the
