@@ -124,3 +124,24 @@ shutdown waits indefinitely for blocking tasks. They now run on process-lifetime
 threads so container exit interrupts the worker and leaves recovery to the durable job
 record and staging lease. The black-box crash check submits a blocking Admin prefetch,
 sends SIGTERM to PID 1, and requires a successful process exit within five seconds.
+
+The completion portion of the drill finally passed on 2026-09-24 with v0.4.9. A
+filtered prefetch of a commit-pinned four-file selection totalling 73,025,919,893
+bytes, one file of which is 72 GB, was interrupted by a container force-stop during
+transfer. It left 8,943,738,646 bytes of retained staging. A new job adopted that
+staging, reported `resumed: true`, and ran to `outcome: published` with
+73,025,919,893 of 73,025,919,893 bytes and four of four files.
+
+So the resumed acquisition transferred 64,082,181,247 bytes where a complete restart
+would have transferred 73,025,919,893 — 12.25 per cent fewer, matching the retained
+amount. Temporary capacity behaved as designed: the archive filesystem never held a
+second copy of the selection, and no partial revision was observable through
+ModelKeep at any point.
+
+One dependency remains before this issue closes. The retained staging was only
+reachable after renaming its directory by hand, because the in-flight marker path
+refuses a matching identity without checking whether the lease is still live. The
+resume machinery was correct and unreachable. [Issue
+0083](0083-release-expired-active-fetch-staging.md) owns that defect; this issue
+closes when an interrupted acquisition of the same identity resumes with no manual
+step.
