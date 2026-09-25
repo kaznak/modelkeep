@@ -405,8 +405,10 @@ Supported client-facing routes include:
 ```http
 GET /api/models/{namespace}/{repo}/revision/{revision}
 GET /api/models/{namespace}/{repo}/tree/{revision}
+GET /api/models/{namespace}/{repo}/refs
 GET /api/datasets/{namespace}/{repo}/revision/{revision}
 GET /api/datasets/{namespace}/{repo}/tree/{revision}
+GET /api/datasets/{namespace}/{repo}/refs
 GET|HEAD /{namespace}/{repo}/resolve/{revision}/{path}
 GET|HEAD /datasets/{namespace}/{repo}/resolve/{revision}/{path}
 ```
@@ -415,6 +417,31 @@ Tree requests accept the query fields used by supported clients. File responses
 support `HEAD`, byte ranges, and conditional requests needed by those clients. These
 routes are documented for diagnosis and interoperability; ordinary automation should
 still use the official client.
+
+### `refs` reports `main` only
+
+`refs` answers the Hub's shape with one branch, `main`, and nothing else:
+
+```json
+{"branches":[{"name":"main","ref":"refs/heads/main","targetCommit":"<commit>"}],"converts":[],"tags":[]}
+```
+
+`include_prs=1` adds an empty `pullRequests`, which both pinned `huggingface_hub`
+versions index when they asked for it. llama.cpp resolves the commit it downloads
+from `branches[name == "main"].targetCommit` here before it requests any file list,
+and stops when this route fails.
+
+`main` resolves exactly as `revision/main` does: an archived `main` answers from the
+archive without contacting upstream, so the route keeps working offline, and a `main`
+the archive does not hold answers upstream's current commit while acquiring nothing.
+The answer is therefore never newer than the archived ref; advancing it is still an
+explicit refresh ([`ADR-0012`](adr/0012-explicit-mutable-ref-refresh.md)).
+
+Other branches and tags are deliberately not listed, which is a deviation from the Hub.
+The archive stores a ref as a name and a commit and does not record whether upstream
+calls it a branch or a tag, so listing the other archived names would invent that
+classification, and listing upstream's would make an archived repository's answer
+depend on upstream. A caller that needs another ref names it on `revision/{ref}`.
 
 A metadata response is assembled by ModelKeep from a file list, never relayed from
 upstream. Nothing upstream says about where its payload lives — a redirect, a Xet hash,

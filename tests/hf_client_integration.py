@@ -1090,6 +1090,69 @@ def assert_in_flight_bytes_of_a_subdirectory_file_are_reported(
         assert in_flight, (reported, total)
 
 
+def assert_refs_answer_main(endpoint, repo_type="model"):
+    """Issue 0088: the refs route answers `main` in the shape the Hub uses.
+
+    llama.cpp resolves the commit it downloads from
+    `branches[name == "main"].targetCommit` on this route and stops when it
+    fails. Both pinned clients read the same route through `list_repo_refs`,
+    which indexes `branches`, `converts` and `tags` unconditionally and
+    `pullRequests` when it asked for them, so a real client parsing the answer is
+    the black-box check of that shape.
+    """
+    api = HfApi(endpoint=endpoint)
+    refs = api.list_repo_refs(REPO_ID, repo_type=repo_type)
+    assert [
+        (branch.name, branch.ref, branch.target_commit) for branch in refs.branches
+    ] == [("main", "refs/heads/main", COMMIT)], refs
+    assert refs.tags == [] and refs.converts == [], refs
+    assert refs.pull_requests is None, refs
+    with_prs = api.list_repo_refs(
+        REPO_ID, repo_type=repo_type, include_pull_requests=True
+    )
+    assert with_prs.pull_requests == [], with_prs
+    assert with_prs.branches[0].target_commit == COMMIT, with_prs
+
+
+def assert_a_llama_cpp_style_download_resolves_through_refs(endpoint):
+    """The request sequence llama.cpp makes, against an offline mirror.
+
+    Commit from `refs`, file list from `tree/{commit}?recursive=true`, then a
+    `HEAD` and a ranged `GET` on `resolve/{commit}/{path}`, as reported for
+    llama.cpp's `get_repo_commit`, `get_repo_files` and its single-file
+    download. llama.cpp is not a pinned client; this pins only that the mirror
+    answers each step of that sequence from the archive.
+    """
+    with urllib.request.urlopen(
+        urllib.request.Request(
+            f"{endpoint}/api/models/{REPO_ID}/refs",
+            headers={"Accept": "application/json"},
+        )
+    ) as response:
+        assert response.status == 200
+        refs = json.load(response)
+    commit = next(
+        branch["targetCommit"]
+        for branch in refs["branches"]
+        if branch["name"] == "main"
+    )
+    assert commit == COMMIT
+    with urllib.request.urlopen(
+        f"{endpoint}/api/models/{REPO_ID}/tree/{commit}?recursive=true"
+    ) as response:
+        listed = {entry["path"] for entry in json.load(response)}
+    assert "config.json" in listed, listed
+    url = f"{endpoint}/{REPO_ID}/resolve/{commit}/config.json"
+    with urllib.request.urlopen(urllib.request.Request(url, method="HEAD")) as response:
+        assert response.status == 200
+        assert response.headers["x-repo-commit"] == COMMIT
+    with urllib.request.urlopen(
+        urllib.request.Request(url, headers={"Range": "bytes=0-4"})
+    ) as response:
+        assert response.status == 206
+        assert response.read() == b'{"mod'
+
+
 def main():
     binary = Path(sys.argv[1])
     helper = Path(sys.argv[2])
@@ -1115,6 +1178,9 @@ def main():
                         raise AssertionError(f"{revision} unexpectedly succeeded")
                     except HfHubHTTPError as error:
                         assert error.response.status_code == expected_status
+                # Cold: the archive holds nothing, so `main` is upstream's commit.
+                assert_refs_answer_main(endpoint)
+                assert_refs_answer_main(endpoint, repo_type="dataset")
                 info = HfApi(endpoint=endpoint).repo_info(REPO_ID, revision="main")
                 assert info.sha == COMMIT
                 cold = Path(download(endpoint, root / "cold-client", "main"))
@@ -1304,6 +1370,10 @@ def main():
                         )
                     )
                 assert len(results) == 4
+                # Warm and offline: `main` answers from the archived ref.
+                assert_refs_answer_main(endpoint)
+                assert_refs_answer_main(endpoint, repo_type="dataset")
+                assert_a_llama_cpp_style_download_resolves_through_refs(endpoint)
             assert ".modelkeep-staging-lease" not in offline_logs[0]
             assert ".cache/huggingface" not in offline_logs[0]
 

@@ -72,11 +72,12 @@ headers, bearer tokens, signed URLs, or upstream error payloads.
 | `archive_self_check_finding` | WARN | `finding`, plus whichever of `repo_id`, `commit`, `path`, `reference`, `age_seconds` the class carries, and `detail` |
 | `archive_self_check_completed` | INFO | `status`, `finding_count`, `revisions_checked`, `duration_ms` |
 
-`request_kind` is one of `model_info`, `model_tree`, `get_file`, or `head_file`;
-`model_info` and `model_tree` cover the dataset metadata routes as well, which are
-distinguished by `repo_type`. Every repository event carries `repo_type`, which is
-`model` or `dataset`. `operation` is the operation that failed or caused a
-transition, such as `pull_through`, `refresh`, `stage`, `publish`, or `update_ref`.
+`request_kind` is one of `model_info`, `model_tree`, `model_refs`, `get_file`, or
+`head_file`; `model_info`, `model_tree` and `model_refs` cover the dataset metadata
+routes as well, which are distinguished by `repo_type`. Every repository event
+carries `repo_type`, which is `model` or `dataset`. `operation` is the operation that
+failed or caused a transition, such as `pull_through`, `refresh`, `stage`, `publish`,
+or `update_ref`.
 
 `archive_extended` reports an acquisition that added paths to an already published
 immutable revision rather than publishing a new one: `added` and `skipped` count the
@@ -170,12 +171,12 @@ A cold miss emits `archive_miss` and then reaches one of three outcomes, which i
 what distinguishes a live acquisition from a stalled one. Every route that can miss
 reports this the same way, so `request_kind` says whether the acquisition was
 started by a file request (`get_file`, `head_file`) or by a repository metadata
-request (`model_info`, `model_tree`). A metadata acquisition has no single requested
+request (`model_info`, `model_tree`, `model_refs`). A metadata acquisition has no single requested
 file, so its `path` field is empty; a file acquisition carries the requested path.
 
 A metadata acquisition is unbounded by default and so normally reaches publication
 rather than a deadline: `acquisition_deadline_exceeded` appears with
-`request_kind=model_info` or `model_tree` only where an operator configured
+`request_kind=model_info`, `model_tree` or `model_refs` only where an operator configured
 `MODELKEEP_METADATA_COLD_MISS_DEADLINE_SECONDS`
 ([`modelkeep-api.md`](modelkeep-api.md)). `acquisition_progress` is emitted for both
 kinds regardless.

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
@@ -258,6 +258,7 @@ fn router_with_state(state: HttpState) -> Router {
             "/api/models/{namespace}/{repo}/tree/{revision}",
             get(model_tree),
         )
+        .route("/api/models/{namespace}/{repo}/refs", get(model_refs))
         .route(
             "/api/datasets/{namespace}/{repo}/revision/{revision}",
             get(dataset_info),
@@ -266,6 +267,7 @@ fn router_with_state(state: HttpState) -> Router {
             "/api/datasets/{namespace}/{repo}/tree/{revision}",
             get(dataset_tree),
         )
+        .route("/api/datasets/{namespace}/{repo}/refs", get(dataset_refs))
         .route(
             "/{namespace}/{repo}/resolve/{revision}/{*path}",
             get(get_file).head(head_file),
@@ -466,6 +468,72 @@ async fn repository_tree(
         })
         .collect::<Vec<_>>();
     Ok(Json(files).into_response())
+}
+
+async fn model_refs(
+    State(state): State<HttpState>,
+    Path((namespace, repo)): Path<(String, String)>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Result<Response, StatusCode> {
+    repository_refs(state, namespace, repo, &query, RepositoryType::Model).await
+}
+
+async fn dataset_refs(
+    State(state): State<HttpState>,
+    Path((namespace, repo)): Path<(String, String)>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Result<Response, StatusCode> {
+    repository_refs(state, namespace, repo, &query, RepositoryType::Dataset).await
+}
+
+/// The one ref the refs route reports.
+const REPORTED_BRANCH: &str = "main";
+
+/// The Hub's `refs` answer, reporting the `main` branch only.
+///
+/// llama.cpp resolves the commit it downloads from `branches[].targetCommit`
+/// of the entry named `main` on this route, and gives up on the download when
+/// the route fails. `main` is resolved exactly as the metadata routes resolve
+/// it, through [`repository_metadata`]: an archived ref answers from the
+/// archive without contacting upstream (core invariant 8, ADR-0012), and a ref
+/// the archive does not hold answers upstream's commit, acquiring nothing.
+///
+/// Nothing else is listed. The archive stores a ref as a name and a commit and
+/// does not record whether upstream calls it a branch or a tag, so listing the
+/// other archived names would mean inventing that classification, and listing
+/// upstream's would make the answer for an archived repository depend on
+/// upstream. `tags` and `converts` are therefore always empty, and
+/// `pullRequests`, which both pinned `huggingface_hub` versions index when they
+/// asked for it with `include_prs=1`, is present and empty in that case.
+async fn repository_refs(
+    state: HttpState,
+    namespace: String,
+    repo: String,
+    query: &BTreeMap<String, String>,
+    repo_type: RepositoryType,
+) -> Result<Response, StatusCode> {
+    let repo_id = format!("{namespace}/{repo}");
+    let Some(answer) =
+        repository_metadata(&state, repo_type, &repo_id, REPORTED_BRANCH, "model_refs").await?
+    else {
+        return cold_miss_pending_response(false, state.cold_miss.metadata_retry_after_seconds());
+    };
+    let mut refs = serde_json::json!({
+        "branches": [{
+            "name": REPORTED_BRANCH,
+            "ref": format!("refs/heads/{REPORTED_BRANCH}"),
+            "targetCommit": answer.commit,
+        }],
+        "converts": [],
+        "tags": [],
+    });
+    if query
+        .get("include_prs")
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true"))
+    {
+        refs["pullRequests"] = serde_json::json!([]);
+    }
+    Ok(Json(refs).into_response())
 }
 
 /// Answers a repository metadata request, from the archive or from upstream.
@@ -2146,6 +2214,127 @@ mod tests {
         }
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(transfers.lock().unwrap().is_empty());
+    }
+
+    /// Issue 0088: llama.cpp resolves the commit it downloads from
+    /// `branches[name == "main"].targetCommit` on the refs route. An archived
+    /// `main` answers that from the archive and never consults upstream, which is
+    /// what keeps a mirrored repository downloadable by llama.cpp while upstream
+    /// is unavailable (core invariant 8).
+    #[tokio::test]
+    async fn the_refs_route_answers_an_archived_main_without_contacting_upstream() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Archive::new(directory.path()).unwrap();
+        archive
+            .publish_revision(crate::PublishRequest {
+                repo_id: "org/model".into(),
+                requested_revision: "main".into(),
+                commit: METADATA_COMMIT.into(),
+                files: vec![crate::ArchiveFile {
+                    path: "config.json".into(),
+                    bytes: b"archived".to_vec(),
+                }],
+            })
+            .unwrap();
+        archive
+            .update_ref("org/model", "main", METADATA_COMMIT)
+            .unwrap();
+        let fetcher = Arc::new(MetadataFetcher::failing(
+            METADATA_COMMIT,
+            UpstreamErrorKind::Unavailable,
+        ));
+        let calls = Arc::clone(&fetcher.metadata_calls);
+        let transfers = Arc::clone(&fetcher.transfers);
+        let pullthrough = Arc::new(PullThrough::new(archive.clone(), fetcher));
+        let app = router_with_pullthrough(archive, pullthrough);
+
+        let response = get(&app, "/api/models/org/model/refs").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(response).await,
+            serde_json::json!({
+                "branches": [{
+                    "name": "main",
+                    "ref": "refs/heads/main",
+                    "targetCommit": METADATA_COMMIT,
+                }],
+                "converts": [],
+                "tags": [],
+            })
+        );
+        // Both pinned clients index `pullRequests` when they asked for it.
+        let with_prs = json_body(get(&app, "/api/models/org/model/refs?include_prs=1").await).await;
+        assert_eq!(with_prs["pullRequests"], serde_json::json!([]));
+        assert_eq!(with_prs["branches"][0]["targetCommit"], METADATA_COMMIT);
+        let without_prs =
+            json_body(get(&app, "/api/models/org/model/refs?include_prs=0").await).await;
+        assert!(without_prs.get("pullRequests").is_none());
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(transfers.lock().unwrap().is_empty());
+    }
+
+    /// Issue 0088: a repository the archive has never seen answers the refs
+    /// route with upstream's commit for `main`, exactly as the metadata routes
+    /// do, and acquires nothing. The answered name is learned the same way, so
+    /// the per-file requests that follow by commit still create `main`.
+    #[tokio::test]
+    async fn the_refs_route_answers_an_unarchived_main_from_upstream_without_acquiring() {
+        for (prefix, repo_type) in [
+            ("/api/models", RepositoryType::Model),
+            ("/api/datasets", RepositoryType::Dataset),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let archive = Archive::new(directory.path()).unwrap();
+            let fetcher = Arc::new(MetadataFetcher::new(
+                METADATA_COMMIT,
+                &[("config.json", b"cold-http")],
+            ));
+            let transfers = Arc::clone(&fetcher.transfers);
+            let pullthrough = Arc::new(PullThrough::new(archive.clone(), fetcher));
+            let app = router_with_pullthrough(archive.clone(), pullthrough);
+
+            let response = get(&app, &format!("{prefix}/org/model/refs")).await;
+            assert_eq!(response.status(), StatusCode::OK, "{prefix}");
+            let refs = json_body(response).await;
+            assert_eq!(refs["branches"][0]["name"], "main", "{prefix}");
+            assert_eq!(
+                refs["branches"][0]["targetCommit"], METADATA_COMMIT,
+                "{prefix}"
+            );
+            assert!(transfers.lock().unwrap().is_empty(), "{prefix}");
+            assert!(archive
+                .resolve_ref_for_type(repo_type, "org/model", "main")
+                .is_err());
+        }
+    }
+
+    /// Issue 0088: the refs route classifies failure as the metadata routes do,
+    /// and never answers a fabricated commit.
+    #[tokio::test]
+    async fn the_refs_route_reports_upstream_failure_and_a_missing_archive_ref() {
+        for (kind, expected) in [
+            (UpstreamErrorKind::Unavailable, StatusCode::BAD_GATEWAY),
+            (UpstreamErrorKind::NotFound, StatusCode::NOT_FOUND),
+            (UpstreamErrorKind::Unauthorized, StatusCode::UNAUTHORIZED),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let archive = Archive::new(directory.path()).unwrap();
+            let fetcher = Arc::new(MetadataFetcher::failing(METADATA_COMMIT, kind));
+            let pullthrough = Arc::new(PullThrough::new(archive.clone(), fetcher));
+            let app = router_with_pullthrough(archive, pullthrough);
+            let response = get(&app, "/api/models/org/model/refs").await;
+            assert_eq!(response.status(), expected);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert!(!String::from_utf8_lossy(&body).contains(METADATA_COMMIT));
+        }
+
+        // Without pull-through, a repository the archive does not hold is absent.
+        let (app, _directory) = test_router();
+        assert_eq!(
+            get(&app, "/api/models/other/model/refs").await.status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     /// Issue 0074: a partially archived revision stops presenting its subset as
