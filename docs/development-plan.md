@@ -919,6 +919,10 @@ MVP 後の候補:
 - ~~中断した上流取得の安全な再開 — [Issue 0056](https://github.com/kaznak/modelkeep/commit/41cbe67)~~。実機drillで73,025,919,893 bytesの選択を force-stop し、8,943,738,646 bytesを引き継いで`outcome: published`まで完走（転送は12.25%減）
 - ~~acquisition失敗の理由を残す（helperがsanitizeしたtyped failure eventと、class別のupstream error） — [Issue 0084](https://github.com/kaznak/modelkeep/commit/0722668)、[job recordへの到達](https://github.com/kaznak/modelkeep/commit/178c228)~~。`error_class: "failed"`一語への収束をやめ、`SanitizedReason`型でcredential-safeを構成として保証
 - ~~委譲先clientに書けるcacheを与える（tmpfsのmode明示とXet chunk cacheのmounted volume配置） — [Issue 0086](https://github.com/kaznak/modelkeep/commit/ed4ed73)~~。root所有0755のtmpfsに`HF_HOME`を置いていたため、10001で走るcontainerではXet転送が全て`EACCES`で失敗していた
+- ~~`refs` routeの応答（`main`のみ、archive済みrefはupstream非依存） — [Issue 0088](https://github.com/kaznak/modelkeep/commit/56625e2)~~。llama.cppの`--hf-repo`がcommit解決の段で`404`を受け、ファイル一覧も取得も始まらなかった
+- llama.cppのcold-miss `HEAD`（`503`を再試行しない） — [Issue 0089](issues/0089-serve-llama-cpp-on-a-cold-file.md)
+- recorded pointer sizeによる`lfs`報告の検討（llama.cppとhuggingface_hubのblob名の食い違い） — [Issue 0090](issues/0090-consider-reporting-lfs-with-a-recorded-pointer-size.md)
+- revisionなしのrepository info（`/api/models/{repo}`） — [Issue 0091](issues/0091-answer-repository-info-without-a-revision.md)
 
 ModelKeep という名称は Hugging Face 専用に限定しないため、将来的に model artifact 全般の persistent pull-through mirror へ拡張できる。
 
